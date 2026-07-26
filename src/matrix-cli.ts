@@ -46,6 +46,11 @@ import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./rende
 import { targetPathFor } from "./claude-target.ts";
 import type { CodexSession } from "./types.ts";
 import {
+  assertClaudeGoalCondition,
+  CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+  CLAUDE_GOAL_TARGET_FINGERPRINT,
+} from "./claude-goal-target.ts";
+import {
   parseGoalMigrationMode,
   planGoalMigration,
   validateGoalMigrationDecision,
@@ -120,6 +125,8 @@ export interface MatrixForwardTargetBinding {
   bridgeRoot: string;
   renderPolicy: {
     includeReasoning: true;
+    goalCapabilityId: typeof CLAUDE_GOAL_TARGET_CAPABILITY_ID;
+    goalCapabilityFingerprint: string;
   };
   sessions: MatrixForwardTargetSessionPlan[];
 }
@@ -816,7 +823,14 @@ function loadForwardSource(
       title: session.codexName || session.title || undefined,
       messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
       losses: forwardLossObservations(bundle.conversation.events, renderMode),
-      goalDecision: planGoalMigration(bundle.conversation.goalState, goalMode),
+      goalDecision: (() => {
+        if (goalMode === "migrate" && bundle.conversation.goalState?.migrationEligible) {
+          assertClaudeGoalCondition(bundle.conversation.goalState.objective);
+        }
+        return planGoalMigration(
+          bundle.conversation.goalState, goalMode, CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+        );
+      })(),
     },
   };
 }
@@ -850,7 +864,11 @@ export function buildForwardMatrixPlan(
     target: {
       claudeHome,
       bridgeRoot,
-      renderPolicy: { includeReasoning: true },
+      renderPolicy: {
+        includeReasoning: true,
+        goalCapabilityId: CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+        goalCapabilityFingerprint: CLAUDE_GOAL_TARGET_FINGERPRINT,
+      },
       sessions: built.plan.sessions.map((selected) => {
         const source = byId.get(selected.sessionId);
         if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
@@ -985,7 +1003,11 @@ export function goalMigrationModeOption(argv: string[]): GoalMigrationMode {
   return noMigrate ? "skip" : parseGoalMigrationMode(explicit);
 }
 
-export function assertGoalMigrationReady(plan: ImportPlan, goalMode: GoalMigrationMode): void {
+export function assertGoalMigrationReady(
+  plan: ImportPlan,
+  goalMode: GoalMigrationMode,
+  implementedCapabilityId?: string,
+): void {
   for (const session of plan.sessions) {
     validateGoalMigrationDecision(session.goalDecision);
     if (session.goalDecision.mode !== goalMode) {
@@ -995,6 +1017,12 @@ export function assertGoalMigrationReady(plan: ImportPlan, goalMode: GoalMigrati
       throw new Error(
         `Goal migration for session ${session.sessionId} is eligible but target activation is not implemented; ` +
         "re-plan with --goal-mode skip (or --no-migrate-goal) for conversation-only apply",
+      );
+    }
+    if (session.goalDecision.status === "ready_for_activation" &&
+      session.goalDecision.targetCapabilityId !== implementedCapabilityId) {
+      throw new Error(
+        `Goal migration capability ${session.goalDecision.targetCapabilityId} is not wired to this target apply path`,
       );
     }
   }

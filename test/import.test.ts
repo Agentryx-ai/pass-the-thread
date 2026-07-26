@@ -39,6 +39,7 @@ import { renderCitation, splitCitations } from "../src/citation.ts";
 import { validateTranscript } from "../src/validate.ts";
 import { encodeProjectDir } from "../src/paths.ts";
 import { parseRenderMode } from "../src/render-mode.ts";
+import { claudeGoalHistoryIdentity } from "../src/claude-goal-target.ts";
 import type { CodexSession } from "../src/types.ts";
 
 const SID = "11111111-1111-4111-8111-111111111111";
@@ -276,6 +277,41 @@ test("render-mode history dedup treats legacy records as semantic", () => {
   history.records = [verbatim];
   assert.equal(alreadyImported(history, "same-source", "semantic"), false);
   assert.equal(alreadyImported(history, "same-source", "verbatim"), true);
+});
+
+test("history identity binds Goal mode, source revision, and target capability", () => {
+  const s = fixtureSession();
+  const identity = {
+    mode: "migrate" as const,
+    sourceGoalSha256: "a".repeat(64),
+    targetCapabilityId: "claude.goal-transcript/v1",
+    targetFingerprint: "b".repeat(64),
+  };
+  const history = { version: 1 as const, records: [
+    makeHistoryRecord(s, "same-source", NOW, undefined, "semantic", identity),
+  ] };
+  assert.equal(alreadyImported(history, "same-source", "semantic", identity), true);
+  assert.equal(alreadyImported(history, "same-source", "semantic", { ...identity, mode: "skip" }), false);
+  assert.equal(alreadyImported(history, "same-source", "semantic", {
+    ...identity, sourceGoalSha256: "c".repeat(64),
+  }), false);
+  assert.equal(alreadyImported(history, "same-source", "semantic", {
+    ...identity, targetFingerprint: "d".repeat(64),
+  }), false);
+
+  const legacy = structuredClone(history.records[0]!);
+  delete legacy.goalMode;
+  delete legacy.sourceGoalSha256;
+  delete legacy.targetGoalCapabilityId;
+  delete legacy.targetGoalFingerprint;
+  assert.equal(alreadyImported({ version: 1, records: [legacy] }, "same-source"), true);
+  assert.equal(alreadyImported(
+    { version: 1, records: [legacy] },
+    "same-source",
+    "semantic",
+    claudeGoalHistoryIdentity(null, "migrate"),
+  ), true);
+  assert.equal(alreadyImported({ version: 1, records: [legacy] }, "same-source", "semantic", identity), false);
 });
 
 test("injected Codex context maps to isMeta, not to a plain user message", () => {

@@ -2,7 +2,7 @@
 // Used when Claude has appended a replay of the history to an imported file.
 import fs from "node:fs";
 import { dedupeLines, repairTranscript } from "./repair.ts";
-import type { ClaudeTranscriptLine } from "./types.ts";
+import type { ClaudeTranscriptRecord } from "./types.ts";
 
 export interface FixResult {
   path: string;
@@ -18,11 +18,11 @@ export function fixTranscriptFile(targetPath: string, dryRun = false): FixResult
   } catch {
     return null;
   }
-  const lines: ClaudeTranscriptLine[] = [];
+  const lines: ClaudeTranscriptRecord[] = [];
   for (const l of raw.split(/\r?\n/)) {
     if (!l.trim()) continue;
     try {
-      lines.push(JSON.parse(l) as ClaudeTranscriptLine);
+      lines.push(JSON.parse(l) as ClaudeTranscriptRecord);
     } catch {
       return null; // not ours to touch if any line is unreadable
     }

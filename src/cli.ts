@@ -43,7 +43,13 @@ import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
 import { codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
 import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
-import type { SessionFilter } from "./types.ts";
+import type { ClaudeTranscriptRecord, SessionFilter } from "./types.ts";
+import { parseGoalMigrationMode, type GoalMigrationMode } from "./goal.ts";
+import {
+  applyClaudeGoalTarget,
+  claudeGoalHistoryIdentity,
+} from "./claude-goal-target.ts";
+import { applyBudget } from "./repair.ts";
 
 export const LEGACY_HELP = `threadpass — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
 
@@ -71,6 +77,9 @@ SELECTION (Codex Desktop conversation-list criteria)
                        to (faithful, but may not fit Claude's context window)
   --render-mode <mode> semantic (default) converts supported structures;
                        verbatim renders the exact rollout as inert history
+  --goal-mode <mode>   migrate (default) restores an authoritative active Goal;
+                       skip preserves it as history only
+  --no-migrate-goal   alias for --goal-mode skip
   --max-tool-output <n>  cap each tool result at n characters (default 4000)
   --max-chars <n>        cap the whole transcript (default 1000000); older turns
                          are dropped so a resumed conversation fits the context
@@ -91,6 +100,22 @@ PATHS
 Sessions are written to <claude-home>/projects/<encoded-cwd>/<sessionId>.jsonl and
 deduped via <claude-home>/codex-import-history.json (source-content sha256).
 `;
+
+export function legacyGoalMigrationMode(
+  explicit: string | undefined,
+  noMigrateGoal: boolean,
+): GoalMigrationMode {
+  const parsed = parseGoalMigrationMode(explicit);
+  if (noMigrateGoal && explicit != null && parsed !== "skip") {
+    throw new Error("--no-migrate-goal contradicts --goal-mode migrate");
+  }
+  return noMigrateGoal ? "skip" : parsed;
+}
+
+function transcriptTitle(lines: readonly ClaudeTranscriptRecord[]): string | undefined {
+  const first = lines[0];
+  return first?.type === "attachment" ? undefined : first?.customTitle;
+}
 
 function parseDateMs(v: string | undefined): number | undefined {
   if (!v) return undefined;
@@ -164,6 +189,8 @@ export function main(argv: string[]): number {
       "max-chars": { type: "string" },
       "full-history": { type: "boolean", default: false },
       "render-mode": { type: "string" },
+      "goal-mode": { type: "string" },
+      "no-migrate-goal": { type: "boolean", default: false },
       "bridge-root": { type: "string" },
       prune: { type: "boolean", default: false },
     },
@@ -174,6 +201,10 @@ export function main(argv: string[]): number {
   const nowMs = Date.now();
   const filter = toFilter(values as Record<string, string | boolean | undefined>);
   const renderMode = parseRenderMode(values["render-mode"] as string | undefined);
+  const goalMode = legacyGoalMigrationMode(
+    values["goal-mode"] as string | undefined,
+    values["no-migrate-goal"] === true,
+  );
   const bridgeRoot = path.resolve(
     typeof values["bridge-root"] === "string" ? values["bridge-root"] : defaultBridgeRoot(),
   );
@@ -306,6 +337,7 @@ export function main(argv: string[]): number {
     process.stderr.write(
       `Codex home:  ${codexHome}\nClaude home: ${claudeHome}\n` +
         `Render mode: ${renderMode}\n` +
+        `Goal mode: ${goalMode}\n` +
         `Selection: Codex Desktop conversation list (via ${via === "desktop" ? "Desktop sidebar state" : via === "db" ? "index DB" : "file scan"}).\n` +
         `${selected.length} conversation(s) selected${dryRun ? " (dry-run)" : ""}.\n\n`,
     );
@@ -317,12 +349,15 @@ export function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (source rollout changed after inventory; run again)\n`);
         continue;
       }
-      if (!force && alreadyImported(history, sha, renderMode)) {
+      const bundle = codexRolloutWithGoalToBridgeBundle(s, codexHome);
+      const sourceGoal = bundle.conversation.goalState;
+      const goalIdentity = claudeGoalHistoryIdentity(sourceGoal, goalMode);
+      if (!force && alreadyImported(history, sha, renderMode, goalIdentity)) {
         skipped += 1;
         // The transcript already exists, but it may predate registration —
         // register it so it actually shows up in the Claude Desktop list.
         if (workspaceDir != null && !alreadyRegistered.has(s.sessionId) && !dryRun) {
-          const catchUp =
+          const catchUpBase =
             renderMode === "verbatim"
               ? mapVerbatimRolloutToClaudeLines(s, {
                   titlePrefix:
@@ -336,12 +371,13 @@ export function main(argv: string[]): number {
                       ? (values["title-prefix"] as string)
                       : undefined,
                 });
+          const catchUp = applyClaudeGoalTarget(s, catchUpBase, sourceGoal, goalMode);
           if (catchUp.length > 0) {
             const record = buildWrapperRecord({
               cliSessionId: s.sessionId,
               cwd: s.cwdOriginal || s.cwd,
               lines: catchUp,
-              title: catchUp[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+              title: transcriptTitle(catchUp) ?? s.codexName ?? s.title ?? "(untitled)",
               model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
               sandboxPolicy: s.sandboxPolicy,
               approvalMode: s.approvalMode,
@@ -368,7 +404,8 @@ export function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (already imported)\n`);
         continue;
       }
-      const lines =
+      const maxChars = values["max-chars"] != null ? Number(values["max-chars"]) : undefined;
+      const baseLines =
         renderMode === "verbatim"
           ? mapVerbatimRolloutToClaudeLines(s, {
               version:
@@ -394,8 +431,13 @@ export function main(argv: string[]): number {
                 values["max-tool-output"] != null
                   ? Number(values["max-tool-output"])
                   : undefined,
-              maxChars: values["max-chars"] != null ? Number(values["max-chars"]) : undefined,
+              maxChars,
             });
+      const composedLines = applyClaudeGoalTarget(s, baseLines, sourceGoal, goalMode);
+      const goalSuffixLength = composedLines.length - baseLines.length;
+      const lines = renderMode === "semantic" && goalSuffixLength > 0
+        ? applyBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength }).lines
+        : composedLines;
       if (lines.length === 0) {
         skipped += 1;
         process.stdout.write(`skip  ${s.sessionId}  (no convertible content)\n`);
@@ -483,17 +525,20 @@ export function main(argv: string[]): number {
       }
 
       if (dryRun) {
-        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath}\n`);
+        const goalAction = sourceGoal == null ? "none"
+          : goalMode === "migrate" && sourceGoal.migrationEligible ? "activate"
+            : "historical-only";
+        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath} (Goal: ${goalAction})\n`);
         imported += 1;
         continue;
       }
-      writeBridgeConversation(bridgeRoot, codexRolloutWithGoalToBridgeBundle(s, codexHome));
+      writeBridgeConversation(bridgeRoot, bundle);
       const res = writeTranscript(claudeHome, s, lines);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
       // repointed one is recognisable later instead of looking like a stranger.
       const recordSessionIds = [...(prior?.recordSessionIds ?? [])];
-      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256, renderMode);
+      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256, renderMode, goalIdentity);
       historyRecord.recordSessionIds = recordSessionIds;
       history.records.push(historyRecord);
       imported += 1;
@@ -523,7 +568,7 @@ export function main(argv: string[]): number {
               cliSessionId: s.sessionId,
               cwd: s.cwdOriginal || s.cwd,
               lines,
-              title: lines[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+              title: transcriptTitle(lines) ?? s.codexName ?? s.title ?? "(untitled)",
               model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
               sandboxPolicy: s.sandboxPolicy,
               approvalMode: s.approvalMode,
@@ -539,7 +584,7 @@ export function main(argv: string[]): number {
           cliSessionId: s.sessionId,
           cwd: s.cwdOriginal || s.cwd,
           lines,
-          title: lines[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+          title: transcriptTitle(lines) ?? s.codexName ?? s.title ?? "(untitled)",
           model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
           sandboxPolicy: s.sandboxPolicy,
           approvalMode: s.approvalMode,

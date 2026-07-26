@@ -20,6 +20,7 @@ import {
 } from "../src/matrix-cli.ts";
 import { buildImportPlan, type ImportPlan } from "../src/import-plan.ts";
 import { planGoalMigration } from "../src/goal.ts";
+import { CLAUDE_GOAL_TARGET_CAPABILITY_ID } from "../src/claude-goal-target.ts";
 import type { ClaudeDesktopSourceSession } from "../src/claude-desktop-source.ts";
 import type { ClaudeSourceTranscript } from "../src/claude-source.ts";
 import { HISTORICAL_SAFETY, type BridgeEvent } from "../src/ir.ts";
@@ -170,6 +171,19 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
   assert.deepEqual(second.file, first.file);
   assert.equal(first.file.direction, "codex-to-claude");
   assert.equal(first.file.target.renderPolicy.includeReasoning, true);
+  assert.equal(first.file.target.renderPolicy.goalCapabilityId, CLAUDE_GOAL_TARGET_CAPABILITY_ID);
+  assert.match(first.file.target.renderPolicy.goalCapabilityFingerprint, /^[0-9a-f]{64}$/);
+  assert.notEqual(matrixPlanDigest({
+    schema: first.file.schema,
+    direction: first.file.direction,
+    renderMode: first.file.renderMode,
+    goalMode: first.file.goalMode,
+    plan: first.file.plan,
+    target: {
+      ...first.file.target,
+      renderPolicy: { ...first.file.target.renderPolicy, goalCapabilityFingerprint: "changed" },
+    },
+  }), first.file.digest);
   assert.equal(first.file.target.sessions[0]?.targetPath, path.resolve(targetPathFor(claudeHome, session).targetPath));
   assert.equal(first.file.target.sessions[0]?.targetExists, false);
   assert.equal(fs.existsSync(claudeHome), false);
@@ -276,6 +290,21 @@ test("active migrate fails closed while skip and historical-only decisions are r
   assert.doesNotThrow(() => assertGoalMigrationReady(absent, "migrate"));
   assert.ok(plan(decision("skip", true)).losses.byKind.some((loss) =>
     loss.kind === "goal_migration_skipped_by_policy"));
+});
+
+test("only the wired Claude Goal capability is accepted as ready", () => {
+  const ready = buildImportPlan([{
+    sessionId: "ready", cwd: "C:/repo",
+    goalDecision: planGoalMigration({
+      version: 1, authority: "native-store", provider: "codex", sourceThreadId: "ready",
+      sourceGoalId: "g", objective: "ship", status: "active", migrationEligible: true,
+      tokenBudget: null, tokensUsed: 0, timeUsedSeconds: 0, createdAtMs: 1, updatedAtMs: 1,
+      locator: { sourcePath: "C:/goals.sqlite", recordIndex: null, table: "thread_goals", key: "ready" },
+      sourceSha256: "a".repeat(64),
+    }, "migrate", CLAUDE_GOAL_TARGET_CAPABILITY_ID),
+  }]).plan;
+  assert.throws(() => assertGoalMigrationReady(ready, "migrate"), /not wired/);
+  assert.doesNotThrow(() => assertGoalMigrationReady(ready, "migrate", CLAUDE_GOAL_TARGET_CAPABILITY_ID));
 });
 
 test("forward CLI plan includes protocol-only active and archived rollouts without target mutation", () => {

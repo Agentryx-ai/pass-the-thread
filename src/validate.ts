@@ -1,7 +1,8 @@
 // Validate a converted transcript against the constraints the Messages API
 // enforces when a session is resumed. A transcript that violates these loads in
 // the UI but fails on the next turn with a 400, so importing must guarantee them.
-import type { AnthropicBlock, ClaudeTranscriptLine } from "./types.ts";
+import { CLAUDE_GOAL_MAX_CONDITION_CHARS } from "./claude-goal-target.ts";
+import type { AnthropicBlock, ClaudeTranscriptLine, ClaudeTranscriptRecord } from "./types.ts";
 
 export interface ValidationIssue {
   line: number;
@@ -10,21 +11,59 @@ export interface ValidationIssue {
 }
 
 /** Blocks of a line, or [] when absent. */
-function blocksOf(line: ClaudeTranscriptLine): AnthropicBlock[] {
+function blocksOf(line: ClaudeTranscriptRecord): AnthropicBlock[] {
+  if (line.type === "attachment") return [];
   const c = line.message?.content;
+  if (typeof c === "string") return c === "" ? [] : [{ type: "text", text: c }];
   return Array.isArray(c) ? c : [];
 }
 
-export function validateTranscript(lines: ClaudeTranscriptLine[]): ValidationIssue[] {
+export function validateTranscript(lines: ClaudeTranscriptRecord[]): ValidationIssue[] {
   const issues: ValidationIssue[] = [];
   const seenToolUseIds = new Set<string>();
   /** tool_use ids emitted by the previous assistant line and not yet resolved. */
   let pending: string[] = [];
+  const uuids = new Set<string>();
+  const sessionId = lines[0]?.sessionId;
+  const cwd = lines[0]?.cwd;
 
   lines.forEach((line, i) => {
+    const at = i + 1;
+    if (line.sessionId === "" || line.sessionId !== sessionId) {
+      issues.push({ line: at, kind: "session-identity", detail: "record sessionId differs from transcript" });
+    }
+    if (line.cwd !== cwd) {
+      issues.push({ line: at, kind: "cwd-identity", detail: "record cwd differs from transcript" });
+    }
+    if (line.userType !== "external" || line.isSidechain !== false ||
+      typeof line.version !== "string" || line.version === "") {
+      issues.push({ line: at, kind: "record-metadata", detail: "invalid Claude transcript metadata" });
+    }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(line.uuid) ||
+      uuids.has(line.uuid)) {
+      issues.push({ line: at, kind: "record-uuid", detail: "record uuid must be a unique UUIDv4" });
+    }
+    uuids.add(line.uuid);
+    const expectedParent = i === 0 ? null : lines[i - 1]!.uuid;
+    if (line.parentUuid !== expectedParent) {
+      issues.push({ line: at, kind: "parent-link", detail: "parentUuid must reference the previous record" });
+    }
+    if (!Number.isFinite(Date.parse(line.timestamp))) {
+      issues.push({ line: at, kind: "timestamp", detail: "timestamp must be ISO-8601" });
+    }
+    if (line.type === "attachment") {
+      const goal = line.attachment;
+      if (line.entrypoint !== "claude-desktop" || goal?.type !== "goal_status" ||
+        goal.met !== false || goal.sentinel !== true ||
+        typeof goal.condition !== "string" || goal.condition.trim() === "" ||
+        goal.condition.length > CLAUDE_GOAL_MAX_CONDITION_CHARS ||
+        (goal as { failed?: unknown }).failed === true) {
+        issues.push({ line: at, kind: "goal-attachment", detail: "malformed or contradictory goal_status attachment" });
+      }
+      return; // control records do not consume or interrupt pending tool adjacency
+    }
     if (line.type === "system") return; // structural marker, no content
     const blocks = blocksOf(line);
-    const at = i + 1;
 
     if (blocks.length === 0) {
       issues.push({ line: at, kind: "empty-content", detail: "message.content is empty" });

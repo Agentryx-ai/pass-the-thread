@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type {
   ClaudeTranscriptLine,
+  ClaudeTranscriptRecord,
   CodexSession,
   ImportHistory,
   ImportHistoryRecord,
@@ -14,6 +15,7 @@ import {
   storedRenderMode,
   type RenderMode,
 } from "./render-mode.ts";
+import type { GoalMigrationMode } from "./goal.ts";
 
 const HISTORY_FILE = "codex-import-history.json";
 
@@ -69,13 +71,26 @@ export function alreadyImported(
   history: ImportHistory,
   contentSha256: string,
   renderMode: RenderMode = "semantic",
+  goalIdentity: GoalHistoryIdentity = { mode: "skip", sourceGoalSha256: null },
 ): boolean {
   let latest: ImportHistoryRecord | null = null;
   for (const record of history.records) {
     if (record.contentSha256 !== contentSha256) continue;
     if (latest == null || record.importedAtMs >= latest.importedAtMs) latest = record;
   }
-  return latest != null && storedRenderMode(latest.renderMode) === renderMode;
+  if (latest == null || storedRenderMode(latest.renderMode) !== renderMode) return false;
+  const storedGoalMode = latest.goalMode ?? "skip";
+  return storedGoalMode === goalIdentity.mode &&
+    (latest.sourceGoalSha256 ?? null) === goalIdentity.sourceGoalSha256 &&
+    (latest.targetGoalCapabilityId ?? null) === (goalIdentity.targetCapabilityId ?? null) &&
+    (latest.targetGoalFingerprint ?? null) === (goalIdentity.targetFingerprint ?? null);
+}
+
+export interface GoalHistoryIdentity {
+  mode: GoalMigrationMode;
+  sourceGoalSha256: string | null;
+  targetCapabilityId?: string | null;
+  targetFingerprint?: string | null;
 }
 
 export function targetPathFor(
@@ -105,7 +120,7 @@ export function transcriptPathFor(
 }
 
 /** Serialize transcript lines to newline-delimited JSON. */
-export function serializeLines(lines: ClaudeTranscriptLine[]): string {
+export function serializeLines(lines: ClaudeTranscriptRecord[]): string {
   return lines.map((l) => JSON.stringify(l)).join("\n") + (lines.length ? "\n" : "");
 }
 
@@ -119,7 +134,7 @@ export interface WriteResult {
 export function writeTranscript(
   claudeHome: string,
   session: CodexSession,
-  lines: ClaudeTranscriptLine[],
+  lines: ClaudeTranscriptRecord[],
 ): WriteResult {
   const { projectDir, targetPath } = targetPathFor(claudeHome, session);
   fs.mkdirSync(projectDir, { recursive: true });
@@ -190,6 +205,7 @@ export function makeHistoryRecord(
   nowMs: number,
   targetSha256?: string,
   renderMode: RenderMode = "semantic",
+  goalIdentity: GoalHistoryIdentity = { mode: "skip", sourceGoalSha256: null },
 ): ImportHistoryRecord {
   return {
     contentSha256,
@@ -198,6 +214,10 @@ export function makeHistoryRecord(
     sourceRolloutPath: session.rolloutPath,
     projectRoot: session.cwd,
     renderMode,
+    goalMode: goalIdentity.mode,
+    sourceGoalSha256: goalIdentity.sourceGoalSha256,
+    targetGoalCapabilityId: goalIdentity.targetCapabilityId ?? null,
+    targetGoalFingerprint: goalIdentity.targetFingerprint ?? null,
     targetSha256,
   };
 }

@@ -150,7 +150,7 @@ test("Goal migration decisions are deterministic and never bind an unimplemented
   assert.equal(planGoalMigration(canonicalGoal("complete")).status, "historical_only");
   assert.equal(planGoalMigration(null).status, "no_source_goal");
   assert.doesNotThrow(() => validateGoalMigrationDecision(skip));
-  assert.throws(() => validateGoalMigrationDecision({ ...skip, targetGoalId: "implicit" }), /not implemented/);
+  assert.throws(() => validateGoalMigrationDecision({ ...skip, targetGoalId: "implicit" }), /target Goal id/);
 });
 
 test("Goal mode, source hash, and status change the source inventory digest", () => {
@@ -389,10 +389,11 @@ test("forward production planning captures the authoritative Codex Goal", () => 
   });
   assert.equal(built.bundles[0]?.conversation.goalState?.objective, "planned Goal");
   assert.equal(built.file.goalMode, "migrate");
-  assert.equal(built.file.plan.sessions[0]?.goalDecision.status, "pending_target_implementation");
+  assert.equal(built.file.plan.sessions[0]?.goalDecision.status, "ready_for_activation");
+  assert.equal(built.file.plan.sessions[0]?.goalDecision.targetCapabilityId, "claude.goal-transcript/v1");
   assert.equal(built.file.plan.sessions[0]?.goalDecision.sourceGoalSha256,
     built.bundles[0]?.conversation.goalState?.sourceSha256);
-  assert.ok(built.file.plan.losses.byKind.some((loss) => loss.kind === "goal_activation_target_unimplemented"));
+  assert.ok(!built.file.plan.losses.byKind.some((loss) => loss.kind === "goal_activation_target_unimplemented"));
 
   const skipped = buildForwardMatrixPlan([codexSession(rollout)], {
     codexHome, claudeHome: path.join(root, ".claude"), bridgeRoot: path.join(root, "bridge"),
