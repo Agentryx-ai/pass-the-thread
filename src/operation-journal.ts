@@ -3,8 +3,30 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { threadRolloutPath, unregisterCodexThread41059 } from "./codex-target-db.ts";
 import { stripWindowsExtendedPrefix } from "./project-identity.ts";
+import {
+  assertCodexGoalReadback,
+  validateCodexGoalActivationPlan,
+  type CodexGoalActivationPlan,
+  type CodexThreadGoal,
+} from "./codex-goal-target.ts";
 
-export type OperationState = "prepared" | "rollout-written" | "committed" | "recovered" | "failed";
+export type OperationState =
+  | "prepared"
+  | "rollout-written"
+  | "thread-registered"
+  | "goal-activation-requested"
+  | "goal-activation-confirmed"
+  | "goal-verified"
+  | "reconciliation-required"
+  | "committed"
+  | "recovered"
+  | "failed";
+
+const OPERATION_STATES = new Set<OperationState>([
+  "prepared", "rollout-written", "thread-registered", "goal-activation-requested",
+  "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+  "committed", "recovered", "failed",
+]);
 
 export interface OperationAttemptSummary {
   attempt: number;
@@ -15,7 +37,7 @@ export interface OperationAttemptSummary {
 }
 
 export interface OperationJournal {
-  schema: "agentryx.bridge/operation-v1";
+  schema: "agentryx.bridge/operation-v2";
   operationId: string;
   attempt: number;
   previousAttempts: OperationAttemptSummary[];
@@ -29,14 +51,16 @@ export interface OperationJournal {
   targetStagePath: string;
   targetRolloutSha256: string;
   targetDbPath: string;
+  goalActivation: CodexGoalActivationPlan | null;
+  observedGoal?: CodexThreadGoal;
   createdFiles: string[];
   error?: string;
 }
 
 export type OperationJournalInput = Omit<
   OperationJournal,
-  "schema" | "state" | "createdAt" | "updatedAt" | "createdFiles" | "attempt" | "previousAttempts"
->;
+  "schema" | "state" | "createdAt" | "updatedAt" | "createdFiles" | "attempt" | "previousAttempts" | "observedGoal" | "goalActivation"
+> & { goalActivation?: CodexGoalActivationPlan | null };
 
 function journalPath(root: string, operationId: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(operationId)) {
@@ -61,11 +85,11 @@ function sha256File(filePath: string): string {
 
 function validateJournal(journal: OperationJournal, operationId: string): void {
   if (
-    journal?.schema !== "agentryx.bridge/operation-v1" ||
+    journal?.schema !== "agentryx.bridge/operation-v2" ||
     journal.operationId !== operationId ||
     !Number.isSafeInteger(journal.attempt) || journal.attempt < 1 ||
     !Array.isArray(journal.previousAttempts) ||
-    !["prepared", "rollout-written", "committed", "recovered", "failed"].includes(journal.state) ||
+    !OPERATION_STATES.has(journal.state) ||
     !/^[0-9a-f]{64}$/i.test(journal.sourceSha256) ||
     !/^[0-9a-f]{64}$/i.test(journal.targetRolloutSha256) ||
     typeof journal.targetCodexHome !== "string" ||
@@ -77,7 +101,7 @@ function validateJournal(journal: OperationJournal, operationId: string): void {
   ) throw new Error(`invalid operation journal ${operationId}`);
   for (const attempt of journal.previousAttempts) {
     if (!Number.isSafeInteger(attempt?.attempt) || attempt.attempt < 1 ||
-      !["prepared", "rollout-written", "committed", "recovered", "failed"].includes(attempt.state) ||
+      !OPERATION_STATES.has(attempt.state) ||
       typeof attempt.createdAt !== "string" || typeof attempt.updatedAt !== "string") {
       throw new Error(`invalid previous attempt in operation journal ${operationId}`);
     }
@@ -97,6 +121,19 @@ function validateJournal(journal: OperationJournal, operationId: string): void {
   }
   if (journal.createdFiles.some((file) => canonical(file) !== rollout)) {
     throw new Error("operation journal contains an unexpected created file");
+  }
+  if (journal.goalActivation != null) {
+    validateCodexGoalActivationPlan(journal.goalActivation);
+    if (journal.goalActivation.targetThreadId !== journal.targetThreadId ||
+      journal.goalActivation.expectedReadback.threadId !== journal.targetThreadId ||
+      journal.goalActivation.request.threadId !== journal.targetThreadId) {
+      throw new Error("operation journal has an invalid Goal activation binding");
+    }
+    if (journal.observedGoal != null) {
+      assertCodexGoalReadback(journal.observedGoal, journal.goalActivation.expectedReadback);
+    }
+  } else if (journal.observedGoal != null) {
+    throw new Error("operation journal has an unbound observed Goal");
   }
 }
 
@@ -145,7 +182,7 @@ export function createOperationJournal(
     }];
   }
   const journal: OperationJournal = {
-    schema: "agentryx.bridge/operation-v1",
+    schema: "agentryx.bridge/operation-v2",
     attempt,
     previousAttempts,
     state: "prepared",
@@ -153,6 +190,7 @@ export function createOperationJournal(
     updatedAt: iso,
     createdFiles: [],
     ...input,
+    goalActivation: input.goalActivation ?? null,
   };
   if (attempt === 1) atomicCreateJson(target, journal);
   else atomicJson(target, journal);
@@ -161,6 +199,10 @@ export function createOperationJournal(
 
 export function loadOperationJournal(root: string, operationId: string): OperationJournal {
   const parsed = JSON.parse(fs.readFileSync(journalPath(root, operationId), "utf8")) as OperationJournal;
+  if ((parsed as unknown as { schema: string }).schema === "agentryx.bridge/operation-v1") {
+    (parsed as unknown as { schema: string }).schema = "agentryx.bridge/operation-v2";
+    parsed.goalActivation = null;
+  }
   // Prototype journals written before retry support are attempt 1.
   if (parsed.attempt == null) parsed.attempt = 1;
   if (parsed.previousAttempts == null) parsed.previousAttempts = [];
@@ -177,6 +219,9 @@ function assertSameOperation(journal: OperationJournal, input: OperationJournalI
     if (canonicalComparable(String(journal[key])) !== canonicalComparable(String(input[key]))) {
       throw new Error(`operation retry changed ${key}: ${input.operationId}`);
     }
+  }
+  if (JSON.stringify(journal.goalActivation) !== JSON.stringify(input.goalActivation ?? null)) {
+    throw new Error(`operation retry changed goalActivation: ${input.operationId}`);
   }
 }
 
@@ -211,7 +256,11 @@ export function commitOperationJournalIfPresent(
   const current = loadOperationJournal(root, input.operationId);
   assertSameOperation(current, input);
   if (current.state === "committed") return current;
-  if (current.state !== "prepared" && current.state !== "rollout-written") {
+  if (current.goalActivation != null && current.state !== "goal-verified") {
+    throw new Error(`an already-applied Goal target is not verified in journal state ${current.state}`);
+  }
+  if (current.goalActivation == null &&
+    current.state !== "prepared" && current.state !== "rollout-written" && current.state !== "thread-registered") {
     throw new Error(`an already-applied target has contradictory journal state ${current.state}`);
   }
   return updateOperationJournal(root, current, { state: "committed" });
@@ -220,7 +269,7 @@ export function commitOperationJournalIfPresent(
 export function updateOperationJournal(
   root: string,
   journal: OperationJournal,
-  patch: Partial<Pick<OperationJournal, "state" | "createdFiles" | "error">>,
+  patch: Partial<Pick<OperationJournal, "state" | "createdFiles" | "error" | "observedGoal">>,
   now = new Date(),
 ): OperationJournal {
   const current = loadOperationJournal(root, journal.operationId);
@@ -238,6 +287,11 @@ export function updateOperationJournal(
 export function recoverCreatedFiles(root: string, operationId: string): OperationJournal {
   let journal = loadOperationJournal(root, operationId);
   if (journal.state === "committed") throw new Error("committed operations require an explicit reverse migration");
+  if (journal.goalActivation != null && new Set<OperationState>([
+    "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+  ]).has(journal.state)) {
+    throw new Error("Goal activation may have reached Codex; reconcile exact native readback before file recovery");
+  }
   // Validate every deletable resource before changing either resource. If a
   // user or another process changed a file, recovery leaves the DB untouched.
   if (fs.existsSync(journal.targetRolloutPath) &&
@@ -269,4 +323,52 @@ export function recoverCreatedFiles(root: string, operationId: string): Operatio
   }
   journal = updateOperationJournal(root, journal, { state: "recovered", createdFiles: [] });
   return journal;
+}
+
+/**
+ * Reconcile the crash window after Goal set was requested. `thread/goal/clear`
+ * is intentionally not used: its audited 41059 contract has only `threadId`
+ * and no Goal id, hash, or compare-and-clear precondition, so it could delete a
+ * user replacement Goal in the read/clear race.
+ */
+export function reconcileGoalActivation(
+  root: string,
+  operationId: string,
+  actual: CodexThreadGoal | null,
+): OperationJournal {
+  let journal = loadOperationJournal(root, operationId);
+  if (journal.goalActivation == null) throw new Error("operation has no live Goal activation to reconcile");
+  if (!new Set<OperationState>([
+    "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+  ]).has(journal.state)) throw new Error(`operation is not in a Goal reconciliation state: ${journal.state}`);
+  if (!fs.existsSync(journal.targetRolloutPath) ||
+    sha256File(journal.targetRolloutPath) !== journal.targetRolloutSha256.toLowerCase()) {
+    throw new Error("Goal reconciliation target rollout is absent or changed");
+  }
+  const registeredPath = fs.existsSync(journal.targetDbPath)
+    ? threadRolloutPath(journal.targetDbPath, journal.targetThreadId)
+    : null;
+  if (registeredPath == null || canonical(registeredPath) !== canonical(journal.targetRolloutPath)) {
+    throw new Error("Goal reconciliation thread registration is absent or changed");
+  }
+  if (actual == null) {
+    journal = updateOperationJournal(root, journal, {
+      state: "failed", error: "native Goal readback proved activation absent; importer artifacts may be recovered",
+    });
+    return recoverCreatedFiles(root, operationId);
+  }
+  try {
+    assertCodexGoalReadback(actual, journal.goalActivation.expectedReadback);
+  } catch (error) {
+    if (journal.state !== "reconciliation-required") {
+      journal = updateOperationJournal(root, journal, {
+        state: "reconciliation-required",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    throw new Error("Codex has a differing Goal; recovery refuses to overwrite or clear it");
+  }
+  return updateOperationJournal(root, journal, {
+    state: "committed", observedGoal: actual, error: undefined,
+  });
 }

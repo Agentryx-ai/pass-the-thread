@@ -18,6 +18,18 @@ import {
   type OperationJournalInput,
 } from "./operation-journal.ts";
 import { stripWindowsExtendedPrefix } from "./project-identity.ts";
+import type { CanonicalGoalSnapshot, GoalMigrationMode } from "./goal.ts";
+import {
+  assertCodexGoalReadback,
+  CODEX_GOAL_TARGET_CAPABILITY_ID,
+  CODEX_GOAL_TARGET_FINGERPRINT,
+  codexGoalSetBinding,
+  createCodexGoalRpc,
+  planCodexGoalActivation,
+  validateCodexGoalActivationPlan,
+  type CodexGoalActivationPlan,
+  type CodexGoalRpc,
+} from "./codex-goal-target.ts";
 
 export const CODEX_41059_CONTEXT_WINDOW = 258_400;
 export const CODEX_41059_SAFE_ACTIVE_TOKENS = 230_000;
@@ -34,6 +46,7 @@ export interface CodexTargetPlan {
   serializedRollout: string;
   rolloutSha256: string;
   conversation: LogicalCodexConversation;
+  goalActivation: CodexGoalActivationPlan | null;
 }
 
 export interface ApplyCodexTargetOptions {
@@ -41,6 +54,8 @@ export interface ApplyCodexTargetOptions {
   evidence: CodexTargetEvidence;
   bridgeRoot: string;
   lock: CodexTargetLock;
+  goalRpc?: CodexGoalRpc;
+  desktopGuard?: () => void;
 }
 
 export interface CodexTargetLock {
@@ -151,6 +166,7 @@ export function operationJournalInputForPlan(plan: CodexTargetPlan): OperationJo
     targetStagePath: plan.stagePath,
     targetRolloutSha256: plan.rolloutSha256,
     targetDbPath: plan.dbPath,
+    goalActivation: plan.goalActivation,
   };
 }
 
@@ -184,6 +200,8 @@ export function planCodexTarget(
   sourceSha256: string,
   conversation: Omit<LogicalCodexConversation, "threadId">,
   archived = false,
+  goal: CanonicalGoalSnapshot | null = null,
+  goalMode: GoalMigrationMode = "migrate",
 ): CodexTargetPlan {
   const activeTokens = estimatedActiveTokens(conversation);
   if (activeTokens > CODEX_41059_SAFE_ACTIVE_TOKENS) {
@@ -200,6 +218,7 @@ export function planCodexTarget(
   const stamp = conversation.createdAt.replace(/[:.]/g, "-").replace(/Z$/, "");
   const rolloutPath = path.join(codexHome, dir, `rollout-${stamp}-${threadId}.jsonl`);
   const operationId = hashText(`operation\0${sourceSha256}\0${threadId}`).slice(0, 32);
+  const goalActivation = planCodexGoalActivation(goal, goalMode, threadId);
   return {
     operationId,
     codexHome: path.resolve(codexHome),
@@ -212,14 +231,53 @@ export function planCodexTarget(
     serializedRollout,
     rolloutSha256: hashText(serializedRollout),
     conversation: fullConversation,
+    goalActivation,
   };
 }
 
 export function applyCodexTarget(plan: CodexTargetPlan, options: ApplyCodexTargetOptions): OperationJournal {
   if (!options.allowWrite) throw new Error("Codex target apply is disabled; create and inspect a plan first");
   assertTargetLock(options.lock, plan.codexHome);
-  assertCodexDesktopClosed();
+  (options.desktopGuard ?? assertCodexDesktopClosed)();
   assertSupportedCodexTarget(options.evidence);
+  if (plan.goalActivation != null &&
+    (plan.goalActivation.capabilityId !== CODEX_GOAL_TARGET_CAPABILITY_ID ||
+      plan.goalActivation.profileFingerprint !== CODEX_GOAL_TARGET_FINGERPRINT)) {
+    throw new Error("Codex Goal target capability changed after planning");
+  }
+  if (plan.goalActivation != null) validateCodexGoalActivationPlan(plan.goalActivation);
+  const goalRpc = plan.goalActivation == null
+    ? null
+    : options.goalRpc ?? createCodexGoalRpc(options.evidence, plan.codexHome);
+  const ownsGoalRpc = goalRpc != null && options.goalRpc == null;
+  let applyError: unknown;
+  try {
+    // The exported API has the same before-first-write capability check as the
+    // matrix CLI. Injected RPCs are probed too, so callers cannot accidentally
+    // bypass the exact app-server profile preflight.
+    goalRpc?.probe();
+    return applyCodexTargetAfterGoalPreflight(plan, options, goalRpc);
+  } catch (error) {
+    applyError = error;
+    throw error;
+  } finally {
+    if (ownsGoalRpc) {
+      try { goalRpc.dispose(); }
+      catch (cleanupError) {
+        if (applyError != null) {
+          throw new AggregateError([applyError, cleanupError], "Codex target apply and Goal RPC cleanup failed");
+        }
+        throw cleanupError;
+      }
+    }
+  }
+}
+
+function applyCodexTargetAfterGoalPreflight(
+  plan: CodexTargetPlan,
+  options: ApplyCodexTargetOptions,
+  goalRpc: CodexGoalRpc | null,
+): OperationJournal {
   const targetState = inspectCodexTargetPlan(plan);
   if (targetState !== "absent") throw new Error(`target is not absent (${targetState}): ${plan.threadId}`);
 
@@ -251,9 +309,71 @@ export function applyCodexTarget(plan: CodexTargetPlan, options: ApplyCodexTarge
       firstUserMessage: firstUser,
       preview: firstUser.slice(0, 500),
     });
+    journal = updateOperationJournal(options.bridgeRoot, journal, { state: "thread-registered" });
+    if (plan.goalActivation != null) {
+      if (goalRpc == null) throw new Error("Codex Goal RPC preflight was not established");
+      const binding = codexGoalSetBinding(plan.operationId, plan.goalActivation);
+      const preexisting = goalRpc.get(plan.threadId, binding);
+      if (preexisting != null) {
+        try {
+          assertCodexGoalReadback(preexisting, plan.goalActivation.expectedReadback);
+        } catch {
+          journal = updateOperationJournal(options.bridgeRoot, journal, {
+            state: "reconciliation-required",
+            error: "Codex target thread has a differing Goal; importer preserved the thread and did not clear it",
+          });
+          throw new Error("Codex target Goal collision; importer will not overwrite or clear it");
+        }
+        if (hashText(fs.readFileSync(plan.rolloutPath, "utf8")) !== plan.rolloutSha256) {
+          throw new Error("Codex Goal idempotency check found a changed imported rollout");
+        }
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-verified", observedGoal: preexisting,
+        });
+      } else {
+        journal = updateOperationJournal(options.bridgeRoot, journal, { state: "goal-activation-requested" });
+        const setGoal = goalRpc.set(plan.goalActivation.request, binding);
+        assertCodexGoalReadback(setGoal, plan.goalActivation.expectedReadback);
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-activation-confirmed", observedGoal: setGoal,
+        });
+        const readback = goalRpc.get(plan.threadId, binding);
+        assertCodexGoalReadback(readback, plan.goalActivation.expectedReadback);
+        if (!(["threadId", "objective", "status", "tokenBudget", "tokensUsed", "timeUsedSeconds", "createdAt", "updatedAt"] as const)
+          .every((field) => readback[field] === setGoal[field])) {
+          throw new Error("Codex Goal changed between set response and restart readback");
+        }
+        if (hashText(fs.readFileSync(plan.rolloutPath, "utf8")) !== plan.rolloutSha256) {
+          throw new Error("Codex Goal RPC changed the imported rollout");
+        }
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-verified", observedGoal: readback,
+        });
+      }
+    }
     journal = updateOperationJournal(options.bridgeRoot, journal, { state: "committed" });
     return journal;
   } catch (error) {
+    if (plan.goalActivation != null && new Set([
+      "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+    ]).has(journal.state)) {
+      let journalError: unknown;
+      try {
+        if (journal.state !== "reconciliation-required") {
+          updateOperationJournal(options.bridgeRoot, journal, {
+            state: "reconciliation-required",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } catch (failure) { journalError = failure; }
+      if (journalError != null) {
+        throw new AggregateError([error, journalError], "Goal activation failed and reconciliation journaling failed");
+      }
+      throw new Error(
+        `Codex Goal activation outcome requires reconciliation; importer artifacts were preserved: ${
+          error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     let cleanupError: unknown;
     try {
       const registeredPath = fs.existsSync(plan.dbPath) ? threadRolloutPath(plan.dbPath, plan.threadId) : null;

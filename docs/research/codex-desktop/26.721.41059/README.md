@@ -44,6 +44,7 @@ Do not promote a `DERIVED` statement to native implementation fact. In particula
 - [Resume contamination case](RESUME_CONTAMINATION_CASE.md) — why a project-correct imported rollout consulted a global Baton handoff.
 - [Project grouping case](PROJECT_GROUPING_CASE.md) — the duplicate-project hypothesis, evidence limits, and canonical-path mitigation.
 - [Framework implications](FRAMEWORK_IMPLICATIONS.md) — why this belongs in a unified, extensible importer architecture.
+- [Goal app-server contract](GOAL_RPC.md) — generated protocol, isolated restart canary, version gate, and crash-recovery boundary.
 - [Artifact provenance](../../../../reference/codex-desktop/26.721.41059/README.md) and [machine-readable manifest](../../../../reference/codex-desktop/26.721.41059/manifest.json).
 
 ## Prior snapshot

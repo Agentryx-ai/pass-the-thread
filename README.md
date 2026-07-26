@@ -81,7 +81,7 @@ threadpass plan --archive active --project-scope existing-targets \
   --out import-plan.json
 ```
 
-There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, date bounds, and an explicit `--limit`. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/goal/access state is never activated as live control state in either mode.
+There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, date bounds, and an explicit `--limit`. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/access records and superseded Goal events always remain inert. A separately identified authoritative active Goal is restored by default in either render mode; `--goal-mode skip` keeps it as history without live activation.
 
 Applying a plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. See [CLI](docs/CLI.md#experimental-claude--codex-matrix).
 
@@ -124,7 +124,9 @@ Writing only a transcript leaves it invisible, so this writes both.
 
 Out of scope today: migrating settings, skills, plugins and MCP servers;
 network/account-backed history that has no local transcript; and pretending
-historical tasks, goals, or grants are safe live control state.
+historical tasks, superseded goals, or grants are safe live control state. Only
+the canonical current Goal can be restored, through a separately versioned and
+verified target-native capability.
 
 </details>
 

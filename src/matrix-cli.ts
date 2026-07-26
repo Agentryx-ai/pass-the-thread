@@ -38,6 +38,7 @@ import {
   commitOperationJournalIfPresent,
   loadOperationJournal,
   recoverCreatedFiles,
+  reconcileGoalActivation,
 } from "./operation-journal.ts";
 import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/v26_721_41059.ts";
 import { assertSupportedCodexTarget, loadInstalledCodexTargetEvidence } from "./version-gate.ts";
@@ -50,6 +51,14 @@ import {
   CLAUDE_GOAL_TARGET_CAPABILITY_ID,
   CLAUDE_GOAL_TARGET_FINGERPRINT,
 } from "./claude-goal-target.ts";
+import {
+  assertCodexGoalReadback,
+  CODEX_GOAL_TARGET_CAPABILITY_ID,
+  CODEX_GOAL_TARGET_FINGERPRINT,
+  codexGoalSetBinding,
+  createCodexGoalRpc,
+  type CodexGoalActivationPlan,
+} from "./codex-goal-target.ts";
 import {
   parseGoalMigrationMode,
   planGoalMigration,
@@ -65,6 +74,7 @@ export interface MatrixTargetSessionPlan {
   rolloutSha256: string;
   archived: boolean;
   activeTokenUpperBound: number;
+  goalActivation: CodexGoalActivationPlan | null;
 }
 
 function releaseTargetLockAfter(
@@ -101,6 +111,8 @@ export interface MatrixTargetBinding {
   dbPath: string;
   bridgeRoot: string;
   evidence: CodexTargetEvidence;
+  goalCapabilityId: typeof CODEX_GOAL_TARGET_CAPABILITY_ID;
+  goalCapabilityFingerprint: string;
   sessions: MatrixTargetSessionPlan[];
 }
 
@@ -897,6 +909,7 @@ function targetSummary(sourceSessionId: string, plan: CodexTargetPlan): MatrixTa
     rolloutSha256: plan.rolloutSha256,
     archived: plan.archived,
     activeTokenUpperBound: estimatedActiveTokens(plan.conversation),
+    goalActivation: plan.goalActivation,
   };
 }
 
@@ -919,7 +932,9 @@ function summariesForPlan(
 ): ImportPlanSessionSummary[] {
   return summariesForRenderMode(sources, renderMode).map((summary, index) => ({
     ...summary,
-    goalDecision: planGoalMigration(sources[index]?.bundle?.conversation.goalState, goalMode),
+    goalDecision: planGoalMigration(
+      sources[index]?.bundle?.conversation.goalState, goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID,
+    ),
   }));
 }
 
@@ -936,6 +951,7 @@ function buildMatrixPlan(
     return planCodexTarget(
       codexHome, dbPath, `${selected.sessionId}\0render:${renderMode}`, selected.sourceSha256,
       bridgeToLogical(source, renderMode), selected.archived,
+      source.bundle.conversation.goalState ?? null, goalMode,
     );
   });
   const withoutDigest: Omit<MatrixReversePlanFile, "digest"> = {
@@ -949,6 +965,8 @@ function buildMatrixPlan(
       dbPath: canonicalExistingPath(dbPath),
       bridgeRoot: canonicalExistingPath(bridgeRoot),
       evidence,
+      goalCapabilityId: CODEX_GOAL_TARGET_CAPABILITY_ID,
+      goalCapabilityFingerprint: CODEX_GOAL_TARGET_FINGERPRINT,
       sessions: targetPlans.map((target, index) => targetSummary(built.plan.sessions[index].sessionId, target)),
     },
   };
@@ -1144,7 +1162,34 @@ export function main(argv = process.argv.slice(2)): void {
     let operationError: unknown;
     try {
       assertCodexDesktopClosed();
-      const recovered = recoverCreatedFiles(bridgeRoot, operationId);
+      let recovered;
+      const nativeGoalMayExist = journal.goalActivation != null && new Set([
+        "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+      ]).has(journal.state);
+      if (!nativeGoalMayExist) recovered = recoverCreatedFiles(bridgeRoot, operationId);
+      else {
+        const rpc = createCodexGoalRpc(evidence, codexHome);
+        let rpcError: unknown;
+        try {
+          rpc.probe();
+          recovered = reconcileGoalActivation(
+            bridgeRoot,
+            operationId,
+            rpc.get(journal.targetThreadId, codexGoalSetBinding(operationId, journal.goalActivation!)),
+          );
+        } catch (error) {
+          rpcError = error;
+          throw error;
+        } finally {
+          try { rpc.dispose(); }
+          catch (cleanupError) {
+            if (rpcError != null) {
+              throw new AggregateError([rpcError, cleanupError], "Codex Goal recovery and RPC cleanup failed");
+            }
+            throw cleanupError;
+          }
+        }
+      }
       writeJson(option(argv, "--out"), recovered);
     } catch (error) {
       operationFailed = true;
@@ -1211,15 +1256,20 @@ export function main(argv = process.argv.slice(2)): void {
   if (rebuilt.file.digest !== stored.digest) {
     throw new Error("source inventory, render mode, Goal state/policy, or target binding changed after the plan was created");
   }
-  assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode);
+  assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
   const byId = new Map(loaded.sources.map((source) => [source.desktop.sessionId, source]));
   const operations: Array<{ sessionId: string; operationId: string; threadId: string; status: "applied" | "already-applied" }> = [];
   assertJsonOutputWritable(option(argv, "--out"));
   const lock = acquireCodexTargetLock(codexHome);
+  let goalRpc: ReturnType<typeof createCodexGoalRpc> | null = null;
   let operationFailed = false;
   let operationError: unknown;
   try {
     assertCodexDesktopClosed();
+    goalRpc = rebuilt.targetPlans.some((plan) => plan.goalActivation != null)
+      ? createCodexGoalRpc(evidence, codexHome)
+      : null;
+    goalRpc?.probe();
     const states = rebuilt.targetPlans.map(inspectCodexTargetPlan);
     const collision = states.findIndex((state) => state === "collision");
     if (collision >= 0) {
@@ -1228,6 +1278,33 @@ export function main(argv = process.argv.slice(2)): void {
     for (let index = 0; index < rebuilt.targetPlans.length; index += 1) {
       const journalInput = operationJournalInputForPlan(rebuilt.targetPlans[index]);
       if (states[index] === "already-applied") {
+        if (rebuilt.targetPlans[index].goalActivation != null) {
+          let journal;
+          try {
+            journal = loadOperationJournal(bridgeRoot, journalInput.operationId);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+              throw new Error("already-applied Goal target has no importer operation journal");
+            }
+            throw error;
+          }
+          if (goalRpc == null) {
+            throw new Error("already-applied Goal target has no importer operation journal");
+          }
+          if (journal.state !== "goal-verified" && journal.state !== "committed") {
+            throw new Error(`already-applied Goal target is not verified in journal state ${journal.state}`);
+          }
+          assertCodexGoalReadback(
+            goalRpc.get(
+              rebuilt.targetPlans[index].threadId,
+              codexGoalSetBinding(
+                rebuilt.targetPlans[index].operationId,
+                rebuilt.targetPlans[index].goalActivation!,
+              ),
+            ),
+            rebuilt.targetPlans[index].goalActivation!.expectedReadback,
+          );
+        }
         commitOperationJournalIfPresent(bridgeRoot, journalInput);
         continue;
       }
@@ -1248,6 +1325,7 @@ export function main(argv = process.argv.slice(2)): void {
       }
       const operation = applyCodexTarget(targetPlan, {
         allowWrite: true, evidence, bridgeRoot, lock,
+        ...(goalRpc == null ? {} : { goalRpc }),
       });
       operations.push({ sessionId: selected.sessionId, operationId: operation.operationId, threadId: targetPlan.threadId, status: "applied" });
     }
@@ -1256,7 +1334,18 @@ export function main(argv = process.argv.slice(2)): void {
     operationError = error;
     throw error;
   } finally {
-    releaseTargetLockAfter(lock, operationFailed, operationError);
+    let rpcCleanupError: unknown;
+    try { goalRpc?.dispose(); } catch (error) { rpcCleanupError = error; }
+    try { releaseTargetLockAfter(lock, operationFailed, operationError); } catch (lockError) {
+      if (rpcCleanupError != null) {
+        throw new AggregateError([operationError, rpcCleanupError, lockError].filter(Boolean), "Codex target cleanup failed");
+      }
+      throw lockError;
+    }
+    if (rpcCleanupError != null) {
+      if (operationFailed) throw new AggregateError([operationError, rpcCleanupError], "Codex target operation and RPC cleanup failed");
+      throw rpcCleanupError;
+    }
   }
   writeJson(option(argv, "--out"), {
     renderMode: stored.renderMode,

@@ -15,6 +15,8 @@ export interface CodexTargetEvidence {
   appAsarSha256: string;
   codexExeSha256: string;
   containerVersion?: string;
+  /** Live executable path, populated only by installed-artifact verification. */
+  codexExePath?: string;
 }
 
 interface SnapshotArtifact {
@@ -105,6 +107,7 @@ export function loadInstalledCodexTargetEvidence(manifestPath: string): CodexTar
     internalVersion: electron.version,
     appAsarSha256: String(appAsar.sha256),
     codexExeSha256: String(codexExe.sha256),
+    codexExePath: path.join(active.InstallLocation as string, "app", "resources", "codex.exe"),
   };
   if (typeof installed?.msix_version === "string") evidence.containerVersion = installed.msix_version;
   return evidence;

@@ -46,7 +46,7 @@ flow. `codex-to-claude` remains an executable alias for compatibility.
 
 ```text
 threadpass scan  [selection]
-threadpass plan  [selection] --render-mode <mode> --evidence <manifest.json> --out <plan.json>
+threadpass plan  [selection] --render-mode <mode> --goal-mode <mode> --evidence <manifest.json> --out <plan.json>
 threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json>
 threadpass recover --operation <id> --evidence <manifest.json>
 ```
@@ -55,13 +55,17 @@ threadpass recover --operation <id> --evidence <manifest.json>
 archive option, `scan` inventories active and archived records; `plan` safely
 defaults to active. A plan's SHA-256 digest binds the selected source revisions,
 render mode, canonical Codex home and database, audited target hashes, generated
-thread IDs, rollout paths/hashes, and active-context upper bounds. `apply`
+thread IDs, rollout paths/hashes, active-context upper bounds, Goal source hash,
+Goal target thread/readback, and target capability fingerprint. `apply`
 rebuilds all of it and refuses if any binding changed.
 
 `recover` is the only supported interrupted-write cleanup path. It revalidates
 the exact installed Codex build, requires Codex Desktop to be closed, obtains
 the same exclusive target lock, verifies rollout ownership before changing the
-database, and records the recovered attempt. A later `apply` starts a new
+database, and records the recovered attempt. If a Goal RPC may have crossed its
+commit boundary, recovery first performs native `thread/goal/get`: an exact
+readback rolls forward, an absent Goal permits importer-artifact cleanup, and a
+differing Goal stops without clearing or overwriting it. A later `apply` starts a new
 validated attempt without discarding earlier attempt history.
 
 Selection options:
@@ -78,6 +82,8 @@ Selection options:
 | `--claude-home`, `--codex-home`, `--sessions-root` | override detected roots |
 | `--out <path>` | JSON output file; omitted or `-` writes stdout |
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
+| `--goal-mode <mode>` | `migrate` (default) or `skip`; independent of render mode and included in the digest |
+| `--no-migrate-goal` | alias for `--goal-mode skip`; conflicting flags are rejected |
 
 Apply requirements:
 
@@ -94,6 +100,15 @@ write, and treats an exact previous result as already applied. Each committed
 session gets a bridge sidecar and operation journal. An unexpected runtime or
 I/O failure can still leave earlier session transactions committed, so inspect
 the plan and loss report before confirmation.
+
+For Claude → Codex, live Goal activation uses only the audited 41059
+`codex.exe app-server --stdio --enable goals` methods. The target thread is
+registered first, then `thread/goal/get` must be absent or exactly idempotent,
+`thread/goal/set` is issued, and a fresh-process `thread/goal/get` must match the
+confirmed objective, active status, and portable budget. Provider counters are
+not treated as equivalent. The unconditional `thread/goal/clear` RPC is never a
+recovery primitive because it has no Goal id or compare-and-clear precondition.
+See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 
 ## Selecting conversations
 

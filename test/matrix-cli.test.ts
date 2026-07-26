@@ -21,6 +21,7 @@ import {
 import { buildImportPlan, type ImportPlan } from "../src/import-plan.ts";
 import { planGoalMigration } from "../src/goal.ts";
 import { CLAUDE_GOAL_TARGET_CAPABILITY_ID } from "../src/claude-goal-target.ts";
+import { CODEX_GOAL_TARGET_CAPABILITY_ID } from "../src/codex-goal-target.ts";
 import type { ClaudeDesktopSourceSession } from "../src/claude-desktop-source.ts";
 import type { ClaudeSourceTranscript } from "../src/claude-source.ts";
 import { HISTORICAL_SAFETY, type BridgeEvent } from "../src/ir.ts";
@@ -76,12 +77,18 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
       dbPath: "C:\\.codex\\state_5.sqlite",
       bridgeRoot: "C:\\bridge",
       evidence: { internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b" },
+      goalCapabilityId: "codex.goal-app-server/v1",
+      goalCapabilityFingerprint: "c".repeat(64),
       sessions: [],
     },
   };
   const semantic = matrixPlanDigest(base);
   assert.notEqual(matrixPlanDigest({ ...base, renderMode: "verbatim" }), semantic);
   assert.notEqual(matrixPlanDigest({ ...base, goalMode: "skip" }), semantic);
+  assert.notEqual(matrixPlanDigest({
+    ...base,
+    target: { ...base.target, goalCapabilityFingerprint: "d".repeat(64) },
+  }), semantic);
   assert.notEqual(matrixPlanDigest({ ...base, target: { ...base.target, codexHome: "D:\\.codex" } }), semantic);
   assert.notEqual(matrixPlanDigest({
     ...base,
@@ -220,6 +227,8 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     target: {
       codexHome: path.join(root, "codex"), dbPath: path.join(root, "state.sqlite"), bridgeRoot,
       evidence: { internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b" }, sessions: [],
+      goalCapabilityId: "codex.goal-app-server/v1" as const,
+      goalCapabilityFingerprint: "c".repeat(64),
     },
   };
   assert.notEqual(matrixPlanDigest(reverseLike), first.file.digest);
@@ -305,6 +314,21 @@ test("only the wired Claude Goal capability is accepted as ready", () => {
   }]).plan;
   assert.throws(() => assertGoalMigrationReady(ready, "migrate"), /not wired/);
   assert.doesNotThrow(() => assertGoalMigrationReady(ready, "migrate", CLAUDE_GOAL_TARGET_CAPABILITY_ID));
+});
+
+test("Goal readiness is direction-specific for the Codex app-server capability", () => {
+  const ready = buildImportPlan([{
+    sessionId: "reverse-ready", cwd: "C:/repo",
+    goalDecision: planGoalMigration({
+      version: 1, authority: "native-transcript", provider: "claude", sourceThreadId: "reverse-ready",
+      sourceGoalId: null, objective: "ship", status: "active", migrationEligible: true,
+      tokenBudget: null, tokensUsed: null, timeUsedSeconds: null, createdAtMs: 1, updatedAtMs: 1,
+      locator: { sourcePath: "C:/claude.jsonl", recordIndex: 0, table: null, key: "reverse-ready" },
+      sourceSha256: "b".repeat(64),
+    }, "migrate", CODEX_GOAL_TARGET_CAPABILITY_ID),
+  }]).plan;
+  assert.doesNotThrow(() => assertGoalMigrationReady(ready, "migrate", CODEX_GOAL_TARGET_CAPABILITY_ID));
+  assert.throws(() => assertGoalMigrationReady(ready, "migrate", CLAUDE_GOAL_TARGET_CAPABILITY_ID), /not wired/);
 });
 
 test("forward CLI plan includes protocol-only active and archived rollouts without target mutation", () => {
