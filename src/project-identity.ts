@@ -22,9 +22,10 @@ export function stripWindowsExtendedPrefix(input: string): string {
 /**
  * Build the identity used everywhere source and target projects are compared.
  *
- * Existing paths go through `realpath`, so junctions, symlinks, and filesystem
- * casing converge. Missing paths still receive absolute/path normalization. The
- * display path retains useful casing; `key` is the case-insensitive Windows key.
+ * Existing host-native paths go through `realpath`, so junctions, symlinks, and
+ * filesystem casing converge. Missing and foreign-platform paths still receive
+ * absolute/path normalization. The display path retains useful casing; `key` is
+ * the case-insensitive Windows key.
  */
 export function canonicalProjectIdentity(input: string): ProjectIdentity {
   if (typeof input !== "string" || input.length === 0) {
@@ -32,13 +33,15 @@ export function canonicalProjectIdentity(input: string): ProjectIdentity {
   }
 
   let candidate = stripWindowsExtendedPrefix(input);
-  if (process.platform === "win32") candidate = candidate.replaceAll("/", "\\");
-  candidate = path.resolve(candidate);
+  const usesWindowsPaths = isWindowsAbsolutePath(input, candidate);
+  const pathApi = usesWindowsPaths ? path.win32 : path;
+  if (usesWindowsPaths) candidate = candidate.replaceAll("/", "\\");
+  candidate = pathApi.resolve(candidate);
 
-  const exists = fs.existsSync(candidate);
+  const exists = (!usesWindowsPaths || process.platform === "win32") && fs.existsSync(candidate);
   let canonical = exists ? fs.realpathSync.native(candidate) : candidate;
-  canonical = stripWindowsExtendedPrefix(path.normalize(canonical));
-  canonical = removeTrailingSeparators(canonical);
+  canonical = stripWindowsExtendedPrefix(pathApi.normalize(canonical));
+  canonical = removeTrailingSeparators(canonical, pathApi);
 
   return { path: canonical, key: canonical.toLowerCase(), exists };
 }
@@ -52,8 +55,24 @@ export function sameProject(
   return leftIdentity.key === rightIdentity.key;
 }
 
-function removeTrailingSeparators(input: string): string {
-  const root = path.parse(input).root;
+function isWindowsAbsolutePath(input: string, withoutExtendedPrefix: string): boolean {
+  if (process.platform === "win32"
+    || /^\\\\\?\\|^\/\/\?\//.test(input)
+    || /^[a-z]:[\\/]/i.test(withoutExtendedPrefix)
+    || withoutExtendedPrefix.startsWith("\\\\")) {
+    return true;
+  }
+
+  if (!/^\/\/[^/\\]+\/[^/\\]+(?:[\\/]|$)/.test(withoutExtendedPrefix)) return false;
+
+  // POSIX permits implementation-defined meaning for exactly two leading
+  // slashes. Preserve an existing host path; when it is absent, there is no
+  // lexical distinction, so prefer cross-host comparison as a Windows UNC path.
+  return !fs.existsSync(withoutExtendedPrefix);
+}
+
+function removeTrailingSeparators(input: string, pathApi: typeof path.win32): string {
+  const root = pathApi.parse(input).root;
   if (input === root) return input;
   const withoutTrailing = input.replace(/[\\/]+$/, "");
   return withoutTrailing === "" ? root : withoutTrailing;
