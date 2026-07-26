@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { summarizeLosses, type LossObservation, type LossReport } from "./loss-report.ts";
 import { canonicalProjectIdentity } from "./project-identity.ts";
+import { planGoalMigration, type GoalMigrationDecision } from "./goal.ts";
 import {
   selectSessions,
   type SelectionOptions,
@@ -14,6 +15,7 @@ export interface ImportPlanSessionSummary extends SelectionSession {
   title?: string;
   messageCount?: number;
   losses?: readonly LossObservation[];
+  goalDecision?: GoalMigrationDecision;
 }
 
 export interface ImportPlanSession {
@@ -30,10 +32,11 @@ export interface ImportPlanSession {
   sourceSha256: string | null;
   title: string | null;
   messageCount: number | null;
+  goalDecision: GoalMigrationDecision;
 }
 
 export interface ImportPlan {
-  version: 1;
+  version: 2;
   selection: {
     archive: "active" | "all" | "archived";
     projectScope: "all" | "projects" | "projectless" | "existing-targets";
@@ -78,10 +81,13 @@ export function buildImportPlan(
   ));
 
   const plan: ImportPlan = {
-    version: 1,
+    version: 2,
     selection: normalizeSelection(selection),
     sessions: rows,
-    losses: summarizeLosses(selected),
+    losses: summarizeLosses(selected.map((session) => ({
+      ...session,
+      losses: [...(session.losses ?? []), ...goalDecisionLosses(session.goalDecision ?? planGoalMigration(null))],
+    }))),
   };
   const { canonicalJson, digest } = digestImportPlan(plan);
   return { plan, canonicalJson, digest };
@@ -133,7 +139,33 @@ function toPlanSession(session: ImportPlanSessionSummary): ImportPlanSession {
     sourceSha256: session.sourceSha256 ?? null,
     title: session.title ?? null,
     messageCount: session.messageCount ?? null,
+    goalDecision: session.goalDecision ?? planGoalMigration(null),
   };
+}
+
+function goalDecisionLosses(decision: GoalMigrationDecision): LossObservation[] {
+  if (decision.status === "pending_target_implementation") {
+    return [{
+      kind: "goal_activation_target_unimplemented",
+      count: 1,
+      detail: "An eligible authoritative source Goal is bound to the plan but cannot be activated by this version.",
+    }];
+  }
+  if (decision.status === "skipped_by_policy" && decision.sourceGoalSha256 != null) {
+    return [{
+      kind: "goal_migration_skipped_by_policy",
+      count: 1,
+      detail: "The authoritative source Goal remains historical because Goal migration was skipped.",
+    }];
+  }
+  if (decision.status === "historical_only") {
+    return [{
+      kind: "goal_ineligible_historical_only",
+      count: 1,
+      detail: "The terminal or otherwise ineligible authoritative source Goal remains historical.",
+    }];
+  }
+  return [];
 }
 
 function normalizeSelection(selection: SelectionOptions): ImportPlan["selection"] {

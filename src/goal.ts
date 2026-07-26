@@ -14,6 +14,23 @@ export type GoalLifecycleStatus =
   | "complete"
   | "failed";
 export type GoalMigrationMode = "migrate" | "skip";
+export type GoalMigrationEligibility = "eligible" | "ineligible" | "absent";
+export type GoalMigrationDecisionStatus =
+  | "pending_target_implementation"
+  | "skipped_by_policy"
+  | "historical_only"
+  | "no_source_goal";
+
+/** A deterministic plan-time decision. This unit never assigns a target Goal. */
+export interface GoalMigrationDecision {
+  mode: GoalMigrationMode;
+  sourceGoalSha256: string | null;
+  eligibility: GoalMigrationEligibility;
+  sourceStatus: GoalLifecycleStatus | null;
+  status: GoalMigrationDecisionStatus;
+  targetCapabilityId: string | null;
+  targetGoalId: string | null;
+}
 
 export interface GoalSourceLocator {
   sourcePath: string;
@@ -119,6 +136,82 @@ export function parseGoalMigrationMode(value?: unknown): GoalMigrationMode {
   if (value == null || value === "") return "migrate";
   if (value === "migrate" || value === "skip") return value;
   throw new Error(`Invalid Goal migration mode: ${String(value)} (expected migrate or skip)`);
+}
+
+export function planGoalMigration(
+  goal: CanonicalGoalSnapshot | null | undefined,
+  mode: GoalMigrationMode = "migrate",
+): GoalMigrationDecision {
+  const parsedMode = parseGoalMigrationMode(mode);
+  if (goal == null) {
+    const decision: GoalMigrationDecision = {
+      mode: parsedMode,
+      sourceGoalSha256: null,
+      eligibility: "absent",
+      sourceStatus: null,
+      status: "no_source_goal",
+      targetCapabilityId: null,
+      targetGoalId: null,
+    };
+    validateGoalMigrationDecision(decision);
+    return decision;
+  }
+  validateCanonicalGoalSnapshot(goal);
+  const decision: GoalMigrationDecision = {
+    mode: parsedMode,
+    sourceGoalSha256: goal.sourceSha256,
+    eligibility: goal.migrationEligible ? "eligible" : "ineligible",
+    sourceStatus: goal.status,
+    status: parsedMode === "skip"
+      ? "skipped_by_policy"
+      : goal.migrationEligible ? "pending_target_implementation" : "historical_only",
+    targetCapabilityId: null,
+    targetGoalId: null,
+  };
+  validateGoalMigrationDecision(decision);
+  return decision;
+}
+
+export function validateGoalMigrationDecision(value: unknown): asserts value is GoalMigrationDecision {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Invalid Goal migration decision: expected an object");
+  }
+  const decision = value as Partial<GoalMigrationDecision>;
+  if (decision.mode !== "migrate" && decision.mode !== "skip") {
+    throw new Error(`Invalid Goal migration mode: ${String(decision.mode)} (expected migrate or skip)`);
+  }
+  const mode = parseGoalMigrationMode(decision.mode);
+  if (!new Set(["eligible", "ineligible", "absent"]).has(String(decision.eligibility))) {
+    throw new Error(`Invalid Goal migration eligibility: ${String(decision.eligibility)}`);
+  }
+  const statuses = new Set<GoalMigrationDecisionStatus>([
+    "pending_target_implementation", "skipped_by_policy", "historical_only", "no_source_goal",
+  ]);
+  if (!statuses.has(decision.status as GoalMigrationDecisionStatus)) {
+    throw new Error(`Invalid Goal migration decision status: ${String(decision.status)}`);
+  }
+  if (decision.targetCapabilityId !== null || decision.targetGoalId !== null) {
+    throw new Error("Invalid Goal migration target binding: activation is not implemented");
+  }
+  if (decision.eligibility === "absent") {
+    if (decision.sourceGoalSha256 !== null || decision.sourceStatus !== null || decision.status !== "no_source_goal") {
+      throw new Error("Invalid absent Goal migration decision");
+    }
+    return;
+  }
+  if (typeof decision.sourceGoalSha256 !== "string" || !/^[0-9a-f]{64}$/.test(decision.sourceGoalSha256)) {
+    throw new Error("Invalid Goal migration sourceGoalSha256");
+  }
+  if (!GOAL_STATUSES.has(decision.sourceStatus as GoalLifecycleStatus)) {
+    throw new Error(`Invalid Goal migration source status: ${String(decision.sourceStatus)}`);
+  }
+  if ((decision.sourceStatus === "active") !== (decision.eligibility === "eligible")) {
+    throw new Error("Invalid Goal migration status eligibility");
+  }
+  const expected = mode === "skip"
+    ? "skipped_by_policy"
+    : decision.eligibility === "eligible" ? "pending_target_implementation" : "historical_only";
+  if (decision.status !== expected) throw new Error("Invalid Goal migration policy decision");
 }
 
 export function createCanonicalGoalSnapshot(input: CanonicalGoalInput): CanonicalGoalSnapshot {

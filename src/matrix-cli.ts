@@ -45,6 +45,12 @@ import type { CodexTargetEvidence } from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
 import { targetPathFor } from "./claude-target.ts";
 import type { CodexSession } from "./types.ts";
+import {
+  parseGoalMigrationMode,
+  planGoalMigration,
+  validateGoalMigrationDecision,
+  type GoalMigrationMode,
+} from "./goal.ts";
 
 export interface MatrixTargetSessionPlan {
   sourceSessionId: string;
@@ -94,9 +100,10 @@ export interface MatrixTargetBinding {
 }
 
 export interface MatrixReversePlanFile {
-  schema: "agentryx.import-plan/v2";
+  schema: "agentryx.import-plan/v3";
   direction: "claude-to-codex";
   renderMode: RenderMode;
+  goalMode: GoalMigrationMode;
   digest: string;
   plan: ImportPlan;
   target: MatrixTargetBinding;
@@ -118,9 +125,10 @@ export interface MatrixForwardTargetBinding {
 }
 
 export interface MatrixForwardPlanFile {
-  schema: "agentryx.import-plan/v2";
+  schema: "agentryx.import-plan/v3";
   direction: "codex-to-claude";
   renderMode: RenderMode;
+  goalMode: GoalMigrationMode;
   digest: string;
   plan: ImportPlan;
   target: MatrixForwardTargetBinding;
@@ -154,6 +162,7 @@ export interface BuildForwardMatrixPlanOptions {
   bridgeRoot: string;
   selection?: SelectionOptions;
   renderMode?: RenderMode;
+  goalMode?: GoalMigrationMode;
 }
 
 export interface BuiltForwardMatrixPlan {
@@ -778,6 +787,7 @@ function loadForwardSource(
   codexHome: string | undefined,
   claudeHome: string,
   renderMode: RenderMode,
+  goalMode: GoalMigrationMode,
 ): ForwardLoadedSource {
   const bundle = codexHome == null
     ? codexRolloutToBridgeBundle(session)
@@ -806,6 +816,7 @@ function loadForwardSource(
       title: session.codexName || session.title || undefined,
       messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
       losses: forwardLossObservations(bundle.conversation.events, renderMode),
+      goalDecision: planGoalMigration(bundle.conversation.goalState, goalMode),
     },
   };
 }
@@ -820,17 +831,21 @@ export function buildForwardMatrixPlan(
   options: BuildForwardMatrixPlanOptions,
 ): BuiltForwardMatrixPlan {
   const renderMode = options.renderMode ?? "semantic";
+  const goalMode = options.goalMode ?? "migrate";
   const selection = options.selection ?? {};
   const claudeHome = canonicalExistingPath(options.claudeHome);
   const bridgeRoot = canonicalExistingPath(options.bridgeRoot);
-  const sources = sessions.map((session) => loadForwardSource(session, options.codexHome, claudeHome, renderMode));
+  const sources = sessions.map((session) => loadForwardSource(
+    session, options.codexHome, claudeHome, renderMode, goalMode,
+  ));
   const summaries = sources.map((source) => source.summary);
   const built = buildImportPlan(summaries, { selection });
   const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
   const withoutDigest: Omit<MatrixForwardPlanFile, "digest"> = {
-    schema: "agentryx.import-plan/v2",
+    schema: "agentryx.import-plan/v3",
     direction: "codex-to-claude",
     renderMode,
+    goalMode,
     plan: built.plan,
     target: {
       claudeHome,
@@ -881,11 +896,20 @@ function summariesForRenderMode(sources: LoadedSource[], renderMode: RenderMode)
   });
 }
 
+function summariesForPlan(
+  sources: LoadedSource[], renderMode: RenderMode, goalMode: GoalMigrationMode,
+): ImportPlanSessionSummary[] {
+  return summariesForRenderMode(sources, renderMode).map((summary, index) => ({
+    ...summary,
+    goalDecision: planGoalMigration(sources[index]?.bundle?.conversation.goalState, goalMode),
+  }));
+}
+
 function buildMatrixPlan(
-  sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode,
+  sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode, goalMode: GoalMigrationMode,
   codexHome: string, dbPath: string, bridgeRoot: string, evidence: CodexTargetEvidence,
 ): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
-  const summaries = summariesForRenderMode(sources, renderMode);
+  const summaries = summariesForPlan(sources, renderMode, goalMode);
   const built = buildImportPlan(summaries, { selection });
   const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
   const targetPlans = built.plan.sessions.map((selected) => {
@@ -897,9 +921,10 @@ function buildMatrixPlan(
     );
   });
   const withoutDigest: Omit<MatrixReversePlanFile, "digest"> = {
-    schema: "agentryx.import-plan/v2",
+    schema: "agentryx.import-plan/v3",
     direction: "claude-to-codex",
     renderMode,
+    goalMode,
     plan: built.plan,
     target: {
       codexHome: canonicalExistingPath(codexHome),
@@ -945,7 +970,35 @@ export const MATRIX_HELP =
   "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
-  "[--render-mode semantic|verbatim] [--direction claude-to-codex|codex-to-claude]\n";
+  "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
+  "[--direction claude-to-codex|codex-to-claude]\n";
+
+export function goalMigrationModeOption(argv: string[]): GoalMigrationMode {
+  const values = optionValues(argv, "--goal-mode");
+  const modes = values.map(parseGoalMigrationMode);
+  if (new Set(modes).size > 1) throw new Error("conflicting --goal-mode values");
+  const explicit = modes.at(-1);
+  const noMigrate = flag(argv, "--no-migrate-goal");
+  if (noMigrate && explicit != null && explicit !== "skip") {
+    throw new Error("--no-migrate-goal contradicts --goal-mode migrate");
+  }
+  return noMigrate ? "skip" : parseGoalMigrationMode(explicit);
+}
+
+export function assertGoalMigrationReady(plan: ImportPlan, goalMode: GoalMigrationMode): void {
+  for (const session of plan.sessions) {
+    validateGoalMigrationDecision(session.goalDecision);
+    if (session.goalDecision.mode !== goalMode) {
+      throw new Error(`Goal migration mode mismatch for session ${session.sessionId}`);
+    }
+    if (session.goalDecision.status === "pending_target_implementation") {
+      throw new Error(
+        `Goal migration for session ${session.sessionId} is eligible but target activation is not implemented; ` +
+        "re-plan with --goal-mode skip (or --no-migrate-goal) for conversation-only apply",
+      );
+    }
+  }
+}
 
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
@@ -962,12 +1015,14 @@ export function main(argv = process.argv.slice(2)): void {
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
       const inventory = loadForwardCodexInventory(codexHome);
       const renderMode = parseRenderMode(option(argv, "--render-mode"));
+      const goalMode = goalMigrationModeOption(argv);
       const built = buildForwardMatrixPlan(inventory.sessions, {
         codexHome,
         claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
         bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
         selection,
         renderMode,
+        goalMode,
       });
       writeJson(option(argv, "--out"), {
         codexHome: canonicalExistingPath(codexHome),
@@ -980,6 +1035,7 @@ export function main(argv = process.argv.slice(2)): void {
         },
         direction,
         renderMode,
+        goalMode,
         selected: built.file.plan.sessions,
         losses: built.file.plan.losses,
         sourceDigest: built.sourceDigest,
@@ -988,7 +1044,8 @@ export function main(argv = process.argv.slice(2)): void {
     }
     const loaded = loadSources(argv, selection);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
-    const built = buildImportPlan(summariesForRenderMode(loaded.sources, renderMode), { selection });
+    const goalMode = goalMigrationModeOption(argv);
+    const built = buildImportPlan(summariesForPlan(loaded.sources, renderMode, goalMode), { selection });
     writeJson(option(argv, "--out"), {
       workspaceDir: loaded.workspaceDir,
       inventory: {
@@ -1000,6 +1057,7 @@ export function main(argv = process.argv.slice(2)): void {
       },
       unreadableRecords: loaded.unreadable,
       renderMode,
+      goalMode,
       selected: built.plan.sessions,
       losses: built.plan.losses,
       sourceDigest: built.digest,
@@ -1018,6 +1076,7 @@ export function main(argv = process.argv.slice(2)): void {
         bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
         selection,
         renderMode: parseRenderMode(option(argv, "--render-mode")),
+        goalMode: goalMigrationModeOption(argv),
       });
       writeJson(option(argv, "--out"), matrix.file);
       return;
@@ -1031,8 +1090,9 @@ export function main(argv = process.argv.slice(2)): void {
     if (!dbPath) throw new Error(`no Codex state database found under ${codexHome}`);
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
     const evidence = loadInstalledCodexTargetEvidence(evidencePath);
+    const goalMode = goalMigrationModeOption(argv);
     const matrix = buildMatrixPlan(
-      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")),
+      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")), goalMode,
       codexHome, dbPath, bridgeRoot, evidence,
     );
     writeJson(option(argv, "--out"), matrix.file);
@@ -1071,9 +1131,13 @@ export function main(argv = process.argv.slice(2)): void {
 
   const planPath = option(argv, "--plan");
   if (planPath) {
-    const candidate = JSON.parse(fs.readFileSync(planPath, "utf8")) as Partial<MatrixPlanFile>;
-    if (candidate.schema === "agentryx.import-plan/v2" && candidate.direction === "codex-to-claude") {
+    const candidate = JSON.parse(fs.readFileSync(planPath, "utf8")) as Record<string, unknown>;
+    if ((candidate.schema === "agentryx.import-plan/v2" || candidate.schema === "agentryx.import-plan/v3") &&
+      candidate.direction === "codex-to-claude") {
       throw new Error("codex-to-claude apply is read-only and is not implemented yet");
+    }
+    if (candidate.schema === "agentryx.import-plan/v2" && candidate.direction === "claude-to-codex") {
+      throw new Error("legacy v2 import plan predates Goal migration binding; regenerate the plan before apply");
     }
   }
   const evidencePath = option(argv, "--evidence");
@@ -1082,12 +1146,14 @@ export function main(argv = process.argv.slice(2)): void {
     throw new Error("apply requires --plan, --evidence, and --confirm <plan digest>");
   }
   const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixPlanFile;
-  if (stored.schema !== "agentryx.import-plan/v2" || stored.direction !== "claude-to-codex" ||
-    !["semantic", "verbatim"].includes(stored.renderMode)) {
+  if (stored.schema !== "agentryx.import-plan/v3" || stored.direction !== "claude-to-codex" ||
+    !["semantic", "verbatim"].includes(stored.renderMode) ||
+    !["migrate", "skip"].includes(stored.goalMode)) {
     throw new Error("unsupported import plan");
   }
   const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
     schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
+    goalMode: stored.goalMode,
     plan: stored.plan, target: stored.target,
   };
   if (matrixPlanDigest(storedContent) !== stored.digest) {
@@ -1098,6 +1164,12 @@ export function main(argv = process.argv.slice(2)): void {
   if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
     throw new Error("apply render mode differs from the confirmed plan");
   }
+  const requestedGoalMode = option(argv, "--goal-mode") != null || flag(argv, "--no-migrate-goal")
+    ? goalMigrationModeOption(argv)
+    : null;
+  if (requestedGoalMode != null && requestedGoalMode !== stored.goalMode) {
+    throw new Error("apply Goal migration mode differs from the confirmed plan");
+  }
   const loaded = loadSources(argv, selectionFromPlan(stored.plan));
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
   const dbPath = findStateDb(codexHome);
@@ -1105,12 +1177,13 @@ export function main(argv = process.argv.slice(2)): void {
   const evidence = loadInstalledCodexTargetEvidence(evidencePath);
   const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
   const rebuilt = buildMatrixPlan(
-    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode,
+    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode, stored.goalMode,
     codexHome, dbPath, bridgeRoot, evidence,
   );
   if (rebuilt.file.digest !== stored.digest) {
-    throw new Error("source inventory, render mode, or target binding changed after the plan was created");
+    throw new Error("source inventory, render mode, Goal state/policy, or target binding changed after the plan was created");
   }
+  assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode);
   const byId = new Map(loaded.sources.map((source) => [source.desktop.sessionId, source]));
   const operations: Array<{ sessionId: string; operationId: string; threadId: string; status: "applied" | "already-applied" }> = [];
   assertJsonOutputWritable(option(argv, "--out"));
@@ -1159,6 +1232,11 @@ export function main(argv = process.argv.slice(2)): void {
   }
   writeJson(option(argv, "--out"), {
     renderMode: stored.renderMode,
+    goalMode: stored.goalMode,
+    goalDecisions: stored.plan.sessions.map((session) => ({
+      sessionId: session.sessionId,
+      ...session.goalDecision,
+    })),
     applied: operations.filter((operation) => operation.status === "applied").length,
     alreadyApplied: operations.filter((operation) => operation.status === "already-applied").length,
     operations,

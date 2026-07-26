@@ -7,16 +7,19 @@ import path from "node:path";
 import {
   matrixPlanDigest,
   buildForwardMatrixPlan,
+  assertGoalMigrationReady,
   forwardLossObservations,
   main,
   nativeToolUseIds,
   formatCliError,
+  goalMigrationModeOption,
   selectionFromPlan,
   selectionOptions,
   transcriptIdentityError,
   type MatrixPlanFile,
 } from "../src/matrix-cli.ts";
-import type { ImportPlan } from "../src/import-plan.ts";
+import { buildImportPlan, type ImportPlan } from "../src/import-plan.ts";
+import { planGoalMigration } from "../src/goal.ts";
 import type { ClaudeDesktopSourceSession } from "../src/claude-desktop-source.ts";
 import type { ClaudeSourceTranscript } from "../src/claude-source.ts";
 import { HISTORICAL_SAFETY, type BridgeEvent } from "../src/ir.ts";
@@ -37,7 +40,7 @@ test("matrix CLI leaves absent repeatable selectors unconstrained", () => {
 
 test("an empty normalized plan selector remains unconstrained during apply", () => {
   const plan = {
-    version: 1,
+    version: 2,
     selection: {
       archive: "all", projectScope: "all", sessionIds: [], projects: [],
       fromMs: null, toMs: null, limit: null,
@@ -54,11 +57,12 @@ test("an empty normalized plan selector remains unconstrained during apply", () 
 
 test("the confirmed matrix digest binds render mode and target identity", () => {
   const base: Omit<Extract<MatrixPlanFile, { direction: "claude-to-codex" }>, "digest"> = {
-    schema: "agentryx.import-plan/v2",
+    schema: "agentryx.import-plan/v3",
     direction: "claude-to-codex",
     renderMode: "semantic",
+    goalMode: "migrate",
     plan: {
-      version: 1,
+      version: 2,
       selection: { archive: "active", projectScope: "all", sessionIds: [], projects: [], fromMs: null, toMs: null, limit: null },
       sessions: [],
       losses: {
@@ -76,11 +80,25 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
   };
   const semantic = matrixPlanDigest(base);
   assert.notEqual(matrixPlanDigest({ ...base, renderMode: "verbatim" }), semantic);
+  assert.notEqual(matrixPlanDigest({ ...base, goalMode: "skip" }), semantic);
   assert.notEqual(matrixPlanDigest({ ...base, target: { ...base.target, codexHome: "D:\\.codex" } }), semantic);
   assert.notEqual(matrixPlanDigest({
     ...base,
     target: { ...base.target, evidence: { ...base.target.evidence, appAsarSha256: "changed" } },
   }), semantic);
+});
+
+test("Goal mode CLI defaults independently and rejects contradictory aliases", () => {
+  assert.equal(goalMigrationModeOption(["plan", "--render-mode", "verbatim"]), "migrate");
+  assert.equal(goalMigrationModeOption(["plan", "--goal-mode", "skip"]), "skip");
+  assert.equal(goalMigrationModeOption(["plan", "--no-migrate-goal"]), "skip");
+  assert.equal(goalMigrationModeOption(["plan", "--goal-mode=skip", "--no-migrate-goal"]), "skip");
+  assert.throws(() => goalMigrationModeOption([
+    "plan", "--goal-mode", "migrate", "--no-migrate-goal",
+  ]), /contradicts/);
+  assert.throws(() => goalMigrationModeOption([
+    "plan", "--goal-mode", "migrate", "--goal-mode", "skip",
+  ]), /conflicting/);
 });
 
 function codexSession(
@@ -140,6 +158,7 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     bridgeRoot,
     selection: { archive: "all" },
     renderMode: "semantic",
+    goalMode: "migrate",
   });
   const second = buildForwardMatrixPlan([session], {
     claudeHome,
@@ -179,9 +198,10 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
   assert.ok(eventKinds.has("media"));
 
   const reverseLike = {
-    schema: "agentryx.import-plan/v2" as const,
+    schema: "agentryx.import-plan/v3" as const,
     direction: "claude-to-codex" as const,
     renderMode: first.file.renderMode,
+    goalMode: first.file.goalMode,
     plan: first.file.plan,
     target: {
       codexHome: path.join(root, "codex"), dbPath: path.join(root, "state.sqlite"), bridgeRoot,
@@ -223,6 +243,39 @@ test("apply rejects a stored forward plan before requesting reverse-only evidenc
     () => main(["apply", "--plan", planPath]),
     /codex-to-claude apply is read-only and is not implemented yet/,
   );
+});
+
+test("legacy reverse v2 plans are rejected with a Goal migration message", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-legacy-goal-"));
+  const planPath = path.join(root, "legacy.json");
+  fs.writeFileSync(planPath, JSON.stringify({
+    schema: "agentryx.import-plan/v2", direction: "claude-to-codex", renderMode: "semantic",
+    goalMode: "skip",
+  }));
+  assert.throws(() => main(["apply", "--plan", planPath]), /predates Goal migration binding; regenerate/);
+});
+
+test("active migrate fails closed while skip and historical-only decisions are ready", () => {
+  const decision = (mode: "migrate" | "skip", eligible: boolean) => ({
+    mode, sourceGoalSha256: "a".repeat(64),
+    eligibility: eligible ? "eligible" as const : "ineligible" as const,
+    sourceStatus: eligible ? "active" as const : "complete" as const,
+    status: mode === "skip" ? "skipped_by_policy" as const
+      : eligible ? "pending_target_implementation" as const : "historical_only" as const,
+    targetCapabilityId: null, targetGoalId: null,
+  });
+  const plan = (goalDecision: ReturnType<typeof decision>) => buildImportPlan([{
+    sessionId: "goal", cwd: "C:/repo", goalDecision,
+  }]).plan;
+  assert.throws(() => assertGoalMigrationReady(plan(decision("migrate", true)), "migrate"), /not implemented/);
+  assert.doesNotThrow(() => assertGoalMigrationReady(plan(decision("skip", true)), "skip"));
+  assert.doesNotThrow(() => assertGoalMigrationReady(plan(decision("migrate", false)), "migrate"));
+  const absent = buildImportPlan([{
+    sessionId: "none", cwd: "C:/repo", goalDecision: planGoalMigration(null),
+  }]).plan;
+  assert.doesNotThrow(() => assertGoalMigrationReady(absent, "migrate"));
+  assert.ok(plan(decision("skip", true)).losses.byKind.some((loss) =>
+    loss.kind === "goal_migration_skipped_by_policy"));
 });
 
 test("forward CLI plan includes protocol-only active and archived rollouts without target mutation", () => {

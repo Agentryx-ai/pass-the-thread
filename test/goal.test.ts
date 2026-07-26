@@ -15,11 +15,14 @@ import {
 import {
   createCanonicalGoalSnapshot,
   parseGoalMigrationMode,
+  planGoalMigration,
   readCodexGoalSnapshot,
   validateCanonicalGoalSnapshot,
+  validateGoalMigrationDecision,
 } from "../src/goal.ts";
 import { readBridgeConversation, writeBridgeConversation } from "../src/bridge-store.ts";
 import { buildForwardMatrixPlan } from "../src/matrix-cli.ts";
+import { buildImportPlan } from "../src/import-plan.ts";
 import type { CodexSession } from "../src/types.ts";
 
 const json = (value: unknown): string => JSON.stringify(value);
@@ -122,6 +125,44 @@ test("Goal migration mode defaults to migrate and only accepts explicit modes", 
   assert.equal(parseGoalMigrationMode("migrate"), "migrate");
   assert.equal(parseGoalMigrationMode("skip"), "skip");
   assert.throws(() => parseGoalMigrationMode("off"), /expected migrate or skip/);
+});
+
+function canonicalGoal(status: "active" | "complete", marker: string = status) {
+  return createCanonicalGoalSnapshot({
+    authority: "native-transcript", provider: "claude", sourceThreadId: "claude-goal",
+    sourceGoalId: null, objective: `Goal ${marker}`, status, tokenBudget: null,
+    tokensUsed: null, timeUsedSeconds: null, createdAtMs: null, updatedAtMs: null,
+    locator: { sourcePath: "C:/session.jsonl", recordIndex: 0, table: null, key: "claude-goal" },
+    sourceMaterial: { marker, status },
+  });
+}
+
+test("Goal migration decisions are deterministic and never bind an unimplemented target", () => {
+  const active = canonicalGoal("active");
+  const migrate = planGoalMigration(active);
+  const skip = planGoalMigration(active, "skip");
+  assert.deepEqual(migrate, {
+    mode: "migrate", sourceGoalSha256: active.sourceSha256, eligibility: "eligible",
+    sourceStatus: "active", status: "pending_target_implementation",
+    targetCapabilityId: null, targetGoalId: null,
+  });
+  assert.equal(skip.status, "skipped_by_policy");
+  assert.equal(planGoalMigration(canonicalGoal("complete")).status, "historical_only");
+  assert.equal(planGoalMigration(null).status, "no_source_goal");
+  assert.doesNotThrow(() => validateGoalMigrationDecision(skip));
+  assert.throws(() => validateGoalMigrationDecision({ ...skip, targetGoalId: "implicit" }), /not implemented/);
+});
+
+test("Goal mode, source hash, and status change the source inventory digest", () => {
+  const build = (goalDecision: ReturnType<typeof planGoalMigration>) => buildImportPlan([{
+    sessionId: "goal-digest", cwd: "C:/repo", sourceSha256: "transcript-stable", goalDecision,
+  }]);
+  const active = canonicalGoal("active", "a");
+  const baseline = build(planGoalMigration(active));
+  assert.notEqual(build(planGoalMigration(active, "skip")).digest, baseline.digest);
+  assert.notEqual(build(planGoalMigration(canonicalGoal("active", "b"))).digest, baseline.digest);
+  assert.notEqual(build(planGoalMigration(canonicalGoal("complete", "terminal"))).digest, baseline.digest);
+  assert.equal(baseline.plan.sessions[0]?.sourceSha256, "transcript-stable");
 });
 
 test("Claude goal_status attachments preserve history and reduce last status as authoritative", () => {
@@ -347,6 +388,40 @@ test("forward production planning captures the authoritative Codex Goal", () => 
     bridgeRoot: path.join(root, "bridge"),
   });
   assert.equal(built.bundles[0]?.conversation.goalState?.objective, "planned Goal");
+  assert.equal(built.file.goalMode, "migrate");
+  assert.equal(built.file.plan.sessions[0]?.goalDecision.status, "pending_target_implementation");
+  assert.equal(built.file.plan.sessions[0]?.goalDecision.sourceGoalSha256,
+    built.bundles[0]?.conversation.goalState?.sourceSha256);
+  assert.ok(built.file.plan.losses.byKind.some((loss) => loss.kind === "goal_activation_target_unimplemented"));
+
+  const skipped = buildForwardMatrixPlan([codexSession(rollout)], {
+    codexHome, claudeHome: path.join(root, ".claude"), bridgeRoot: path.join(root, "bridge"),
+    goalMode: "skip",
+  });
+  assert.equal(skipped.file.plan.sessions[0]?.goalDecision.status, "skipped_by_policy");
+  assert.equal(skipped.bundles[0]?.conversation.goalState?.objective, "planned Goal");
+  assert.ok(skipped.bundles[0]?.conversation.events.every((event) => !event.safety.activateGoal));
+});
+
+test("a forward Goal-only change updates plan digests but not conversation target identity", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "goal-forward-digest-"));
+  const rollout = path.join(root, "rollout.jsonl");
+  fs.writeFileSync(rollout, `${json({ type: "session_meta", payload: { id: "codex-goal" } })}\n`, "utf8");
+  const codexHome = path.join(root, ".codex");
+  const dbPath = createGoalDb(codexHome, { objective: "first" });
+  const options = { codexHome, claudeHome: path.join(root, ".claude"), bridgeRoot: path.join(root, "bridge") };
+  const first = buildForwardMatrixPlan([codexSession(rollout)], options);
+  const db = new DatabaseSync(dbPath);
+  db.prepare("UPDATE thread_goals SET objective = ?, updated_at_ms = ? WHERE thread_id = ?")
+    .run("second", 3000, "codex-goal");
+  db.close();
+  const second = buildForwardMatrixPlan([codexSession(rollout)], options);
+  assert.notEqual(second.file.digest, first.file.digest);
+  assert.notEqual(second.sourceDigest, first.sourceDigest);
+  assert.notEqual(second.file.plan.sessions[0]?.goalDecision.sourceGoalSha256,
+    first.file.plan.sessions[0]?.goalDecision.sourceGoalSha256);
+  assert.equal(second.file.plan.sessions[0]?.sourceSha256, first.file.plan.sessions[0]?.sourceSha256);
+  assert.equal(second.file.target.sessions[0]?.targetPath, first.file.target.sessions[0]?.targetPath);
 });
 
 test("Goal changes create a new bridge revision even when rollout bytes do not change", () => {
