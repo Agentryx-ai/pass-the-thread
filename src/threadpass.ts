@@ -1,6 +1,7 @@
 #!/usr/bin/env -S node --experimental-sqlite
+import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 import { main as runLegacyCommand } from "./cli.ts";
 import { formatCliError, main as runMatrixCommand } from "./matrix-cli.ts";
@@ -45,7 +46,11 @@ export function dispatch(argv: string[]): number {
   return 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+if (
+  process.argv[1] &&
+  fs.realpathSync.native(fileURLToPath(import.meta.url)) ===
+    fs.realpathSync.native(path.resolve(process.argv[1]))
+) {
   try {
     process.exitCode = dispatch(process.argv.slice(2));
   } catch (error) {

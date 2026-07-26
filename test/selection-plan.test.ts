@@ -38,14 +38,41 @@ test("extended drive and UNC prefixes are stripped without changing their target
 
 test("canonical project identity normalizes Windows spellings and compares without case", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "project-identity-"));
-  const extended = "\\\\?\\" + dir.replaceAll("/", "\\") + "\\";
-  const ordinary = dir.toUpperCase().replaceAll("/", "\\");
+  const nativeIdentity = canonicalProjectIdentity(dir + path.sep);
+  assert.equal(nativeIdentity.exists, true);
+  assert.equal(nativeIdentity.path.endsWith(path.sep), false);
 
+  const windowsPath = process.platform === "win32"
+    ? path.join(dir, "missing", "Project")
+    : String.raw`C:\work\Project`;
+  const extended = "\\\\?\\" + windowsPath.replaceAll("/", "\\") + "\\";
+  const ordinary = windowsPath.toUpperCase().replaceAll("\\", "/");
   const identity = canonicalProjectIdentity(extended);
-  assert.equal(identity.exists, true);
+  assert.equal(identity.exists, false);
+  assert.equal(identity.path, path.win32.normalize(windowsPath));
   assert.equal(identity.path.endsWith("\\"), false);
   assert.equal(identity.key, identity.path.toLowerCase());
   assert.equal(sameProject(identity, ordinary), true);
+});
+
+test("forward- and backslash UNC spellings share a canonical identity", () => {
+  const forward = "//localhost/__pass_the_thread_missing_share__/Project/";
+  const backward = String.raw`\\localhost\__pass_the_thread_missing_share__\project`;
+
+  assert.equal(canonicalProjectIdentity(forward).exists, false);
+  assert.equal(sameProject(forward, backward), true);
+});
+
+test("an existing POSIX double-slash path retains host-native identity", {
+  skip: process.platform === "win32",
+}, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "project-identity-double-slash-"));
+  const doubleSlash = `/${dir}`;
+
+  const identity = canonicalProjectIdentity(doubleSlash);
+  assert.equal(identity.exists, true);
+  assert.equal(identity.path, fs.realpathSync.native(dir));
+  assert.equal(sameProject(identity, dir), true);
 });
 
 test("canonical project identity resolves and normalizes a path even when absent", () => {
