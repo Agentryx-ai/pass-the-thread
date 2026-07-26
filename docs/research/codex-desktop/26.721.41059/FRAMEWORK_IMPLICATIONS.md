@@ -14,7 +14,7 @@ The required path must be independently inspectable because:
 
 ## Architectural lineage
 
-The canonical starting point is the current `codex-to-claude` architecture, not Baton. Its useful separation of concerns is:
+The canonical starting point was the predecessor `codex-to-claude` architecture, not Baton. Its useful separation of concerns is:
 
 ```text
 versioned source reader
@@ -25,7 +25,7 @@ versioned source reader
   -> operation journal / recovery
 ```
 
-This should evolve into one extensible framework that can host additional source/target adapters and import directions. It should not be documented as a completed product or as a fixed repository split. The eventual repository/product name and the supported direction matrix are still undecided.
+That architecture is evolving into Pass the Thread, an extensible framework that can host additional source/target adapters and import directions. This version-pinned research still documents evidence and design lineage, not a claim that every direction is complete.
 
 ## Minimum acceptance criteria for a new direction
 

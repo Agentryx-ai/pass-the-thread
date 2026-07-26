@@ -1,6 +1,7 @@
 #!/usr/bin/env -S node --experimental-strip-types --experimental-sqlite
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 import { resolveCodexHome, resolveClaudeHome } from "./paths.ts";
 import { loadDesktopSessions } from "./codex-source.ts";
@@ -44,7 +45,7 @@ import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
 import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
 import type { SessionFilter } from "./types.ts";
 
-const HELP = `codex-import — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
+export const LEGACY_HELP = `threadpass — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
 
 By default this selects exactly the conversations Codex Desktop shows in its list:
 it reads Codex's own index (state_*.sqlite) and replicates the Desktop filter
@@ -53,11 +54,11 @@ threads, excluding subagent/worker threads. (Falls back to a rollout-file scan w
 the equivalent filter if no index DB is present.)
 
 USAGE
-  codex-import list   [options] [--json]
-  codex-import fix    [--dry-run] [--prune]
+  threadpass list   [options] [--json]
+  threadpass fix    [--dry-run] [--prune]
         de-duplicate transcripts, re-sync titles from them, and report or remove
         records for conversations this tool no longer imports
-  codex-import import [options] [--dry-run] [--force] [--include-reasoning] [--version-tag <s>]
+  threadpass import [options] [--dry-run] [--force] [--include-reasoning] [--version-tag <s>]
 
 SELECTION (Codex Desktop conversation-list criteria)
   --interactive-only   drop non-interactive 'codex exec' automation runs
@@ -119,7 +120,7 @@ function fmtDate(ms: number | null): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-function main(argv: string[]): number {
+export function main(argv: string[]): number {
   const swallowed = npmSwallowedFlags(argv);
   if (swallowed.length > 0) {
     process.stderr.write(npmSwallowedMessage(swallowed, argv));
@@ -128,7 +129,7 @@ function main(argv: string[]): number {
 
   const command = argv[0];
   if (!command || command === "-h" || command === "--help" || command === "help") {
-    process.stdout.write(HELP);
+    process.stdout.write(LEGACY_HELP);
     return command ? 0 : 1;
   }
 
@@ -684,8 +685,10 @@ function main(argv: string[]): number {
     return 0;
   }
 
-  process.stderr.write(`Unknown command: ${command}\n\n${HELP}`);
+  process.stderr.write(`Unknown command: ${command}\n\n${LEGACY_HELP}`);
   return 1;
 }
 
-process.exit(main(process.argv.slice(2)));
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  process.exitCode = main(process.argv.slice(2));
+}

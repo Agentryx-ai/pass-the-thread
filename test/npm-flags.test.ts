@@ -48,5 +48,5 @@ test("only a literal true counts", () => {
 test("the message names the flag and a command that works", () => {
   const msg = npmSwallowedMessage(["--dry-run"], ["import"]);
   assert.match(msg, /--dry-run never reached this tool/);
-  assert.match(msg, /src\/cli\.ts import --dry-run/);
+  assert.match(msg, /src\/threadpass\.ts import --dry-run/);
 });

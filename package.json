@@ -1,21 +1,29 @@
 {
-  "name": "codex-to-claude",
+  "name": "pass-the-thread",
   "version": "0.1.0",
-  "description": "Versioned conversation import adapters for Codex and Claude, with typed fidelity and deterministic plans.",
+  "description": "Provider-neutral agent session portability with typed fidelity and deterministic plans.",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": ["codex", "claude", "claude-code", "openai", "anthropic", "session", "transcript", "migration", "import", "ai-agent"],
-  "bin": { "codex-to-claude": "src/cli.ts" },
+  "repository": { "type": "git", "url": "git+https://github.com/Agentryx-ai/pass-the-thread.git" },
+  "homepage": "https://github.com/Agentryx-ai/pass-the-thread#readme",
+  "bugs": { "url": "https://github.com/Agentryx-ai/pass-the-thread/issues" },
+  "bin": {
+    "threadpass": "dist/threadpass.js",
+    "codex-to-claude": "dist/threadpass.js"
+  },
   "scripts": {
-    "list": "node --experimental-strip-types --experimental-sqlite src/cli.ts list",
-    "import": "node --experimental-strip-types --experimental-sqlite src/cli.ts import",
-    "import:dry": "node --experimental-strip-types --experimental-sqlite src/cli.ts import --dry-run",
-    "matrix": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts",
-    "matrix:scan": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts scan",
-    "matrix:plan": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts plan",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "list": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts list",
+    "import": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts import",
+    "import:dry": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts import --dry-run",
+    "matrix": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts",
+    "matrix:scan": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts scan",
+    "matrix:plan": "node --experimental-strip-types --experimental-sqlite src/threadpass.ts plan",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --experimental-strip-types --experimental-sqlite --test test/*.test.ts",
-    "verify": "npm run typecheck && npm test"
+    "verify": "npm run typecheck && npm run build && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
@@ -23,7 +31,7 @@
   },
   "engines": { "node": ">=22.6.0" },
   "files": [
-    "src",
+    "dist",
     "docs",
     "reference/codex-desktop/26.721.41059/README.md",
     "reference/codex-desktop/26.721.41059/manifest.json",

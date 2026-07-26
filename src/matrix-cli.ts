@@ -610,18 +610,19 @@ function assertJsonOutputWritable(target: string | undefined): void {
   fs.accessSync(fs.existsSync(resolved) ? resolved : parent, fs.constants.W_OK);
 }
 
-function usage(): never {
-  throw new Error(
-    "usage: matrix-cli <scan|plan|apply|recover> [--archive active|archived|all] " +
-    "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
-    "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
-    "[--render-mode semantic|verbatim]",
-  );
-}
+export const MATRIX_HELP =
+  "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
+  "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
+  "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
+  "[--render-mode semantic|verbatim]\n";
 
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
-  if (!command || command === "help" || flag(argv, "--help")) usage();
+  if (!command) throw new Error(MATRIX_HELP.trimEnd());
+  if (command === "help" || flag(argv, "--help")) {
+    process.stdout.write(MATRIX_HELP);
+    return;
+  }
   if (command === "scan") {
     const selection = selectionOptions(argv);
     if (selection.archive == null) selection.archive = "all";
@@ -691,7 +692,7 @@ export function main(argv = process.argv.slice(2)): void {
     }
     return;
   }
-  if (command !== "apply") usage();
+  if (command !== "apply") throw new Error(MATRIX_HELP.trimEnd());
 
   const planPath = option(argv, "--plan");
   const evidencePath = option(argv, "--evidence");

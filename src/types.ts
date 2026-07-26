@@ -1,5 +1,5 @@
 // Shared types for Codex rollout (source) and Claude Code transcript (target).
-// See docs/research/CODEX_TO_CLAUDE_SESSION_IMPORT.md for the format contract.
+// See docs/FORMATS.md for the format contract.
 
 import type { RenderMode } from "./render-mode.ts";
 

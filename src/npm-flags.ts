@@ -34,7 +34,7 @@ export function npmSwallowedMessage(swallowed: readonly string[], argv: readonly
     `ERROR: ${swallowed.join(" and ")} never reached this tool.\n` +
     `npm has flags of the same name and consumed them, so this would have run for\n` +
     `real. Run it directly instead:\n\n` +
-    `  node --experimental-strip-types --experimental-sqlite src/cli.ts ${args}\n\n` +
+    `  node --experimental-strip-types --experimental-sqlite src/threadpass.ts ${args}\n\n` +
     `or use a script with the flag already in it:  npm run import:dry\n`
   );
 }

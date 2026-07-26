@@ -273,7 +273,7 @@ export function mapSessionToClaudeLines(
           {
             type: "text",
             text:
-              "[codex-to-claude] Codex compacted the conversation here. Earlier turns " +
+              "[pass-the-thread] Codex compacted the conversation here. Earlier turns " +
               "were replaced by a summary that is encrypted in the source session, so " +
               "only the messages Codex carried forward are present.",
           },

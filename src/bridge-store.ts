@@ -50,9 +50,8 @@ export interface StoreResult {
 }
 
 export function defaultBridgeRoot(home = os.homedir()): string {
-  // Keep storage under the existing project's namespace while the public
-  // product/repository name remains undecided. The schema itself is provider
-  // neutral and can back additional source/target adapters later.
+  // Keep the predecessor path so existing sidecars remain discoverable. The
+  // schema itself is provider neutral and can back more adapters later.
   return path.join(home, ".codex-to-claude", "bridge-v1");
 }
 

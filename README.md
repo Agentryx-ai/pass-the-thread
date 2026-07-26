@@ -1,10 +1,10 @@
 <div align="center">
 
-# codex-to-claude
+# Pass the Thread
 
 **Move agent conversations without flattening away the structures that make them usable.**
 
-This repository began as Codex → Claude and keeps that stable command. It is now also the home of a shared, provider-neutral conversation IR and an experimental Claude → Codex adapter. The name of a broader product is intentionally undecided.
+Provider-neutral session portability with a shared conversation IR, deterministic plans, and fidelity-aware adapters. This project succeeds `codex-to-claude`; its original Codex → Claude flow remains available through the same commands and the legacy executable alias.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.6-brightgreen.svg)](#requirements)
@@ -16,6 +16,8 @@ This repository began as Codex → Claude and keeps that stable command. It is n
 ## ✨ What's New
 
 *Newest first.*
+
+The linked pull requests below are historical work from the `codex-to-claude` predecessor repository.
 
 - 🧭 **Importer-matrix foundation** — a lossless raw-envelope store, typed historical IR, archive/project/session/date selection, deterministic plans and loss reports, and a version-gated Codex Desktop 26.721.41059 target adapter now live beside the original converter. The built-in Codex importer was audited because “50 succeeded” did not preserve native tool calls, reasoning, images, compaction, world state, or turn context in the observed targets. See the [version-pinned research](docs/research/codex-desktop/26.721.41059/README.md).
 - 🧷 **A conversation you carried on in Claude is left alone** — `--force` treated "Claude replayed the history into the file" and "you answered in it" as the same kind of change and overwrote both, which cost a message. It now tells them apart and refuses the second, naming what would have been deleted and counting only lines somebody typed. Continuing an import also makes Claude fork it and repoint the record at a session of its own; those records are recognised as no longer ours, left alone rather than duplicated, and searched for messages sent there. ([#9](https://github.com/Agentryx-ai/codex-to-claude/pull/9), [#10](https://github.com/Agentryx-ai/codex-to-claude/pull/10))
@@ -33,13 +35,13 @@ This repository began as Codex → Claude and keeps that stable command. It is n
 ## Quick start
 
 ```bash
-git clone https://github.com/Agentryx-ai/codex-to-claude
-cd codex-to-claude
-node --experimental-strip-types --experimental-sqlite src/cli.ts list
+git clone https://github.com/Agentryx-ai/pass-the-thread
+cd pass-the-thread
+node --experimental-strip-types --experimental-sqlite src/threadpass.ts list
 ```
 
 ```console
-$ codex-to-claude list
+$ threadpass list
 20 conversation(s), 20 after refinements.  [vscode:19  cli:1]
 
 By project:
@@ -50,19 +52,19 @@ By project:
     1  (no project)
     ...
 
-$ codex-to-claude import --dry-run          # writes nothing
-$ codex-to-claude import --title-prefix "[Codex] "
+$ threadpass import --dry-run          # writes nothing
+$ threadpass import --title-prefix "[Codex] "
 ```
 
 Restart Claude Desktop. The conversations are in the sidebar under the same
 projects, and you can open and continue them.
 
-Flags belong on `node src/cli.ts`, not on `npm run` — see
+Flags belong on `node src/threadpass.ts`, not on `npm run` — see
 [CLI](docs/CLI.md#pass-flags-to-node-not-through-npm).
 
 ## Experimental importer matrix
 
-The original command remains Codex → Claude. The new `matrix` command adds the first reverse adapter without forking the core into another repository:
+The original Codex → Claude commands remain available. The provider matrix adds the first reverse adapter through the same `threadpass` entrypoint:
 
 ```text
 Codex  ── existing converter ──► Claude
@@ -72,8 +74,8 @@ Claude ── shared IR + 41059 adapter ──► Codex
 Start with a read-only inventory or a saved deterministic plan:
 
 ```bash
-npm run matrix:scan -- --archive all
-npm run matrix:plan -- --archive active --project-scope existing-targets \
+threadpass scan --archive all
+threadpass plan --archive active --project-scope existing-targets \
   --render-mode semantic \
   --evidence reference/codex-desktop/26.721.41059/manifest.json \
   --out import-plan.json

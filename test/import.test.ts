@@ -508,7 +508,7 @@ test("Codex memory citations leave the reply and become metadata", () => {
   assert.equal(citations.length, 1);
   assert.equal(
     citations[0],
-    "[codex-to-claude] Codex cited its memory here:\n" +
+    "[pass-the-thread] Codex cited its memory here:\n" +
       "  MEMORY.md:1-10 — eagle-eye-clone HIL and physical-evidence context\n" +
       "  MEMORY.md:46-53 — evidence artifact handling context\n" +
       "  conversation 019f4f03-c457-7043-a408-9b54025c6e0c",

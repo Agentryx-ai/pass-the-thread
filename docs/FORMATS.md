@@ -149,7 +149,7 @@ It is not an item type. It arrives as plain text inside an assistant `output_tex
 So it is treated like everything else that is real content authored by neither side: lifted out of the reply and re-emitted as an `isMeta` line, the shape sub-agent reports get.
 
 ```
-[codex-to-claude] Codex cited its memory here:
+[pass-the-thread] Codex cited its memory here:
   MEMORY.md:46-53 — evidence artifact handling context
   conversation 019f4f03-c457-7043-a408-9b54025c6e0c
 ```

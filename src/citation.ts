@@ -67,5 +67,5 @@ export function renderCitation(inner: string): string {
 
   // An envelope with neither section carries nothing worth a line of its own.
   if (lines.length === 0) return "";
-  return `[codex-to-claude] Codex cited its memory here:\n${lines.join("\n")}`;
+  return `[pass-the-thread] Codex cited its memory here:\n${lines.join("\n")}`;
 }

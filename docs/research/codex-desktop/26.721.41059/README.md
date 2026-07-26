@@ -1,6 +1,6 @@
 # Codex Desktop 26.721.41059 importer snapshot
 
-This directory records a version-pinned investigation of Codex Desktop's built-in external-agent importer. It is evidence for an in-development, unified importer framework; it is not a claim that the framework or any particular product name is complete.
+This directory records a version-pinned investigation of Codex Desktop's built-in external-agent importer. It is evidence for the in-development Pass the Thread framework; it is not a claim that every provider direction is complete.
 
 ## Snapshot
 
@@ -23,7 +23,7 @@ The built-in importer completed quickly and reported every selected session as a
 
 The UI offers useful coarse categories, but Chat sessions are one aggregate choice. It exposes no per-session picker, search, date range, archive filter, or "existing projects only" filter. The Projects checkbox is independent from the Chats checkbox and does not constrain which chats are imported.
 
-These observations justify retaining an inspectable importer path with explicit selection, preview, validation, loss reporting, and recovery. The architectural starting point is the existing `codex-to-claude` source-reader / conversion / target-writer design. Baton is not the source architecture. The eventual public name and import-direction matrix remain undecided.
+These observations justify retaining an inspectable importer path with explicit selection, preview, validation, loss reporting, and recovery. The architectural starting point is the predecessor `codex-to-claude` source-reader / conversion / target-writer design. Baton is not the source architecture. That lineage now continues under the Pass the Thread name; the supported direction matrix remains explicitly versioned and incomplete.
 
 ## Evidence labels
 

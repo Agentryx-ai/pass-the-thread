@@ -1,15 +1,19 @@
-# CLI
+# Pass the Thread CLI
 
 ```
-codex-to-claude list    [options] [--json]
-codex-to-claude import  [options] [--dry-run] [--force]
-codex-to-claude fix     [--dry-run] [--prune]
+threadpass list    [options] [--json]
+threadpass import  [options] [--dry-run] [--force]
+threadpass fix     [--dry-run] [--prune]
+threadpass scan    [selection]
+threadpass plan    [selection] --evidence <manifest.json> --out <plan.json>
+threadpass apply   --plan <plan.json> --confirm <digest> --evidence <manifest.json>
+threadpass recover --operation <id> --evidence <manifest.json>
 ```
 
 Without a global install, that is:
 
 ```bash
-node --experimental-strip-types --experimental-sqlite src/cli.ts list
+node --experimental-strip-types --experimental-sqlite src/threadpass.ts list
 ```
 
 ## Pass flags to node, not through npm
@@ -18,7 +22,7 @@ npm has its own `--dry-run` and `--force`, and consumes them instead of
 forwarding them to the script — `npm run import -- --dry-run` reached the tool
 as a plain `import` and wrote for real. It now detects the swallowed flag and
 refuses, and `npm run import:dry` has the flag baked in. Everything else belongs
-on a direct `node src/cli.ts` invocation.
+on a direct `node src/threadpass.ts` invocation.
 
 ## Commands
 
@@ -37,14 +41,14 @@ imported — `--prune` removes those.
 
 ## Experimental Claude → Codex matrix
 
-The matrix command uses the same repository and shared conversion core; it is
-not a separate successor project.
+These commands use the same shared conversion core as the legacy Codex → Claude
+flow. `codex-to-claude` remains an executable alias for compatibility.
 
 ```text
-node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts scan  [selection]
-node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts plan  [selection] --render-mode <mode> --evidence <manifest.json> --out <plan.json>
-node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts apply --plan <plan.json> --confirm <digest> --evidence <manifest.json>
-node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts recover --operation <id> --evidence <manifest.json>
+threadpass scan  [selection]
+threadpass plan  [selection] --render-mode <mode> --evidence <manifest.json> --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json>
+threadpass recover --operation <id> --evidence <manifest.json>
 ```
 
 `scan` and `plan` are read-only with respect to Codex and Claude data. With no
