@@ -44,7 +44,26 @@ import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/
 import { assertSupportedCodexTarget, loadInstalledCodexTargetEvidence } from "./version-gate.ts";
 import type { CodexTargetEvidence } from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
-import { targetPathFor } from "./claude-target.ts";
+import { transcriptPathFor } from "./claude-target.ts";
+import {
+  applyForwardSessions,
+  CLAUDE_FORWARD_RENDERER_FINGERPRINT,
+  CLAUDE_FORWARD_RENDERER_ID,
+  deterministicWrapperPath,
+  forwardSessionApplyPlan,
+  isRenderableForwardImage,
+  loadForwardApplyJournal,
+  renderForwardClaudeTranscript,
+  rollbackForwardSessions,
+  type ForwardSessionApplyPlan,
+} from "./claude-forward-target.ts";
+import {
+  findActiveWorkspaceDir,
+  findRecordFor,
+  countWorkspaceDirs,
+  resolveDesktopSessionsRoot,
+  signedInWorkspaceDir,
+} from "./claude-desktop-target.ts";
 import type { CodexSession } from "./types.ts";
 import {
   assertClaudeGoalCondition,
@@ -128,15 +147,25 @@ export interface MatrixReversePlanFile {
 
 export interface MatrixForwardTargetSessionPlan {
   sourceSessionId: string;
+  operationId: string;
   targetPath: string;
   targetExists: boolean;
+  targetSha256: string | null;
+  renderedSha256: string;
+  wrapperPath: string | null;
+  wrapperSha256: string | null;
+  renderedWrapperSha256: string | null;
 }
 
 export interface MatrixForwardTargetBinding {
+  codexHome: string | null;
   claudeHome: string;
   bridgeRoot: string;
+  workspaceDir: string | null;
   renderPolicy: {
     includeReasoning: true;
+    rendererId: typeof CLAUDE_FORWARD_RENDERER_ID;
+    rendererFingerprint: string;
     goalCapabilityId: typeof CLAUDE_GOAL_TARGET_CAPABILITY_ID;
     goalCapabilityFingerprint: string;
   };
@@ -182,6 +211,8 @@ export interface BuildForwardMatrixPlanOptions {
   selection?: SelectionOptions;
   renderMode?: RenderMode;
   goalMode?: GoalMigrationMode;
+  workspaceDir?: string | null;
+  expectedTargets?: readonly MatrixForwardTargetSessionPlan[];
 }
 
 export interface BuiltForwardMatrixPlan {
@@ -189,6 +220,7 @@ export interface BuiltForwardMatrixPlan {
   bundles: BridgeBundle[];
   summaries: ImportPlanSessionSummary[];
   sourceDigest: string;
+  applyPlans: ForwardSessionApplyPlan[];
 }
 
 function loadForwardCodexInventory(codexHome: string): ForwardCodexInventory {
@@ -514,11 +546,14 @@ export function forwardLossObservations(
         : `protocol_record_sidecar_only:${event.recordType}`);
     } else if (event.kind === "turn_context") add("turn_context_sidecar_only");
     else if (event.kind === "world_state") add("world_state_sidecar_only");
+    else if (event.kind === "reasoning") add("reasoning_rendered_as_inert_metadata");
     else if (event.kind === "goal_snapshot") add("historical_goal_not_rendered_or_activated");
-    else if (event.kind === "task_notification") add("task_notification_not_rendered");
+    // task_notification is rendered as readable inert metadata, never raw chat.
     else if (event.kind === "access_snapshot") add("access_snapshot_not_rendered_or_applied");
-    else if (event.kind === "media" && event.mediaType !== "image") {
-      add(`unsupported_media_not_rendered:${event.mediaType}`);
+    else if (event.kind === "media" && !isRenderableForwardImage(event)) {
+      add(event.mediaType === "image"
+        ? "unsupported_image_sidecar_only"
+        : `unsupported_media_not_rendered:${event.mediaType}`);
     }
   }
   return [...counts]
@@ -808,15 +843,18 @@ function loadForwardSource(
   renderMode: RenderMode,
   goalMode: GoalMigrationMode,
 ): ForwardLoadedSource {
+  const canonicalSession = { ...session, rolloutPath: canonicalExistingPath(session.rolloutPath) };
   const bundle = codexHome == null
-    ? codexRolloutToBridgeBundle(session)
-    : codexRolloutWithGoalToBridgeBundle(session, codexHome);
-  const target = targetPathFor(claudeHome, session);
-  const targetPath = canonicalExistingPath(target.targetPath);
+    ? codexRolloutToBridgeBundle(canonicalSession)
+    : codexRolloutWithGoalToBridgeBundle(canonicalSession, codexHome);
+  const targetPath = canonicalExistingPath(transcriptPathFor(
+    claudeHome, session.cwdOriginal || session.cwd, session.sessionId,
+  ));
+  const boundSession = { ...canonicalSession, sourceContentSha256: bundle.conversation.sourceContentSha256 };
   const projectRoot = session.cwdOriginal || session.cwd;
   const targetExists = fs.existsSync(targetPath);
   return {
-    session,
+    session: boundSession,
     bundle,
     targetPath,
     targetExists,
@@ -847,6 +885,51 @@ function loadForwardSource(
   };
 }
 
+function buildForwardApplyPlan(
+  source: ForwardLoadedSource,
+  workspaceDir: string | null,
+  renderMode: RenderMode,
+  goalMode: GoalMigrationMode,
+  expected?: MatrixForwardTargetSessionPlan,
+): ForwardSessionApplyPlan {
+  let existingWrapper = workspaceDir == null ? null : findRecordFor(workspaceDir, source.session.sessionId);
+  if (workspaceDir != null) {
+    const matches: string[] = [];
+    for (const name of fs.readdirSync(workspaceDir)) {
+      if (!name.startsWith("local_") || !name.endsWith(".json")) continue;
+      const candidate = path.join(workspaceDir, name);
+      try {
+        const record = JSON.parse(fs.readFileSync(candidate, "utf8")) as { cliSessionId?: unknown };
+        if (record.cliSessionId === source.session.sessionId) matches.push(candidate);
+      } catch { /* unrelated unreadable records do not become overwrite candidates */ }
+    }
+    if (matches.length > 1) throw new Error(`multiple Claude wrappers target ${source.session.sessionId}; selection is ambiguous`);
+    if (matches.length === 1 && existingWrapper?.path !== matches[0]) {
+      existingWrapper = findRecordFor(workspaceDir, source.session.sessionId);
+    }
+  }
+  const newWrapperPath = workspaceDir == null ? null : deterministicWrapperPath(workspaceDir, source.session.sessionId);
+  if (existingWrapper == null && newWrapperPath != null && fs.existsSync(newWrapperPath)) {
+    let cliSessionId: unknown;
+    try { cliSessionId = (JSON.parse(fs.readFileSync(newWrapperPath, "utf8")) as { cliSessionId?: unknown }).cliSessionId; }
+    catch { throw new Error(`deterministic Claude wrapper collision for ${source.session.sessionId}`); }
+    if (cliSessionId !== source.session.sessionId) {
+      throw new Error(`Claude wrapper was repointed or collides for ${source.session.sessionId}; it will not be overwritten`);
+    }
+  }
+  let wrapperPath = workspaceDir == null ? null : canonicalExistingPath(existingWrapper?.path ?? newWrapperPath!);
+  if (expected) {
+    const wrapperMatches = wrapperPath === expected.wrapperPath ||
+      (wrapperPath != null && expected.wrapperPath != null &&
+        canonicalExistingPath(wrapperPath).toLowerCase() === canonicalExistingPath(expected.wrapperPath).toLowerCase());
+    if (!wrapperMatches) throw new Error(`forward wrapper binding changed for ${source.session.sessionId}`);
+    // Retain the exact confirmed spelling before deriving the session operation id.
+    wrapperPath = expected.wrapperPath;
+  }
+  const lines = renderForwardClaudeTranscript(source.session, source.bundle, { renderMode, goalMode });
+  return forwardSessionApplyPlan(source.session, lines, source.targetPath, wrapperPath);
+}
+
 /**
  * Build a deterministic, read-only Codex-to-Claude matrix plan from an isolated
  * inventory. The only filesystem operations are source reads and target
@@ -859,14 +942,56 @@ export function buildForwardMatrixPlan(
   const renderMode = options.renderMode ?? "semantic";
   const goalMode = options.goalMode ?? "migrate";
   const selection = options.selection ?? {};
-  const claudeHome = canonicalExistingPath(options.claudeHome);
-  const bridgeRoot = canonicalExistingPath(options.bridgeRoot);
+  // Plan-bound target roots must not change merely because apply creates them.
+  const claudeHome = path.resolve(options.claudeHome);
+  const bridgeRoot = path.resolve(options.bridgeRoot);
+  const workspaceDir = options.workspaceDir == null ? null : path.resolve(options.workspaceDir);
   const sources = sessions.map((session) => loadForwardSource(
     session, options.codexHome, claudeHome, renderMode, goalMode,
   ));
+  const expectedById = new Map((options.expectedTargets ?? []).map((target) => [target.sourceSessionId, target]));
+  for (const source of sources) {
+    const expected = expectedById.get(source.session.sessionId);
+    if (expected) {
+      source.summary.targetExists = expected.targetSha256 != null;
+      source.targetPath = expected.targetPath;
+    }
+  }
   const summaries = sources.map((source) => source.summary);
   const built = buildImportPlan(summaries, { selection });
   const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
+  const selectedApplyPlans = new Map(built.plan.sessions.map((selected) => {
+    const source = byId.get(selected.sessionId);
+    if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
+    const expected = expectedById.get(selected.sessionId);
+    const applyPlan = buildForwardApplyPlan(source, workspaceDir, renderMode, goalMode, expected);
+    if (expected) {
+      const actualWrapperPath = applyPlan.wrapper?.path ?? null;
+      const wrapperPathMatches = actualWrapperPath === expected.wrapperPath ||
+        (actualWrapperPath != null && expected.wrapperPath != null &&
+          canonicalExistingPath(actualWrapperPath).toLowerCase() === canonicalExistingPath(expected.wrapperPath).toLowerCase());
+      if (canonicalExistingPath(applyPlan.transcript.path).toLowerCase() !== canonicalExistingPath(expected.targetPath).toLowerCase() ||
+        applyPlan.transcript.afterSha256 !== expected.renderedSha256 ||
+        applyPlan.operationId !== expected.operationId || !wrapperPathMatches ||
+        (applyPlan.wrapper?.afterSha256 ?? null) !== expected.renderedWrapperSha256) {
+        throw new Error(`forward target or rendered output changed for ${selected.sessionId}`);
+      }
+      if (applyPlan.transcript.beforeSha256 !== expected.targetSha256 && applyPlan.transcript.beforeSha256 !== expected.renderedSha256) {
+        throw new Error(`forward transcript drift for ${selected.sessionId}`);
+      }
+      if (applyPlan.wrapper != null && applyPlan.wrapper.beforeSha256 !== expected.wrapperSha256 &&
+        applyPlan.wrapper.beforeSha256 !== expected.renderedWrapperSha256) {
+        throw new Error(`forward wrapper drift for ${selected.sessionId}`);
+      }
+      applyPlan.transcript.beforeSha256 = expected.targetSha256;
+      applyPlan.transcript.path = expected.targetPath;
+      if (applyPlan.wrapper != null) {
+        applyPlan.wrapper.beforeSha256 = expected.wrapperSha256;
+        applyPlan.wrapper.path = expected.wrapperPath!;
+      }
+    }
+    return [selected.sessionId, applyPlan] as const;
+  }));
   const withoutDigest: Omit<MatrixForwardPlanFile, "digest"> = {
     schema: "agentryx.import-plan/v3",
     direction: "codex-to-claude",
@@ -874,29 +999,41 @@ export function buildForwardMatrixPlan(
     goalMode,
     plan: built.plan,
     target: {
+      codexHome: options.codexHome == null ? null : canonicalExistingPath(options.codexHome),
       claudeHome,
       bridgeRoot,
+      workspaceDir,
       renderPolicy: {
         includeReasoning: true,
+        rendererId: CLAUDE_FORWARD_RENDERER_ID,
+        rendererFingerprint: CLAUDE_FORWARD_RENDERER_FINGERPRINT,
         goalCapabilityId: CLAUDE_GOAL_TARGET_CAPABILITY_ID,
         goalCapabilityFingerprint: CLAUDE_GOAL_TARGET_FINGERPRINT,
       },
       sessions: built.plan.sessions.map((selected) => {
         const source = byId.get(selected.sessionId);
         if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
+        const applyPlan = selectedApplyPlans.get(selected.sessionId)!;
         return {
           sourceSessionId: selected.sessionId,
+          operationId: applyPlan.operationId,
           targetPath: source.targetPath,
-          targetExists: source.targetExists,
+          targetExists: applyPlan.transcript.beforeSha256 != null,
+          targetSha256: applyPlan.transcript.beforeSha256,
+          renderedSha256: applyPlan.transcript.afterSha256,
+          wrapperPath: applyPlan.wrapper?.path ?? null,
+          wrapperSha256: applyPlan.wrapper?.beforeSha256 ?? null,
+          renderedWrapperSha256: applyPlan.wrapper?.afterSha256 ?? null,
         };
       }),
     },
   };
   return {
     file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
-    bundles: sources.map((source) => source.bundle),
+    bundles: built.plan.sessions.map((selected) => byId.get(selected.sessionId)!.bundle),
     summaries,
     sourceDigest: built.digest,
+    applyPlans: built.plan.sessions.map((selected) => selectedApplyPlans.get(selected.sessionId)!),
   };
 }
 
@@ -1007,7 +1144,23 @@ export const MATRIX_HELP =
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
   "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
-  "[--direction claude-to-codex|codex-to-claude]\n";
+  "[--direction claude-to-codex|codex-to-claude] [--allow-overwrite] [--dry-run]\n";
+
+function forwardWorkspace(argv: string[], claudeHome: string): string | null {
+  if (flag(argv, "--no-register")) return null;
+  const explicit = option(argv, "--workspace-dir");
+  if (explicit) return path.resolve(explicit);
+  const root = resolveDesktopSessionsRoot(option(argv, "--sessions-root"));
+  const signedIn = signedInWorkspaceDir(root, claudeHome);
+  if (signedIn == null && countWorkspaceDirs(root) > 1) {
+    throw new Error("multiple Claude Desktop workspaces exist and the signed-in one cannot be proven; pass --workspace-dir");
+  }
+  const resolved = signedIn ?? findActiveWorkspaceDir(root);
+  if (resolved == null) {
+    throw new Error("no Claude Desktop workspace could be resolved; pass --workspace-dir or explicitly use --no-register");
+  }
+  return resolved;
+}
 
 export function goalMigrationModeOption(argv: string[]): GoalMigrationMode {
   const values = optionValues(argv, "--goal-mode");
@@ -1062,29 +1215,26 @@ export function main(argv = process.argv.slice(2)): void {
       const inventory = loadForwardCodexInventory(codexHome);
       const renderMode = parseRenderMode(option(argv, "--render-mode"));
       const goalMode = goalMigrationModeOption(argv);
-      const built = buildForwardMatrixPlan(inventory.sessions, {
-        codexHome,
-        claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
-        bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
-        selection,
-        renderMode,
-        goalMode,
-      });
+      const claudeHome = canonicalExistingPath(resolveClaudeHome(option(argv, "--claude-home")));
+      const sources = inventory.sessions.map((session) => loadForwardSource(
+        session, codexHome, claudeHome, renderMode, goalMode,
+      ));
+      const built = buildImportPlan(sources.map((source) => source.summary), { selection });
       writeJson(option(argv, "--out"), {
         codexHome: canonicalExistingPath(codexHome),
         inventory: {
           via: inventory.via,
           total: inventory.sessions.length,
-          selected: built.file.plan.sessions.length,
+          selected: built.plan.sessions.length,
           active: inventory.sessions.filter((source) => source.isArchived !== true).length,
           archived: inventory.sessions.filter((source) => source.isArchived === true).length,
         },
         direction,
         renderMode,
         goalMode,
-        selected: built.file.plan.sessions,
-        losses: built.file.plan.losses,
-        sourceDigest: built.sourceDigest,
+        selected: built.plan.sessions,
+        losses: built.plan.losses,
+        sourceDigest: built.digest,
       });
       return;
     }
@@ -1115,14 +1265,16 @@ export function main(argv = process.argv.slice(2)): void {
     if (direction === "codex-to-claude") {
       const selection = selectionOptions(argv);
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+      const claudeHome = resolveClaudeHome(option(argv, "--claude-home"));
       const inventory = loadForwardCodexInventory(codexHome);
       const matrix = buildForwardMatrixPlan(inventory.sessions, {
         codexHome,
-        claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
+        claudeHome,
         bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
         selection,
         renderMode: parseRenderMode(option(argv, "--render-mode")),
         goalMode: goalMigrationModeOption(argv),
+        workspaceDir: forwardWorkspace(argv, claudeHome),
       });
       writeJson(option(argv, "--out"), matrix.file);
       return;
@@ -1146,9 +1298,18 @@ export function main(argv = process.argv.slice(2)): void {
   }
   if (command === "recover") {
     const operationId = option(argv, "--operation");
-    const evidencePath = option(argv, "--evidence");
-    if (!operationId || !evidencePath) throw new Error("recover requires --operation and --evidence");
+    if (!operationId) throw new Error("recover requires --operation");
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
+    try {
+      loadForwardApplyJournal(bridgeRoot, operationId);
+      assertJsonOutputWritable(option(argv, "--out"));
+      writeJson(option(argv, "--out"), rollbackForwardSessions(bridgeRoot, operationId));
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const evidencePath = option(argv, "--evidence");
+    if (!evidencePath) throw new Error("Codex-target recover requires --evidence");
     const journal = loadOperationJournal(bridgeRoot, operationId);
     const codexHome = resolveCodexHome(option(argv, "--codex-home") ?? journal.targetCodexHome);
     if (canonicalExistingPath(codexHome).toLowerCase() !== canonicalExistingPath(journal.targetCodexHome).toLowerCase()) {
@@ -1207,7 +1368,85 @@ export function main(argv = process.argv.slice(2)): void {
     const candidate = JSON.parse(fs.readFileSync(planPath, "utf8")) as Record<string, unknown>;
     if ((candidate.schema === "agentryx.import-plan/v2" || candidate.schema === "agentryx.import-plan/v3") &&
       candidate.direction === "codex-to-claude") {
-      throw new Error("codex-to-claude apply is read-only and is not implemented yet");
+      if (candidate.schema !== "agentryx.import-plan/v3") {
+        throw new Error("legacy forward plan is unsupported; regenerate the plan");
+      }
+      const stored = candidate as unknown as MatrixForwardPlanFile;
+      const confirmation = option(argv, "--confirm");
+      if (!confirmation) throw new Error("forward apply requires --confirm <plan digest>");
+      const content: Omit<MatrixForwardPlanFile, "digest"> = {
+        schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
+        goalMode: stored.goalMode, plan: stored.plan, target: stored.target,
+      };
+      if (matrixPlanDigest(content) !== stored.digest) throw new Error("stored import plan content does not match its digest");
+      if (confirmation !== stored.digest) throw new Error("confirmation digest does not match the plan");
+      if (stored.target.renderPolicy.rendererId !== CLAUDE_FORWARD_RENDERER_ID ||
+        stored.target.renderPolicy.rendererFingerprint !== CLAUDE_FORWARD_RENDERER_FINGERPRINT ||
+        stored.target.renderPolicy.goalCapabilityId !== CLAUDE_GOAL_TARGET_CAPABILITY_ID ||
+        stored.target.renderPolicy.goalCapabilityFingerprint !== CLAUDE_GOAL_TARGET_FINGERPRINT) {
+        throw new Error("forward target renderer or Goal capability does not match this build");
+      }
+      const requestedMode = option(argv, "--render-mode");
+      if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
+        throw new Error("apply render mode differs from the confirmed plan");
+      }
+      const requestedGoalMode = option(argv, "--goal-mode") != null || flag(argv, "--no-migrate-goal")
+        ? goalMigrationModeOption(argv) : null;
+      if (requestedGoalMode != null && requestedGoalMode !== stored.goalMode) {
+        throw new Error("apply Goal migration mode differs from the confirmed plan");
+      }
+      if (stored.target.codexHome == null) throw new Error("forward plan has no source Codex home; regenerate through the CLI");
+      const requestedCodexHome = option(argv, "--codex-home");
+      if (requestedCodexHome != null && canonicalExistingPath(resolveCodexHome(requestedCodexHome)).toLowerCase() !==
+        canonicalExistingPath(stored.target.codexHome).toLowerCase()) throw new Error("apply Codex home differs from the confirmed plan");
+      const requestedClaudeHome = option(argv, "--claude-home");
+      if (requestedClaudeHome != null && canonicalExistingPath(resolveClaudeHome(requestedClaudeHome)).toLowerCase() !==
+        canonicalExistingPath(stored.target.claudeHome).toLowerCase()) throw new Error("apply Claude home differs from the confirmed plan");
+      const inventory = loadForwardCodexInventory(stored.target.codexHome);
+      const rebuilt = buildForwardMatrixPlan(inventory.sessions, {
+        codexHome: stored.target.codexHome,
+        claudeHome: stored.target.claudeHome,
+        bridgeRoot: stored.target.bridgeRoot,
+        workspaceDir: stored.target.workspaceDir,
+        selection: selectionFromPlan(stored.plan),
+        renderMode: stored.renderMode,
+        goalMode: stored.goalMode,
+        expectedTargets: stored.target.sessions,
+      });
+      if (rebuilt.file.digest !== stored.digest) {
+        throw new Error("source inventory, render output, Goal state/policy, or target binding changed after the plan was created");
+      }
+      assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CLAUDE_GOAL_TARGET_CAPABILITY_ID);
+      if (flag(argv, "--dry-run")) {
+        if (option(argv, "--out")) throw new Error("forward --dry-run refuses --out because dry-run is zero-mutation");
+        process.stdout.write(`${JSON.stringify({
+          dryRun: true, digest: stored.digest, renderMode: stored.renderMode, goalMode: stored.goalMode,
+          sessions: rebuilt.applyPlans.map((plan) => ({
+            sessionId: plan.sessionId, transcript: plan.transcript.path,
+            transcriptAction: plan.transcript.beforeSha256 == null ? "create" : "overwrite",
+            wrapper: plan.wrapper?.path ?? null,
+            wrapperAction: plan.wrapper == null ? "not-registered" : plan.wrapper.beforeSha256 == null ? "create" : "overwrite",
+          })),
+        }, null, 2)}\n`);
+        return;
+      }
+      assertJsonOutputWritable(option(argv, "--out"));
+      // Persist every exact source revision before any Claude target mutation.
+      for (const bundle of rebuilt.bundles) writeBridgeConversation(stored.target.bridgeRoot, bundle);
+      const journal = applyForwardSessions(rebuilt.applyPlans, {
+        bridgeRoot: stored.target.bridgeRoot,
+        claudeHome: stored.target.claudeHome,
+        workspaceDir: stored.target.workspaceDir,
+        planDigest: stored.digest,
+        allowOverwrite: flag(argv, "--allow-overwrite"),
+      });
+      writeJson(option(argv, "--out"), {
+        direction: stored.direction, renderMode: stored.renderMode, goalMode: stored.goalMode,
+        operationId: journal.operationId, state: journal.state,
+        applied: rebuilt.applyPlans.length,
+        sessions: rebuilt.applyPlans.map((plan) => ({ sessionId: plan.sessionId, operationId: plan.operationId })),
+      });
+      return;
     }
     if (candidate.schema === "agentryx.import-plan/v2" && candidate.direction === "claude-to-codex") {
       throw new Error("legacy v2 import plan predates Goal migration binding; regenerate the plan before apply");

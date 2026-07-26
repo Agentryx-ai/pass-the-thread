@@ -92,6 +92,8 @@ export interface MediaEvent extends BridgeEventBase {
   mediaType: "image" | "audio" | "file" | "unknown";
   source: unknown;
   metadata: unknown;
+  role: "user" | "assistant" | "system" | "unknown";
+  authoredByHuman: boolean;
 }
 
 /** A known provider protocol record which has no portable behavioral meaning. */

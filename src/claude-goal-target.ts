@@ -112,6 +112,7 @@ function historicalGoalLine(
       }],
     },
     uuid: goalRecordUuid(goal.sourceSha256, "history"),
+    isMeta: true,
   };
   const gitBranch = session.meta.git?.branch;
   if (gitBranch) line.gitBranch = gitBranch;

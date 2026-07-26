@@ -67,8 +67,8 @@ Flags belong on `node src/threadpass.ts`, not on `npm run` — see
 The original Codex → Claude commands remain available. The provider matrix adds the first reverse adapter through the same `threadpass` entrypoint:
 
 ```text
-Codex  ── existing converter ──► Claude
-Claude ── shared IR + 41059 adapter ──► Codex
+Codex  ── shared typed IR + transactional adapter ──► Claude
+Claude ── shared typed IR + 41059 adapter ──────────► Codex
 ```
 
 Start with a read-only inventory or a saved deterministic plan:
@@ -83,7 +83,18 @@ threadpass plan --archive active --project-scope existing-targets \
 
 There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, date bounds, and an explicit `--limit`. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/access records and superseded Goal events always remain inert. A separately identified authoritative active Goal is restored by default in either render mode; `--goal-mode skip` keeps it as history without live activation.
 
-Applying a plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. See [CLI](docs/CLI.md#experimental-claude--codex-matrix).
+Applying a reverse plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. See [CLI](docs/CLI.md#experimental-bidirectional-matrix).
+
+Forward plans (`--direction codex-to-claude`) are now applicable too. They bind
+the typed renderer and exact before/after hashes for transcripts and Claude
+Desktop wrapper records. `--dry-run` is strictly zero-mutation; existing files
+require `--allow-overwrite` plus an unchanged-target proof. Before the first
+target write, immutable backups and a durable operation journal are created, so
+an interrupted uncommitted batch can be reconciled or rolled back with
+`threadpass recover --operation <id>`. Unsupported protocol, world/access state
+and unknown records remain in the canonical sidecar instead of leaking as raw
+chat; task notifications are readable inert metadata, and archived state is
+preserved in the Claude wrapper.
 
 ## How it works
 

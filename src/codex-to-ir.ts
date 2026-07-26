@@ -216,6 +216,8 @@ function messageEvents(envelope: RawEnvelope, payload: ObjectRecord): BridgeEven
         mediaType: "image",
         source: block.image_url ?? block.url ?? block.source ?? null,
         metadata: block,
+        role,
+        authoredByHuman: role === "user" && blockType === "input_image",
       });
       return;
     }
@@ -226,6 +228,8 @@ function messageEvents(envelope: RawEnvelope, payload: ObjectRecord): BridgeEven
         mediaType: "audio",
         source: block.audio_url ?? block.url ?? block.source ?? null,
         metadata: block,
+        role,
+        authoredByHuman: role === "user" && blockType === "input_audio",
       });
       return;
     }
@@ -300,6 +304,15 @@ function responseItemEvents(envelope: RawEnvelope, payload: ObjectRecord): Bridg
     }];
   }
   return [unknown(envelope, "payload", "unknown_record", payload)];
+}
+
+function repathEvent(envelope: RawEnvelope, event: BridgeEvent, prefix: string): BridgeEvent {
+  const path = event.path.replace(/^payload/, prefix);
+  return {
+    ...event,
+    id: deterministicId("bridge-event-v1", { envelopeId: envelope.id, path, kind: event.kind }),
+    path,
+  };
 }
 
 function eventMessageEvents(envelope: RawEnvelope, payload: ObjectRecord): BridgeEvent[] {
@@ -378,12 +391,28 @@ export function codexRecordToIr(envelope: RawEnvelope): BridgeEvent[] {
     }];
   }
   if (type === "compacted") {
-    return [{
+    const events: BridgeEvent[] = [{
       ...base(envelope, "payload", "compact_boundary"),
       kind: "compact_boundary",
       compactMetadata: record.payload ?? record,
       activeContextStartsAfter: true,
     }];
+    const replacement = payload?.replacement_history;
+    if (Array.isArray(replacement)) replacement.forEach((value, index) => {
+      const item = asRecord(value);
+      const prefix = `payload.replacement_history[${index}]`;
+      if (!item) {
+        events.push(unknown(envelope, prefix, "unsupported_shape", value));
+      } else if (item.type === "compaction") {
+        events.push({
+          ...base(envelope, prefix, "protocol"), kind: "protocol",
+          recordType: "compacted_replacement", protocolType: "compaction", payload: item,
+        });
+      } else {
+        events.push(...responseItemEvents(envelope, item).map((event) => repathEvent(envelope, event, prefix)));
+      }
+    });
+    return events;
   }
   if (type === "event_msg" && payload) return eventMessageEvents(envelope, payload);
   if (type === "response_item" && payload) return responseItemEvents(envelope, payload);

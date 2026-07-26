@@ -16,6 +16,7 @@ import {
   selectionFromPlan,
   selectionOptions,
   transcriptIdentityError,
+  type MatrixForwardPlanFile,
   type MatrixPlanFile,
 } from "../src/matrix-cli.ts";
 import { buildImportPlan, type ImportPlan } from "../src/import-plan.ts";
@@ -206,7 +207,7 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
       "event_msg_protocol_sidecar_only",
       "historical_goal_not_rendered_or_activated",
       "protocol_record_sidecar_only:session_meta",
-      "task_notification_not_rendered",
+      "reasoning_rendered_as_inert_metadata",
       "turn_context_sidecar_only",
       "unknown_event_sidecar_only:unknown_content_block",
       "unsupported_media_not_rendered:audio",
@@ -241,17 +242,27 @@ test("forward loss policy makes verbatim semantics inert and keeps supported eve
   const events: BridgeEvent[] = [
     { ...base, id: "text", kind: "text", role: "user", text: "hi", authoredByHuman: true },
     { ...base, id: "reason", kind: "reasoning", summary: "s", content: "c" },
-    { ...base, id: "image", kind: "media", mediaType: "image", source: "data:image/png;base64,AA==", metadata: {} },
+    { ...base, id: "image", kind: "media", mediaType: "image", source: "data:image/png;base64,AA==", metadata: {}, role: "user", authoredByHuman: true },
     { ...base, id: "compact", kind: "compact_boundary", compactMetadata: {}, activeContextStartsAfter: true },
   ];
-  assert.deepEqual(forwardLossObservations(events, "semantic"), []);
+  assert.deepEqual(forwardLossObservations(events, "semantic"), [{
+    kind: "reasoning_rendered_as_inert_metadata", count: 1,
+  }]);
+  const unsupportedImages: BridgeEvent[] = [
+    { ...base, id: "url", kind: "media", mediaType: "image", source: "https://example.com/image.png", metadata: {}, role: "user", authoredByHuman: true },
+    { ...base, id: "mime", kind: "media", mediaType: "image", source: "data:image/svg+xml;base64,PHN2Zz4=", metadata: {}, role: "user", authoredByHuman: true },
+    { ...base, id: "base64", kind: "media", mediaType: "image", source: "data:image/png;base64,%%%", metadata: {}, role: "user", authoredByHuman: true },
+  ];
+  assert.deepEqual(forwardLossObservations(unsupportedImages, "semantic"), [{
+    kind: "unsupported_image_sidecar_only", count: 3,
+  }]);
   assert.deepEqual(forwardLossObservations(events, "verbatim"), [{
     kind: "verbatim_semantics_intentionally_inert", count: 4,
     detail: "Canonical source text is preserved, but source-native semantics are not activated in Claude.",
   }]);
 });
 
-test("apply rejects a stored forward plan before requesting reverse-only evidence", () => {
+test("forward apply requires confirmation before any mutation", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-apply-"));
   const session = codexSession(root, "read-only", [
     { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] } },
@@ -264,8 +275,41 @@ test("apply rejects a stored forward plan before requesting reverse-only evidenc
   fs.writeFileSync(planPath, JSON.stringify(built.file), "utf8");
   assert.throws(
     () => main(["apply", "--plan", planPath]),
-    /codex-to-claude apply is read-only and is not implemented yet/,
+    /forward apply requires --confirm/,
   );
+  assert.equal(fs.existsSync(path.join(root, "bridge")), false);
+});
+
+test("forward CLI dry-run is zero-mutation and confirmed apply writes transcript plus archived wrapper", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-e2e-"));
+  const codexHome = path.join(root, "codex");
+  const claudeHome = path.join(root, "claude");
+  const bridgeRoot = path.join(root, "bridge");
+  const workspaceDir = path.join(root, "workspace");
+  const archived = path.join(codexHome, "archived_sessions");
+  fs.mkdirSync(archived, { recursive: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  const id = "12345678-1234-4234-8234-123456789abc";
+  fs.writeFileSync(path.join(archived, `rollout-2026-07-25T10-00-00-${id}.jsonl`), [
+    JSON.stringify({ timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd: path.join(root, "repo"), source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello matrix" }] } }),
+  ].join("\n") + "\n", "utf8");
+  const planPath = path.join(root, "plan.json");
+  main(["plan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", claudeHome, "--bridge-root", bridgeRoot, "--workspace-dir", workspaceDir,
+    "--archive", "all", "--out", planPath]);
+  const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixForwardPlanFile;
+  const before = fs.readdirSync(root, { recursive: true }).map(String).sort();
+  main(["apply", "--plan", planPath, "--confirm", stored.digest, "--dry-run"]);
+  assert.deepEqual(fs.readdirSync(root, { recursive: true }).map(String).sort(), before);
+  main(["apply", "--plan", planPath, "--confirm", stored.digest]);
+  assert.doesNotThrow(() => main(["apply", "--plan", planPath, "--confirm", stored.digest]));
+  const target = stored.target.sessions[0]!;
+  assert.equal(fs.existsSync(target.targetPath), true);
+  assert.equal(fs.existsSync(target.wrapperPath!), true);
+  const wrapper = JSON.parse(fs.readFileSync(target.wrapperPath!, "utf8")) as { isArchived: boolean; cliSessionId: string };
+  assert.equal(wrapper.isArchived, true);
+  assert.equal(wrapper.cliSessionId, id);
 });
 
 test("legacy reverse v2 plans are rejected with a Goal migration message", () => {
@@ -371,7 +415,7 @@ test("forward CLI plan includes protocol-only active and archived rollouts witho
   main([
     "plan", "--direction", "codex-to-claude", "--codex-home", codexHome,
     "--claude-home", claudeHome, "--bridge-root", bridgeRoot, "--archive", "all",
-    "--project", "FixtureProject", "--out", out,
+    "--project", "FixtureProject", "--no-register", "--out", out,
   ]);
 
   const stored = JSON.parse(fs.readFileSync(out, "utf8")) as MatrixPlanFile;
