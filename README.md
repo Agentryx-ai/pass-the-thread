@@ -2,13 +2,13 @@
 
 # codex-to-claude
 
-**Move your Codex conversations into Claude — same list, same titles, tool calls intact.**
+**Move agent conversations without flattening away the structures that make them usable.**
 
-Codex ships an import that pulls Claude sessions in. Nothing goes the other way, so switching means leaving your history behind. This is that direction: Codex CLI and Codex Desktop into Claude Code and Claude Desktop.
+This repository began as Codex → Claude and keeps that stable command. It is now also the home of a shared, provider-neutral conversation IR and an experimental Claude → Codex adapter. The name of a broader product is intentionally undecided.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.6-brightgreen.svg)](#requirements)
-[![Dependencies](https://img.shields.io/badge/dependencies-0-brightgreen.svg)](./package.json)
+[![Runtime dependencies](https://img.shields.io/badge/runtime_dependencies-0-brightgreen.svg)](./package.json)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-blue.svg)](#requirements)
 
 </div>
@@ -17,6 +17,7 @@ Codex ships an import that pulls Claude sessions in. Nothing goes the other way,
 
 *Newest first.*
 
+- 🧭 **Importer-matrix foundation** — a lossless raw-envelope store, typed historical IR, archive/project/session/date selection, deterministic plans and loss reports, and a version-gated Codex Desktop 26.721.41059 target adapter now live beside the original converter. The built-in Codex importer was audited because “50 succeeded” did not preserve native tool calls, reasoning, images, compaction, world state, or turn context in the observed targets. See the [version-pinned research](docs/research/codex-desktop/26.721.41059/README.md).
 - 🧷 **A conversation you carried on in Claude is left alone** — `--force` treated "Claude replayed the history into the file" and "you answered in it" as the same kind of change and overwrote both, which cost a message. It now tells them apart and refuses the second, naming what would have been deleted and counting only lines somebody typed. Continuing an import also makes Claude fork it and repoint the record at a session of its own; those records are recognised as no longer ours, left alone rather than duplicated, and searched for messages sent there. ([#9](https://github.com/Agentryx-ai/codex-to-claude/pull/9), [#10](https://github.com/Agentryx-ai/codex-to-claude/pull/10))
 - 🛑 **A dry run stays dry** — `npm run import -- --dry-run` used to import for real. npm owns `--dry-run` and `--force`, parses them as its own config and passes an empty argv on, so the flag never arrived and the write path ran. It now detects the swallowed flag and refuses; `npm run import:dry` has it baked in. ([#6](https://github.com/Agentryx-ai/codex-to-claude/pull/6))
 - 🧠 **Memory citations out of the reply** — when Codex answers from its memory files it appends an `<oai-mem-citation>` block, which Codex Desktop parses back out and never shows. Imports used to end an answer with raw markup; the citation is now a readable metadata line after the reply. ([#3](https://github.com/Agentryx-ai/codex-to-claude/pull/3))
@@ -25,7 +26,7 @@ Codex ships an import that pulls Claude sessions in. Nothing goes the other way,
 
 ## Contents
 
-**On this page** — [Quick start](#quick-start) · [How it works](#how-it-works) · [Features](#features) · [Choosing conversations](#choosing-conversations) · [Requirements](#requirements) · [Safety](#safety) · [Limitations](#limitations)
+**On this page** — [Quick start](#quick-start) · [Importer matrix](#experimental-importer-matrix) · [How it works](#how-it-works) · [Features](#features) · [Choosing conversations](#choosing-conversations) · [Requirements](#requirements) · [Safety](#safety) · [Limitations](#limitations)
 
 **Reference** — [CLI](docs/CLI.md) · [Conversion](docs/CONVERSION.md) · [Formats](docs/FORMATS.md)
 
@@ -59,6 +60,29 @@ projects, and you can open and continue them.
 Flags belong on `node src/cli.ts`, not on `npm run` — see
 [CLI](docs/CLI.md#pass-flags-to-node-not-through-npm).
 
+## Experimental importer matrix
+
+The original command remains Codex → Claude. The new `matrix` command adds the first reverse adapter without forking the core into another repository:
+
+```text
+Codex  ── existing converter ──► Claude
+Claude ── shared IR + 41059 adapter ──► Codex
+```
+
+Start with a read-only inventory or a saved deterministic plan:
+
+```bash
+npm run matrix:scan -- --archive all
+npm run matrix:plan -- --archive active --project-scope existing-targets \
+  --render-mode semantic \
+  --evidence reference/codex-desktop/26.721.41059/manifest.json \
+  --out import-plan.json
+```
+
+There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, date bounds, and an explicit `--limit`. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/goal/access state is never activated as live control state in either mode.
+
+Applying a plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. See [CLI](docs/CLI.md#experimental-claude--codex-matrix).
+
 ## How it works
 
 Claude Desktop keeps a conversation in two places, and needs both to show it:
@@ -90,14 +114,15 @@ Writing only a transcript leaves it invisible, so this writes both.
 - 🔐 **Sandbox and approval mapped** — Codex's two settings collapse into Claude's one `permissionMode`
 - 📉 **Long sessions still open** — imports start from the context Codex compacted to; 39 MB of history became 6.5 MB across 20 conversations
 - ✅ **Validated before writing** — every conversion is replay-checked, and one that would fail on resume is repaired or refused
+- 🧾 **Semantic or verbatim, in both directions** — semantic conversion is the default; `--render-mode verbatim` keeps exact UTF-8 source text inert when canonical representation matters more than native rendering
 - 🛟 **Your edits win** — a conversation you continued in Claude is skipped, not overwritten
 
 <details>
 <summary><b>What it deliberately does not do</b></summary>
 
-Out of scope: the reverse direction (Codex already has it), settings, skills,
-plugins and MCP servers, anything requiring a network call or an account, and
-editing conversations you already have.
+Out of scope today: migrating settings, skills, plugins and MCP servers;
+network/account-backed history that has no local transcript; and pretending
+historical tasks, goals, or grants are safe live control state.
 
 </details>
 
@@ -131,7 +156,7 @@ Recents, and plenty of people never look at them, so membership is a filter:
 
 ## Requirements
 
-Windows or macOS, and Node.js 22.6 or newer. No dependencies.
+Windows or macOS, and Node.js 22.6 or newer. The runtime has no production dependencies; development installs TypeScript and Node declarations for strict type checking.
 
 Every path resolves per platform: the Claude Desktop session-record store from
 `%APPDATA%`, `~/Library/Application Support` or `$XDG_CONFIG_HOME`, and
@@ -161,6 +186,9 @@ This writes into another application's local data, so it stays cautious.
 
 - Built on undocumented internals of two proprietary desktop apps. They can
   change at any time.
+- Claude → Codex writes are supported only for the exact audited Codex Desktop
+  26.721.41059 artifacts and are still experimental; create and inspect a plan
+  first, close Codex, and keep a backup.
 - Tested on Windows 11 and macOS 26. Linux resolves the same way but has not
   been run there.
 - Codex encrypts its compaction summaries, so an import shows where compaction
@@ -187,7 +215,7 @@ This writes into another application's local data, so it stays cautious.
 ## Development
 
 ```bash
-npm test
+npm run verify
 ```
 
 ## Disclaimer

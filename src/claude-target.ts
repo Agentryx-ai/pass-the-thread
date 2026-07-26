@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
   ClaudeTranscriptLine,
   CodexSession,
@@ -8,6 +8,12 @@ import type {
   ImportHistoryRecord,
 } from "./types.ts";
 import { encodeProjectDir } from "./paths.ts";
+import {
+  decodeCanonicalUtf8,
+  inertHistoricalNotice,
+  storedRenderMode,
+  type RenderMode,
+} from "./render-mode.ts";
 
 const HISTORY_FILE = "codex-import-history.json";
 
@@ -59,8 +65,17 @@ export function saveImportHistory(claudeHome: string, history: ImportHistory): v
   );
 }
 
-export function alreadyImported(history: ImportHistory, contentSha256: string): boolean {
-  return history.records.some((r) => r.contentSha256 === contentSha256);
+export function alreadyImported(
+  history: ImportHistory,
+  contentSha256: string,
+  renderMode: RenderMode = "semantic",
+): boolean {
+  let latest: ImportHistoryRecord | null = null;
+  for (const record of history.records) {
+    if (record.contentSha256 !== contentSha256) continue;
+    if (latest == null || record.importedAtMs >= latest.importedAtMs) latest = record;
+  }
+  return latest != null && storedRenderMode(latest.renderMode) === renderMode;
 }
 
 export function targetPathFor(
@@ -118,11 +133,63 @@ export function writeTranscript(
   };
 }
 
+export interface VerbatimMapOptions {
+  /** Value written to the Claude transcript line's version field. */
+  version?: string;
+  /** Prefix prepended to Claude's display title. */
+  titlePrefix?: string;
+}
+
+/**
+ * Render the complete Codex rollout as one inert Claude metadata message.
+ *
+ * The second text block is exactly the source file decoded as strict UTF-8:
+ * no trimming, newline conversion, normalization, parsing, or reserialization.
+ * `isMeta` prevents Claude from treating source controls or tool syntax as a
+ * live user turn. The source file itself is read-only and never modified.
+ */
+export function mapVerbatimRolloutToClaudeLines(
+  session: CodexSession,
+  opts: VerbatimMapOptions = {},
+): ClaudeTranscriptLine[] {
+  const source = fs.readFileSync(session.rolloutPath);
+  const literal = decodeCanonicalUtf8(source);
+  if (literal === "") return [];
+
+  const timestampMs = session.firstTsMs ?? session.lastTsMs ?? 0;
+  const timestamp = new Date(Number.isFinite(timestampMs) ? timestampMs : 0).toISOString();
+  const title = `${opts.titlePrefix ?? ""}${session.codexName || session.title || session.sessionId}`;
+  const line: ClaudeTranscriptLine = {
+    parentUuid: null,
+    isSidechain: false,
+    userType: "external",
+    cwd: session.cwd,
+    sessionId: session.sessionId,
+    version: opts.version ?? "0.0.0-codex-import",
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        { type: "text", text: inertHistoricalNotice("Codex rollout JSONL") },
+        { type: "text", text: literal },
+      ],
+    },
+    uuid: randomUUID(),
+    timestamp,
+    customTitle: title,
+    isMeta: true,
+  };
+  const gitBranch = session.meta.git?.branch;
+  if (gitBranch) line.gitBranch = gitBranch;
+  return [line];
+}
+
 export function makeHistoryRecord(
   session: CodexSession,
   contentSha256: string,
   nowMs: number,
   targetSha256?: string,
+  renderMode: RenderMode = "semantic",
 ): ImportHistoryRecord {
   return {
     contentSha256,
@@ -130,6 +197,7 @@ export function makeHistoryRecord(
     importedSessionId: session.sessionId,
     sourceRolloutPath: session.rolloutPath,
     projectRoot: session.cwd,
+    renderMode,
     targetSha256,
   };
 }

@@ -1,7 +1,7 @@
 {
   "name": "codex-to-claude",
   "version": "0.1.0",
-  "description": "Import Codex conversations into Claude Desktop / Claude Code, with the conversation list, titles and tool calls intact.",
+  "description": "Versioned conversation import adapters for Codex and Claude, with typed fidelity and deterministic plans.",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": ["codex", "claude", "claude-code", "openai", "anthropic", "session", "transcript", "migration", "import", "ai-agent"],
@@ -10,8 +10,25 @@
     "list": "node --experimental-strip-types --experimental-sqlite src/cli.ts list",
     "import": "node --experimental-strip-types --experimental-sqlite src/cli.ts import",
     "import:dry": "node --experimental-strip-types --experimental-sqlite src/cli.ts import --dry-run",
-    "test": "node --experimental-strip-types --experimental-sqlite --test test/*.test.ts"
+    "matrix": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts",
+    "matrix:scan": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts scan",
+    "matrix:plan": "node --experimental-strip-types --experimental-sqlite src/matrix-cli.ts plan",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --experimental-strip-types --experimental-sqlite --test test/*.test.ts",
+    "verify": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^6.0.3"
   },
   "engines": { "node": ">=22.6.0" },
-  "files": ["src", "docs", "README.md", "LICENSE", "NOTICE"]
+  "files": [
+    "src",
+    "docs",
+    "reference/codex-desktop/26.721.41059/README.md",
+    "reference/codex-desktop/26.721.41059/manifest.json",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ]
 }

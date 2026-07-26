@@ -1,5 +1,6 @@
 #!/usr/bin/env -S node --experimental-strip-types --experimental-sqlite
 import fs from "node:fs";
+import path from "node:path";
 import { parseArgs } from "node:util";
 import { resolveCodexHome, resolveClaudeHome } from "./paths.ts";
 import { loadDesktopSessions } from "./codex-source.ts";
@@ -11,6 +12,7 @@ import {
   inspectTarget,
   lastRecordFor,
   loadImportHistory,
+  mapVerbatimRolloutToClaudeLines,
   makeHistoryRecord,
   saveImportHistory,
   sha256File,
@@ -37,6 +39,9 @@ import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
 import { findContinuation } from "./continued.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
+import { parseRenderMode } from "./render-mode.ts";
+import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
+import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
 import type { SessionFilter } from "./types.ts";
 
 const HELP = `codex-import — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
@@ -63,6 +68,8 @@ SELECTION (Codex Desktop conversation-list criteria)
   --include-empty      keep threads the user never wrote in (Codex hides these)
   --full-history       import every turn instead of the context Codex compacted
                        to (faithful, but may not fit Claude's context window)
+  --render-mode <mode> semantic (default) converts supported structures;
+                       verbatim renders the exact rollout as inert history
   --max-tool-output <n>  cap each tool result at n characters (default 4000)
   --max-chars <n>        cap the whole transcript (default 1000000); older turns
                          are dropped so a resumed conversation fits the context
@@ -78,6 +85,7 @@ OPTIONAL REFINEMENTS (off by default)
 PATHS
   --codex-home <p>   default $CODEX_HOME or ~/.codex
   --claude-home <p>  default $CLAUDE_CONFIG_DIR or ~/.claude
+  --bridge-root <p>  canonical source sidecars; default ~/.codex-to-claude/bridge-v1
 
 Sessions are written to <claude-home>/projects/<encoded-cwd>/<sessionId>.jsonl and
 deduped via <claude-home>/codex-import-history.json (source-content sha256).
@@ -154,6 +162,8 @@ function main(argv: string[]): number {
       "max-tool-output": { type: "string" },
       "max-chars": { type: "string" },
       "full-history": { type: "boolean", default: false },
+      "render-mode": { type: "string" },
+      "bridge-root": { type: "string" },
       prune: { type: "boolean", default: false },
     },
   });
@@ -162,6 +172,10 @@ function main(argv: string[]): number {
   const claudeHome = resolveClaudeHome(values["claude-home"] as string | undefined);
   const nowMs = Date.now();
   const filter = toFilter(values as Record<string, string | boolean | undefined>);
+  const renderMode = parseRenderMode(values["render-mode"] as string | undefined);
+  const bridgeRoot = path.resolve(
+    typeof values["bridge-root"] === "string" ? values["bridge-root"] : defaultBridgeRoot(),
+  );
 
   const { via, sessions: all } = loadDesktopSessions(codexHome, {
     interactiveOnly: values["interactive-only"] === true,
@@ -290,23 +304,37 @@ function main(argv: string[]): number {
 
     process.stderr.write(
       `Codex home:  ${codexHome}\nClaude home: ${claudeHome}\n` +
+        `Render mode: ${renderMode}\n` +
         `Selection: Codex Desktop conversation list (via ${via === "desktop" ? "Desktop sidebar state" : via === "db" ? "index DB" : "file scan"}).\n` +
         `${selected.length} conversation(s) selected${dryRun ? " (dry-run)" : ""}.\n\n`,
     );
 
     for (const s of selected) {
-      const sha = sha256File(s.rolloutPath);
-      if (!force && alreadyImported(history, sha)) {
+      const sha = s.sourceContentSha256 ?? sha256File(s.rolloutPath);
+      if (sha256File(s.rolloutPath) !== sha) {
+        skipped += 1;
+        process.stdout.write(`skip  ${s.sessionId}  (source rollout changed after inventory; run again)\n`);
+        continue;
+      }
+      if (!force && alreadyImported(history, sha, renderMode)) {
         skipped += 1;
         // The transcript already exists, but it may predate registration —
         // register it so it actually shows up in the Claude Desktop list.
         if (workspaceDir != null && !alreadyRegistered.has(s.sessionId) && !dryRun) {
-          const catchUp = mapSessionToClaudeLines(s, {
-            titlePrefix:
-              typeof values["title-prefix"] === "string"
-                ? (values["title-prefix"] as string)
-                : undefined,
-          });
+          const catchUp =
+            renderMode === "verbatim"
+              ? mapVerbatimRolloutToClaudeLines(s, {
+                  titlePrefix:
+                    typeof values["title-prefix"] === "string"
+                      ? (values["title-prefix"] as string)
+                      : undefined,
+                })
+              : mapSessionToClaudeLines(s, {
+                  titlePrefix:
+                    typeof values["title-prefix"] === "string"
+                      ? (values["title-prefix"] as string)
+                      : undefined,
+                });
           if (catchUp.length > 0) {
             const record = buildWrapperRecord({
               cliSessionId: s.sessionId,
@@ -339,22 +367,34 @@ function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (already imported)\n`);
         continue;
       }
-      const lines = mapSessionToClaudeLines(s, {
-        version:
-          typeof values["version-tag"] === "string"
-            ? (values["version-tag"] as string)
-            : undefined,
-        includeReasoning: values["include-reasoning"] === true,
-        titlePrefix:
-          typeof values["title-prefix"] === "string"
-            ? (values["title-prefix"] as string)
-            : undefined,
-        maxToolChars:
-          values["max-tool-output"] != null
-            ? Number(values["max-tool-output"])
-            : undefined,
-        maxChars: values["max-chars"] != null ? Number(values["max-chars"]) : undefined,
-      });
+      const lines =
+        renderMode === "verbatim"
+          ? mapVerbatimRolloutToClaudeLines(s, {
+              version:
+                typeof values["version-tag"] === "string"
+                  ? (values["version-tag"] as string)
+                  : undefined,
+              titlePrefix:
+                typeof values["title-prefix"] === "string"
+                  ? (values["title-prefix"] as string)
+                  : undefined,
+            })
+          : mapSessionToClaudeLines(s, {
+              version:
+                typeof values["version-tag"] === "string"
+                  ? (values["version-tag"] as string)
+                  : undefined,
+              includeReasoning: values["include-reasoning"] === true,
+              titlePrefix:
+                typeof values["title-prefix"] === "string"
+                  ? (values["title-prefix"] as string)
+                  : undefined,
+              maxToolChars:
+                values["max-tool-output"] != null
+                  ? Number(values["max-tool-output"])
+                  : undefined,
+              maxChars: values["max-chars"] != null ? Number(values["max-chars"]) : undefined,
+            });
       if (lines.length === 0) {
         skipped += 1;
         process.stdout.write(`skip  ${s.sessionId}  (no convertible content)\n`);
@@ -446,12 +486,13 @@ function main(argv: string[]): number {
         imported += 1;
         continue;
       }
+      writeBridgeConversation(bridgeRoot, codexRolloutToBridgeBundle(s));
       const res = writeTranscript(claudeHome, s, lines);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
       // repointed one is recognisable later instead of looking like a stranger.
       const recordSessionIds = [...(prior?.recordSessionIds ?? [])];
-      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256);
+      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256, renderMode);
       historyRecord.recordSessionIds = recordSessionIds;
       history.records.push(historyRecord);
       imported += 1;

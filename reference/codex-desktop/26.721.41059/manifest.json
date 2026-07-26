@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "snapshot_id": "codex-desktop-windows-x64-26.721.41059",
+  "snapshot_date": "2026-07-26",
+  "platform": "windows",
+  "architecture": "x64",
+  "installed_package": {
+    "name": "OpenAI.Codex",
+    "package_full_name": "OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0",
+    "msix_version": "26.721.4979.0",
+    "publisher": "CN=50BDFD77-8903-4850-9FFE-6E8522F64D5B",
+    "install_location": "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0"
+  },
+  "electron_app": {
+    "name": "openai-codex-electron",
+    "product_name": "Codex",
+    "version": "26.721.41059",
+    "build_number": "5848",
+    "build_flavor": "prod"
+  },
+  "artifacts": [
+    {
+      "name": "app.asar",
+      "role": "electron_application_archive",
+      "source_path": "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0\\app\\resources\\app.asar",
+      "snapshot_path": "artifacts/app.asar",
+      "size_bytes": 209728412,
+      "sha256": "44884F86D619A12C3C0AF1B8C65945005BDA4379775B03270674C666226FF4B7",
+      "source_modified_at_utc": "2026-07-24T21:35:06.2999465Z",
+      "snapshot_created_at_utc": "2026-07-25T22:20:36.2360210Z",
+      "source_hash_matched": true,
+      "git_tracked": false
+    },
+    {
+      "name": "codex.exe",
+      "role": "codex_native_app_server",
+      "source_path": "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.721.4979.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
+      "snapshot_path": "artifacts/codex.exe",
+      "size_bytes": 353628464,
+      "sha256": "39E9E041EA33AC34AAD9578ADFE660C5C7A6DC8F82620B77623960F9352A6EF3",
+      "source_modified_at_utc": "2026-07-24T07:48:21.1591952Z",
+      "snapshot_created_at_utc": "2026-07-25T22:20:36.3165461Z",
+      "source_hash_matched": true,
+      "git_tracked": false
+    }
+  ],
+  "runtime_observation": {
+    "batch_id": "77c07f8a-db9f-4e4a-bc2a-1a300f4d792f",
+    "selected_sessions": 50,
+    "source_directories": 23,
+    "reported_successes": 50,
+    "reported_failures": 0
+  }
+}

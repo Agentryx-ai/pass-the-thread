@@ -16,6 +16,7 @@ import { isInjectedContext, splitUserMessage } from "../src/preamble.ts";
 import {
   alreadyImported,
   loadImportHistory,
+  mapVerbatimRolloutToClaudeLines,
   makeHistoryRecord,
   saveImportHistory,
   sha256File,
@@ -37,6 +38,7 @@ import { loadThreadNames, nameFromThreadRow } from "../src/codex-thread-names.ts
 import { renderCitation, splitCitations } from "../src/citation.ts";
 import { validateTranscript } from "../src/validate.ts";
 import { encodeProjectDir } from "../src/paths.ts";
+import { parseRenderMode } from "../src/render-mode.ts";
 import type { CodexSession } from "../src/types.ts";
 
 const SID = "11111111-1111-4111-8111-111111111111";
@@ -73,6 +75,7 @@ test("parseRollout extracts meta, cwd, title, messageCount", () => {
   assert.equal(s.cwd, "/home/u/proj");
   assert.equal(s.meta.git?.branch, "main");
   assert.equal(s.title, "hello codex");
+  assert.equal(s.sourceContentSha256, sha256File(s.rolloutPath));
   // user(1) + assistant(2) messages
   assert.equal(s.messageCount, 3);
   assert.equal(s.firstTsMs, Date.parse("2026-07-24T05:38:12.000Z"));
@@ -124,7 +127,7 @@ test("includeReasoning maps reasoning to a leading thinking block", () => {
 
 test("applyFilter honors since-days, max, project, and id", () => {
   const mk = (id: string, lastTsMs: number, cwd: string): CodexSession => ({
-    sessionId: id, rolloutPath: `/x/${id}.jsonl`, cwd, meta: {},
+    sessionId: id, rolloutPath: `/x/${id}.jsonl`, cwd, cwdOriginal: cwd, meta: {},
     firstTsMs: lastTsMs, lastTsMs, items: [{ tsMs: lastTsMs, payload: { type: "message", role: "user" } }],
     model: null, messageCount: 1, title: id, source: "cli", isChild: false, userMessageCount: 1,
   });
@@ -214,6 +217,65 @@ test("end-to-end import writes a resumable transcript and dedups on re-run", () 
   // second run sees it as already imported
   const history2 = loadImportHistory(claudeHome);
   assert.equal(alreadyImported(history2, sha), true);
+});
+
+test("verbatim mode keeps every UTF-8 source byte in inert Claude history", () => {
+  const s = fixtureSession();
+  const source = Buffer.concat([
+    Buffer.from([0xef, 0xbb, 0xbf]),
+    Buffer.from(
+      '{"type":"response_item","payload":{"type":"function_call","name":"danger","arguments":"{}","call_id":"live-looking"}}\r\n' +
+        '<task-notification><task-id>x</task-id></task-notification>\r\n',
+      "utf8",
+    ),
+  ]);
+  fs.writeFileSync(s.rolloutPath, source);
+
+  const lines = mapVerbatimRolloutToClaudeLines(s, { titlePrefix: "[Codex] " });
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, "user");
+  assert.equal(lines[0].isMeta, true, "literal source must not become live context");
+  assert.equal(lines[0].customTitle, `[Codex] ${s.title}`);
+  assert.deepEqual(validateTranscript(lines), []);
+
+  const blocks = lines[0].message.content;
+  assert.equal(blocks.length, 2);
+  assert.equal(blocks[0].type, "text");
+  assert.equal(blocks[1].type, "text");
+  assert.ok(
+    blocks.every((block) => block.type === "text"),
+    "tool-looking source must stay plain text",
+  );
+  assert.ok(blocks[0].type === "text" && /inert/.test(blocks[0].text));
+  assert.ok(blocks[1].type === "text");
+  assert.deepEqual(Buffer.from(blocks[1].text, "utf8"), source);
+});
+
+test("verbatim mode refuses invalid UTF-8 instead of damaging canonical bytes", () => {
+  const s = fixtureSession();
+  fs.writeFileSync(s.rolloutPath, Buffer.from([0x7b, 0xff, 0x7d]));
+  assert.throws(
+    () => mapVerbatimRolloutToClaudeLines(s),
+    /encoded data was not valid|valid for encoding utf-8/i,
+  );
+});
+
+test("render-mode history dedup treats legacy records as semantic", () => {
+  const s = fixtureSession();
+  const old = makeHistoryRecord(s, "same-source", NOW);
+  delete old.renderMode;
+  const history = { version: 1 as const, records: [old] };
+
+  assert.equal(parseRenderMode(), "semantic");
+  assert.equal(parseRenderMode("verbatim"), "verbatim");
+  assert.throws(() => parseRenderMode("raw"), /expected semantic or verbatim/);
+  assert.equal(alreadyImported(history, "same-source", "semantic"), true);
+  assert.equal(alreadyImported(history, "same-source", "verbatim"), false);
+
+  const verbatim = makeHistoryRecord(s, "same-source", NOW + 1, undefined, "verbatim");
+  history.records = [verbatim];
+  assert.equal(alreadyImported(history, "same-source", "semantic"), false);
+  assert.equal(alreadyImported(history, "same-source", "verbatim"), true);
 });
 
 test("injected Codex context maps to isMeta, not to a plain user message", () => {

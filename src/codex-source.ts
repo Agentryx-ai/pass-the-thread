@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CodexSession, RolloutLine, SessionMeta } from "./types.ts";
 import { normalizeCwd } from "./paths.ts";
 import { loadDesktopThreads, loadThreadsByIds } from "./codex-db.ts";
@@ -54,8 +54,11 @@ export function parseRollout(
 ): CodexSession | null {
   const useCompaction = opts.useCodexCompaction !== false;
   let raw: string;
+  let sourceContentSha256: string;
   try {
-    raw = fs.readFileSync(rolloutPath, "utf8");
+    const bytes = fs.readFileSync(rolloutPath);
+    raw = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    sourceContentSha256 = createHash("sha256").update(bytes).digest("hex");
   } catch {
     return null;
   }
@@ -67,7 +70,8 @@ export function parseRollout(
   let model: string | null = null;
   let compactedAway = 0;
 
-  for (const line of raw.split(/\r?\n/)) {
+  for (const [lineIndex, originalLine] of raw.split(/\r?\n/).entries()) {
+    const line = lineIndex === 0 ? originalLine.replace(/^\uFEFF/, "") : originalLine;
     if (line.trim() === "") continue;
     let rec: RolloutLine;
     try {
@@ -169,6 +173,7 @@ export function parseRollout(
   return {
     sessionId,
     rolloutPath,
+    sourceContentSha256,
     cwd,
     cwdOriginal: rawCwd,
     meta,

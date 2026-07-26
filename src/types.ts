@@ -1,6 +1,8 @@
 // Shared types for Codex rollout (source) and Claude Code transcript (target).
 // See docs/research/CODEX_TO_CLAUDE_SESSION_IMPORT.md for the format contract.
 
+import type { RenderMode } from "./render-mode.ts";
+
 // ---------- Codex rollout (source) ----------
 
 /** One line of a Codex rollout .jsonl file: RolloutLine wrapping a RolloutItem. */
@@ -58,6 +60,8 @@ export interface SessionMeta {
 export interface CodexSession {
   sessionId: string;
   rolloutPath: string;
+  /** SHA-256 of the exact rollout bytes parsed into this snapshot. */
+  sourceContentSha256?: string;
   cwd: string;
   /** cwd exactly as Codex recorded it (original case, \?\ prefix stripped). */
   cwdOriginal: string;
@@ -182,6 +186,8 @@ export interface ImportHistoryRecord {
   importedSessionId: string;
   sourceRolloutPath: string;
   projectRoot: string;
+  /** Target rendering used for this import. Missing on legacy records means semantic. */
+  renderMode?: RenderMode;
   /** sha256 of the transcript this tool wrote, to detect later edits by Claude. */
   targetSha256?: string;
   /**
