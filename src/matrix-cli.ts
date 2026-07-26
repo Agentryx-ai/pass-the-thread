@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { resolveClaudeHome, resolveCodexHome } from "./paths.ts";
+import { normalizeCwd, resolveClaudeHome, resolveCodexHome } from "./paths.ts";
 import {
   inventoryClaudeDesktop,
   resolveClaudeDesktopWorkspace,
@@ -13,12 +13,14 @@ import {
 import { readClaudeJsonl } from "./claude-source.ts";
 import { claudeTranscriptToIr } from "./claude-to-ir.ts";
 import type { BridgeBundle, BridgeEvent } from "./ir.ts";
+import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
+import { deriveSessionIdFromFilename, loadDesktopSessions, parseRollout } from "./codex-source.ts";
 import { writeBridgeConversation, defaultBridgeRoot } from "./bridge-store.ts";
 import { buildImportPlan, canonicalStringify, type ImportPlan, type ImportPlanSessionSummary } from "./import-plan.ts";
 import { selectSessions, type SelectionOptions } from "./selection.ts";
-import { loadDesktopSelection } from "./codex-desktop-state.ts";
+import { loadDesktopSelection, projectForCwd } from "./codex-desktop-state.ts";
 import { canonicalProjectIdentity } from "./project-identity.ts";
-import { findStateDb } from "./codex-db.ts";
+import { findStateDb, loadDesktopThreads, type DbThreadRow } from "./codex-db.ts";
 import {
   applyCodexTarget,
   acquireCodexTargetLock,
@@ -41,6 +43,8 @@ import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/
 import { assertSupportedCodexTarget, loadInstalledCodexTargetEvidence } from "./version-gate.ts";
 import type { CodexTargetEvidence } from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
+import { targetPathFor } from "./claude-target.ts";
+import type { CodexSession } from "./types.ts";
 
 export interface MatrixTargetSessionPlan {
   sourceSessionId: string;
@@ -89,7 +93,7 @@ export interface MatrixTargetBinding {
   sessions: MatrixTargetSessionPlan[];
 }
 
-export interface MatrixPlanFile {
+export interface MatrixReversePlanFile {
   schema: "agentryx.import-plan/v2";
   direction: "claude-to-codex";
   renderMode: RenderMode;
@@ -98,10 +102,203 @@ export interface MatrixPlanFile {
   target: MatrixTargetBinding;
 }
 
+export interface MatrixForwardTargetSessionPlan {
+  sourceSessionId: string;
+  targetPath: string;
+  targetExists: boolean;
+}
+
+export interface MatrixForwardTargetBinding {
+  claudeHome: string;
+  bridgeRoot: string;
+  renderPolicy: {
+    includeReasoning: true;
+  };
+  sessions: MatrixForwardTargetSessionPlan[];
+}
+
+export interface MatrixForwardPlanFile {
+  schema: "agentryx.import-plan/v2";
+  direction: "codex-to-claude";
+  renderMode: RenderMode;
+  digest: string;
+  plan: ImportPlan;
+  target: MatrixForwardTargetBinding;
+}
+
+export type MatrixPlanFile = MatrixReversePlanFile | MatrixForwardPlanFile;
+export type MatrixDirection = MatrixPlanFile["direction"];
+
 interface LoadedSource {
   desktop: ClaudeDesktopSourceSession;
   bundle: BridgeBundle | null;
   summary: ImportPlanSessionSummary;
+}
+
+interface ForwardLoadedSource {
+  session: CodexSession;
+  bundle: BridgeBundle;
+  summary: ImportPlanSessionSummary;
+  targetPath: string;
+  targetExists: boolean;
+}
+
+interface ForwardCodexInventory {
+  via: "desktop" | "db" | "scan";
+  sessions: CodexSession[];
+}
+
+export interface BuildForwardMatrixPlanOptions {
+  claudeHome: string;
+  bridgeRoot: string;
+  selection?: SelectionOptions;
+  renderMode?: RenderMode;
+}
+
+export interface BuiltForwardMatrixPlan {
+  file: MatrixForwardPlanFile;
+  bundles: BridgeBundle[];
+  summaries: ImportPlanSessionSummary[];
+  sourceDigest: string;
+}
+
+function loadForwardCodexInventory(codexHome: string): ForwardCodexInventory {
+  let inventory: ForwardCodexInventory;
+  try {
+    inventory = loadDesktopSessions(codexHome, {
+      includeArchived: true,
+      useCodexCompaction: false,
+    });
+  } catch {
+    // Legacy parsing may reject a future/non-object line. The typed pass below
+    // still inventories every rollout and records that envelope explicitly.
+    inventory = { via: "scan", sessions: [] };
+  }
+  const byPath = new Map(inventory.sessions.map((session) => [
+    canonicalExistingPath(session.rolloutPath).toLowerCase(),
+    session,
+  ]));
+  const dbByPath = new Map((loadDesktopThreads(codexHome, { includeArchived: true }) ?? [])
+    .filter((row) => row.rolloutPath !== "")
+    .map((row) => [canonicalExistingPath(row.rolloutPath).toLowerCase(), row]));
+  const desktopState = loadDesktopSelection(codexHome);
+  const sessions: CodexSession[] = [];
+  const seen = new Set<string>();
+  const walk = (dir: string, archived: boolean): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(candidate, archived);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        const key = canonicalExistingPath(candidate).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let parsed: CodexSession | null = null;
+        try { parsed = parseRollout(candidate, { useCodexCompaction: false }); } catch { /* typed IR handles it */ }
+        const session = enrichForwardSession(
+          byPath.get(key) ?? parsed ?? minimalCodexSession(candidate),
+          dbByPath.get(key),
+          desktopState,
+        );
+        if (!session || session.isChild || session.source.includes("subagent")) continue;
+        sessions.push({ ...session, isArchived: archived || session.isArchived === true });
+      }
+    }
+  };
+  walk(path.join(codexHome, "sessions"), false);
+  walk(path.join(codexHome, "archived_sessions"), true);
+  for (const session of inventory.sessions) {
+    const key = canonicalExistingPath(session.rolloutPath).toLowerCase();
+    if (!seen.has(key)) sessions.push(session);
+  }
+  return {
+    via: inventory.via,
+    sessions: sessions.sort((left, right) => (right.lastTsMs ?? 0) - (left.lastTsMs ?? 0)),
+  };
+}
+
+function enrichForwardSession(
+  original: CodexSession,
+  row: DbThreadRow | undefined,
+  desktopState: ReturnType<typeof loadDesktopSelection>,
+): CodexSession {
+  const session = { ...original };
+  if (row) {
+    const rawCwd = row.cwd.replace(/^\\\\\?\\/, "");
+    if (rawCwd !== "") {
+      session.cwdOriginal = rawCwd;
+      session.cwd = normalizeCwd(rawCwd);
+    }
+    if (row.name != null) session.codexName = row.name;
+    if (row.title !== "") session.title = row.title.replace(/\s+/g, " ").slice(0, 100);
+    if (row.source !== "") session.source = row.source;
+    session.lastTsMs = row.updatedAtMs ?? session.lastTsMs;
+    session.sandboxPolicy = row.sandboxPolicy;
+    session.approvalMode = row.approvalMode;
+    session.reasoningEffort = row.reasoningEffort;
+    session.isArchived = row.archived;
+  }
+  if (desktopState != null) {
+    const desktopThreadId = row?.id ?? session.sessionId;
+    const explicitlyAssigned = desktopState.mode === "assigned" &&
+      desktopState.threadProject.has(desktopThreadId);
+    const project = desktopState.projectlessThreadIds.has(desktopThreadId)
+      ? null
+      : explicitlyAssigned
+        ? desktopState.threadProject.get(desktopThreadId) ?? null
+        : projectForCwd(desktopState, session.cwdOriginal || session.cwd);
+    session.projectName = project?.name ?? "(no project)";
+    session.hasProject = project != null;
+  }
+  return session;
+}
+
+function minimalCodexSession(rolloutPath: string): CodexSession {
+  const meta: Record<string, unknown> = {};
+  let firstTsMs: number | null = null;
+  let lastTsMs: number | null = null;
+  try {
+    const raw = fs.readFileSync(rolloutPath, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      if (line.trim() === "") continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(line.replace(/^\uFEFF/, "")); } catch { continue; }
+      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const record = parsed as Record<string, unknown>;
+      const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+      if (Number.isFinite(timestamp)) {
+        if (firstTsMs == null) firstTsMs = timestamp;
+        lastTsMs = timestamp;
+      }
+      if (record.type === "session_meta" && record.payload && typeof record.payload === "object") {
+        Object.assign(meta, record.payload);
+      }
+    }
+  } catch {
+    // The typed adapter will surface the source read error with its exact path.
+  }
+  const rawCwd = typeof meta.cwd === "string" ? meta.cwd.replace(/^\\\\\?\\/, "") : "";
+  const sourceValue = meta.source ?? meta.originator;
+  const source = typeof sourceValue === "string"
+    ? sourceValue
+    : sourceValue == null ? "" : JSON.stringify(sourceValue);
+  return {
+    sessionId: deriveSessionIdFromFilename(rolloutPath),
+    rolloutPath,
+    cwd: rawCwd === "" ? "" : normalizeCwd(rawCwd),
+    cwdOriginal: rawCwd,
+    meta,
+    firstTsMs,
+    lastTsMs,
+    items: [],
+    model: null,
+    messageCount: 0,
+    title: "",
+    source,
+    isChild: meta.parent_thread_id != null && meta.parent_thread_id !== "",
+    userMessageCount: 0,
+  };
 }
 
 function optionValues(argv: string[], name: string): string[] {
@@ -162,6 +359,15 @@ export function selectionOptions(argv: string[]): SelectionOptions {
     toMs: dateOption(argv, "--to-date"),
     limit: numberOption(argv, "--limit"),
   };
+}
+
+export function matrixDirection(argv: string[]): MatrixDirection {
+  const value = option(argv, "--direction");
+  if (value == null) return "claude-to-codex";
+  if (value !== "claude-to-codex" && value !== "codex-to-claude") {
+    throw new Error("--direction must be claude-to-codex or codex-to-claude");
+  }
+  return value;
 }
 
 function targetProject(codexHome: string, cwd: string): { exists: boolean; name?: string } {
@@ -249,6 +455,43 @@ function lossObservations(events: BridgeEvent[]): Array<{ kind: string; count: n
   }
   if (compactBoundaries > 1) counts.set("earlier_compaction_sidecar_only", compactBoundaries - 1);
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([kind, count]) => ({ kind, count }));
+}
+
+/** Loss policy for the typed Codex IR when it is rendered into Claude history. */
+export function forwardLossObservations(
+  events: readonly BridgeEvent[],
+  renderMode: RenderMode,
+): Array<{ kind: string; count: number; detail?: string }> {
+  if (renderMode === "verbatim") {
+    return [{
+      kind: "verbatim_semantics_intentionally_inert",
+      count: Math.max(1, events.length),
+      detail: "Canonical source text is preserved, but source-native semantics are not activated in Claude.",
+    }];
+  }
+
+  const counts = new Map<string, number>();
+  const add = (kind: string): void => {
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  };
+  for (const event of events) {
+    if (event.kind === "unknown") add(`unknown_event_sidecar_only:${event.reason}`);
+    else if (event.kind === "protocol") {
+      add(event.recordType === "event_msg"
+        ? "event_msg_protocol_sidecar_only"
+        : `protocol_record_sidecar_only:${event.recordType}`);
+    } else if (event.kind === "turn_context") add("turn_context_sidecar_only");
+    else if (event.kind === "world_state") add("world_state_sidecar_only");
+    else if (event.kind === "goal_snapshot") add("historical_goal_not_rendered_or_activated");
+    else if (event.kind === "task_notification") add("task_notification_not_rendered");
+    else if (event.kind === "access_snapshot") add("access_snapshot_not_rendered_or_applied");
+    else if (event.kind === "media" && event.mediaType !== "image") {
+      add(`unsupported_media_not_rendered:${event.mediaType}`);
+    }
+  }
+  return [...counts]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([kind, count]) => ({ kind, count }));
 }
 
 export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
@@ -515,13 +758,94 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
   return logical;
 }
 
-export function matrixPlanDigest(value: Omit<MatrixPlanFile, "digest">): string {
+export function matrixPlanDigest(
+  value: Omit<MatrixReversePlanFile, "digest"> | Omit<MatrixForwardPlanFile, "digest">,
+): string {
   return createHash("sha256").update(canonicalStringify(value), "utf8").digest("hex");
 }
 
 function canonicalExistingPath(value: string): string {
   const resolved = path.resolve(value);
   try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+}
+
+function loadForwardSource(
+  session: CodexSession,
+  claudeHome: string,
+  renderMode: RenderMode,
+): ForwardLoadedSource {
+  const bundle = codexRolloutToBridgeBundle(session);
+  const target = targetPathFor(claudeHome, session);
+  const targetPath = canonicalExistingPath(target.targetPath);
+  const projectRoot = session.cwdOriginal || session.cwd;
+  const targetExists = fs.existsSync(targetPath);
+  return {
+    session,
+    bundle,
+    targetPath,
+    targetExists,
+    summary: {
+      sessionId: session.sessionId,
+      cwd: projectRoot,
+      projectRoot,
+      projectName: session.projectName,
+      hasProject: session.hasProject ?? projectRoot !== "",
+      isArchived: session.isArchived === true,
+      targetExists,
+      firstTsMs: session.firstTsMs,
+      lastTsMs: session.lastTsMs,
+      sourcePath: canonicalExistingPath(session.rolloutPath),
+      sourceSha256: bundle.conversation.sourceContentSha256,
+      title: session.codexName || session.title || undefined,
+      messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
+      losses: forwardLossObservations(bundle.conversation.events, renderMode),
+    },
+  };
+}
+
+/**
+ * Build a deterministic, read-only Codex-to-Claude matrix plan from an isolated
+ * inventory. The only filesystem operations are source reads and target
+ * existence checks; neither the bridge store nor Claude home is created.
+ */
+export function buildForwardMatrixPlan(
+  sessions: readonly CodexSession[],
+  options: BuildForwardMatrixPlanOptions,
+): BuiltForwardMatrixPlan {
+  const renderMode = options.renderMode ?? "semantic";
+  const selection = options.selection ?? {};
+  const claudeHome = canonicalExistingPath(options.claudeHome);
+  const bridgeRoot = canonicalExistingPath(options.bridgeRoot);
+  const sources = sessions.map((session) => loadForwardSource(session, claudeHome, renderMode));
+  const summaries = sources.map((source) => source.summary);
+  const built = buildImportPlan(summaries, { selection });
+  const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
+  const withoutDigest: Omit<MatrixForwardPlanFile, "digest"> = {
+    schema: "agentryx.import-plan/v2",
+    direction: "codex-to-claude",
+    renderMode,
+    plan: built.plan,
+    target: {
+      claudeHome,
+      bridgeRoot,
+      renderPolicy: { includeReasoning: true },
+      sessions: built.plan.sessions.map((selected) => {
+        const source = byId.get(selected.sessionId);
+        if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
+        return {
+          sourceSessionId: selected.sessionId,
+          targetPath: source.targetPath,
+          targetExists: source.targetExists,
+        };
+      }),
+    },
+  };
+  return {
+    file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
+    bundles: sources.map((source) => source.bundle),
+    summaries,
+    sourceDigest: built.digest,
+  };
 }
 
 function targetSummary(sourceSessionId: string, plan: CodexTargetPlan): MatrixTargetSessionPlan {
@@ -553,7 +877,7 @@ function summariesForRenderMode(sources: LoadedSource[], renderMode: RenderMode)
 function buildMatrixPlan(
   sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode,
   codexHome: string, dbPath: string, bridgeRoot: string, evidence: CodexTargetEvidence,
-): { file: MatrixPlanFile; targetPlans: CodexTargetPlan[] } {
+): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
   const summaries = summariesForRenderMode(sources, renderMode);
   const built = buildImportPlan(summaries, { selection });
   const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
@@ -565,7 +889,7 @@ function buildMatrixPlan(
       bridgeToLogical(source, renderMode), selected.archived,
     );
   });
-  const withoutDigest: Omit<MatrixPlanFile, "digest"> = {
+  const withoutDigest: Omit<MatrixReversePlanFile, "digest"> = {
     schema: "agentryx.import-plan/v2",
     direction: "claude-to-codex",
     renderMode,
@@ -614,7 +938,7 @@ export const MATRIX_HELP =
   "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
-  "[--render-mode semantic|verbatim]\n";
+  "[--render-mode semantic|verbatim] [--direction claude-to-codex|codex-to-claude]\n";
 
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
@@ -626,6 +950,34 @@ export function main(argv = process.argv.slice(2)): void {
   if (command === "scan") {
     const selection = selectionOptions(argv);
     if (selection.archive == null) selection.archive = "all";
+    const direction = matrixDirection(argv);
+    if (direction === "codex-to-claude") {
+      const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+      const inventory = loadForwardCodexInventory(codexHome);
+      const renderMode = parseRenderMode(option(argv, "--render-mode"));
+      const built = buildForwardMatrixPlan(inventory.sessions, {
+        claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
+        bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
+        selection,
+        renderMode,
+      });
+      writeJson(option(argv, "--out"), {
+        codexHome: canonicalExistingPath(codexHome),
+        inventory: {
+          via: inventory.via,
+          total: inventory.sessions.length,
+          selected: built.file.plan.sessions.length,
+          active: inventory.sessions.filter((source) => source.isArchived !== true).length,
+          archived: inventory.sessions.filter((source) => source.isArchived === true).length,
+        },
+        direction,
+        renderMode,
+        selected: built.file.plan.sessions,
+        losses: built.file.plan.losses,
+        sourceDigest: built.sourceDigest,
+      });
+      return;
+    }
     const loaded = loadSources(argv, selection);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
     const built = buildImportPlan(summariesForRenderMode(loaded.sources, renderMode), { selection });
@@ -647,6 +999,20 @@ export function main(argv = process.argv.slice(2)): void {
     return;
   }
   if (command === "plan") {
+    const direction = matrixDirection(argv);
+    if (direction === "codex-to-claude") {
+      const selection = selectionOptions(argv);
+      const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+      const inventory = loadForwardCodexInventory(codexHome);
+      const matrix = buildForwardMatrixPlan(inventory.sessions, {
+        claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
+        bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
+        selection,
+        renderMode: parseRenderMode(option(argv, "--render-mode")),
+      });
+      writeJson(option(argv, "--out"), matrix.file);
+      return;
+    }
     const evidencePath = option(argv, "--evidence");
     if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
     const selection = selectionOptions(argv);
@@ -695,6 +1061,12 @@ export function main(argv = process.argv.slice(2)): void {
   if (command !== "apply") throw new Error(MATRIX_HELP.trimEnd());
 
   const planPath = option(argv, "--plan");
+  if (planPath) {
+    const candidate = JSON.parse(fs.readFileSync(planPath, "utf8")) as Partial<MatrixPlanFile>;
+    if (candidate.schema === "agentryx.import-plan/v2" && candidate.direction === "codex-to-claude") {
+      throw new Error("codex-to-claude apply is read-only and is not implemented yet");
+    }
+  }
   const evidencePath = option(argv, "--evidence");
   const confirmation = option(argv, "--confirm");
   if (!planPath || !evidencePath || !confirmation) {
@@ -705,7 +1077,7 @@ export function main(argv = process.argv.slice(2)): void {
     !["semantic", "verbatim"].includes(stored.renderMode)) {
     throw new Error("unsupported import plan");
   }
-  const storedContent: Omit<MatrixPlanFile, "digest"> = {
+  const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
     schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
     plan: stored.plan, target: stored.target,
   };
