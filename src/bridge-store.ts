@@ -11,7 +11,14 @@ import {
   verifyEnvelope,
   type RawEnvelope,
 } from "./envelope.ts";
-import type { BridgeBundle, BridgeConversation, BridgeOperation } from "./ir.ts";
+import {
+  BRIDGE_IR_VERSION,
+  type BridgeBundle,
+  type BridgeConversation,
+  type BridgeOperation,
+} from "./ir.ts";
+
+type LegacyBridgeConversationV1 = Omit<BridgeConversation, "version"> & { version: 1 };
 
 interface StoredRawObject {
   version: 1;
@@ -32,7 +39,7 @@ interface StoredEnvelopeRef {
 interface StoredConversation {
   version: 1;
   contentSha256: string;
-  conversation: BridgeConversation;
+  conversation: BridgeConversation | LegacyBridgeConversationV1;
   envelopes: StoredEnvelopeRef[];
 }
 
@@ -156,13 +163,26 @@ function envelopeRef(envelope: RawEnvelope): StoredEnvelopeRef {
 }
 
 function conversationPayloadHash(
-  conversation: BridgeConversation,
+  conversation: BridgeConversation | LegacyBridgeConversationV1,
   envelopes: StoredEnvelopeRef[],
 ): string {
   return sha256Utf8(stableStringify({ version: 1, conversation, envelopes }));
 }
 
+function migrateConversation(
+  conversation: BridgeConversation | LegacyBridgeConversationV1,
+): BridgeConversation {
+  if (conversation.version === BRIDGE_IR_VERSION) return conversation;
+  if (conversation.version === 1) {
+    return { ...conversation, version: BRIDGE_IR_VERSION };
+  }
+  throw new Error(`Unsupported bridge IR version: ${String((conversation as { version?: unknown }).version)}`);
+}
+
 function validateBundle(bundle: BridgeBundle): void {
+  if (bundle.conversation.version !== BRIDGE_IR_VERSION) {
+    throw new Error(`Cannot write unsupported bridge IR version: ${String(bundle.conversation.version)}`);
+  }
   const ids = new Set<string>();
   for (const envelope of bundle.envelopes) {
     verifyEnvelope(envelope);
@@ -300,7 +320,7 @@ export function readBridgeConversation(
     if (envelope.id !== ref.id) throw new Error(`Envelope id mismatch for ${ref.id}`);
     return envelope;
   });
-  const bundle = { conversation: stored.conversation, envelopes };
+  const bundle = { conversation: migrateConversation(stored.conversation), envelopes };
   validateBundle(bundle);
   return bundle;
 }

@@ -5,13 +5,14 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { createEnvelope } from "../src/envelope.ts";
+import { createEnvelope, sha256Utf8, stableStringify } from "../src/envelope.ts";
 import { readClaudeJsonl, scanClaudeSessions } from "../src/claude-source.ts";
 import { claudeRecordToIr, claudeTranscriptToIr } from "../src/claude-to-ir.ts";
-import { codexRolloutToBridgeBundle } from "../src/codex-to-ir.ts";
+import { codexRecordToIr, codexRolloutToBridgeBundle } from "../src/codex-to-ir.ts";
 import type { CodexSession } from "../src/types.ts";
 import {
   objectPath,
+  conversationPath,
   conversationRevisionPath,
   readBridgeConversation,
   writeBridgeConversation,
@@ -135,6 +136,193 @@ test("Codex rollouts also get a byte-exact provider-neutral sidecar", () => {
     Buffer.from(restored.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join(""), "utf8"),
     bytes,
   );
+});
+
+test("every Codex envelope maps to typed historical IR or an explicit unknown", () => {
+  const records = [
+    { timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id: "codex-ir", cwd: "C:\\repo" } },
+    {
+      timestamp: "2026-07-25T10:00:01.000Z",
+      type: "turn_context",
+      payload: { approval_policy: "on-request", sandbox_policy: { type: "workspace-write" } },
+    },
+    {
+      timestamp: "2026-07-25T10:00:02.000Z",
+      type: "response_item",
+      payload: {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "hello" },
+          { type: "input_image", image_url: "data:image/png;base64,AA==", detail: "high" },
+          { type: "future_block", mustSurvive: true },
+        ],
+      },
+    },
+    {
+      timestamp: "2026-07-25T10:00:03.000Z",
+      type: "response_item",
+      payload: { type: "reasoning", summary: [{ type: "summary_text", text: "think" }], content: null },
+    },
+    {
+      timestamp: "2026-07-25T10:00:04.000Z",
+      type: "response_item",
+      payload: { type: "function_call", name: "shell", arguments: '{"cmd":"dir"}', call_id: "call-1" },
+    },
+    {
+      timestamp: "2026-07-25T10:00:05.000Z",
+      type: "response_item",
+      payload: { type: "function_call_output", call_id: "call-1", output: "done" },
+    },
+    {
+      timestamp: "2026-07-25T10:00:06.000Z",
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        message: "<task-notification><task-id>task-7</task-id><status>completed</status></task-notification>",
+      },
+    },
+    {
+      timestamp: "2026-07-25T10:00:07.000Z",
+      type: "event_msg",
+      payload: { type: "thread_goal_updated", goal: "ship safely", status: "active" },
+    },
+    { timestamp: "2026-07-25T10:00:08.000Z", type: "world_state", payload: { cwd: "C:\\repo", active: true } },
+    { timestamp: "2026-07-25T10:00:09.000Z", type: "compacted", payload: { replacement_history: [] } },
+    { timestamp: "2026-07-25T10:00:10.000Z", type: "future_record", payload: { mustSurvive: true } },
+  ];
+  const envelopes = records.map((record, recordIndex) => createEnvelope("codex", json(record), {
+    sourcePath: "C:/rollout.jsonl",
+    recordIndex,
+    lineEnding: "\n",
+  }));
+  const malformed = createEnvelope("codex", "{broken", {
+    sourcePath: "C:/rollout.jsonl",
+    recordIndex: records.length,
+    lineEnding: "\n",
+  });
+  const events = [...envelopes, malformed].flatMap(codexRecordToIr);
+  const remapped = [...envelopes, malformed].flatMap(codexRecordToIr);
+
+  assert.deepEqual(
+    new Set(events.map((event) => event.sourceEnvelopeId)),
+    new Set([...envelopes, malformed].map((envelope) => envelope.id)),
+  );
+  assert.equal(new Set(events.map((event) => event.id)).size, events.length);
+  assert.deepEqual(remapped.map((event) => event.id), events.map((event) => event.id));
+  assert.deepEqual(
+    events.map((event) => event.kind),
+    [
+      "protocol",
+      "turn_context",
+      "access_snapshot",
+      "text",
+      "media",
+      "unknown",
+      "reasoning",
+      "tool_use",
+      "tool_result",
+      "protocol",
+      "task_notification",
+      "protocol",
+      "goal_snapshot",
+      "world_state",
+      "compact_boundary",
+      "unknown",
+      "unknown",
+    ],
+  );
+
+  const task = events.find((event) => event.kind === "task_notification");
+  assert.ok(task && task.kind === "task_notification");
+  assert.equal(task.taskId, "task-7");
+  assert.equal(task.safety.resumeTask, false);
+  const goal = events.find((event) => event.kind === "goal_snapshot");
+  assert.ok(goal && goal.kind === "goal_snapshot");
+  assert.equal(goal.goal, "ship safely");
+  assert.equal(goal.safety.activateGoal, false);
+  const access = events.find((event) => event.kind === "access_snapshot");
+  assert.ok(access && access.kind === "access_snapshot");
+  assert.equal(access.permissionMode, "on-request");
+  assert.equal(access.safety.applyAccess, false);
+  const media = events.find((event) => event.kind === "media");
+  assert.ok(media && media.kind === "media");
+  assert.equal(media.mediaType, "image");
+  assert.equal(media.source, "data:image/png;base64,AA==");
+});
+
+test("Codex injected user-role context is historical while a wrapped request stays human-authored", () => {
+  const injected = {
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "<environment_context><cwd>C:\\repo</cwd></environment_context>" }],
+    },
+  };
+  const wrapped = {
+    type: "response_item",
+    payload: {
+      type: "message",
+      role: "user",
+      content: [{
+        type: "input_text",
+        text: "# AGENTS.md instructions\n\n<INSTRUCTIONS>follow this</INSTRUCTIONS>\n\n## My request for Codex:\n\nship it",
+      }],
+    },
+  };
+  const events = [injected, wrapped].flatMap((record, recordIndex) => codexRecordToIr(createEnvelope(
+    "codex",
+    json(record),
+    { sourcePath: "C:/rollout.jsonl", recordIndex, lineEnding: "\n" },
+  )));
+
+  assert.deepEqual(events.map((event) => event.kind), ["text", "text", "text"]);
+  const text = events.filter((event): event is Extract<typeof event, { kind: "text" }> => event.kind === "text");
+  assert.deepEqual(text.map((event) => event.authoredByHuman), [false, false, true]);
+  assert.deepEqual(text.map((event) => event.role), ["system", "system", "user"]);
+  assert.equal(text[2]?.text, "ship it");
+});
+
+test("Codex event_msg mirrors stay protocol-only and future suffixes need tool structure", () => {
+  const records = [
+    { type: "event_msg", payload: { type: "user_message", message: "same message" } },
+    { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "same message" }] } },
+    { type: "response_item", payload: { type: "future_output", id: "item-1", content: "not a tool" } },
+    { type: "response_item", payload: { type: "future_call", id: "item-2", input: { q: 1 } } },
+  ];
+  const events = records.flatMap((record, recordIndex) => codexRecordToIr(createEnvelope(
+    "codex",
+    json(record),
+    { sourcePath: "C:/rollout.jsonl", recordIndex, lineEnding: "\n" },
+  )));
+
+  assert.deepEqual(events.map((event) => event.kind), ["protocol", "text", "unknown", "unknown"]);
+  assert.equal(events.filter((event) => event.kind === "text").length, 1);
+});
+
+test("Codex bundle event coverage is complete without changing exact source bytes", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-ir-coverage-"));
+  const sourcePath = path.join(root, "rollout.jsonl");
+  const contents = [
+    json({ type: "session_meta", payload: { id: "coverage", cwd: "C:\\repo" } }),
+    json({ type: "event_msg", payload: { type: "task_started" } }),
+    json({ type: "world_state", payload: { state: "opaque" } }),
+  ].join("\r\n") + "\r\n";
+  fs.writeFileSync(sourcePath, contents, "utf8");
+  const session = {
+    sessionId: "coverage", rolloutPath: sourcePath, cwd: "C:\\repo", cwdOriginal: "C:\\repo",
+    meta: {}, firstTsMs: null, lastTsMs: null, items: [], model: null, messageCount: 0,
+    title: "coverage", source: "vscode", isChild: false, userMessageCount: 0,
+  } satisfies CodexSession;
+  const bundle = codexRolloutToBridgeBundle(session);
+
+  assert.equal(bundle.conversation.events.length, 3);
+  assert.deepEqual(
+    new Set(bundle.conversation.events.map((event) => event.sourceEnvelopeId)),
+    new Set(bundle.conversation.recordEnvelopeIds),
+  );
+  assert.equal(bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join(""), contents);
 });
 
 test("Claude records map to lossless historical IR without activating controls", () => {
@@ -341,4 +529,47 @@ test("bridge store keeps immutable revisions when an active session grows", () =
   const wrongRevision = "f".repeat(64);
   fs.copyFileSync(first.conversationPath, conversationRevisionPath(root, "growing", wrongRevision));
   assert.throws(() => readBridgeConversation(root, "growing", wrongRevision), /manifest hash mismatch/i);
+});
+
+test("bridge store hash-verifies and upgrades legacy IR v1 manifests on read", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-v1-upgrade-"));
+  const file = path.join(dir, "source.jsonl");
+  fs.writeFileSync(file, `${json({ type: "user", sessionId: "legacy-v1", message: { content: "hello" } })}\n`);
+  const root = path.join(dir, "store");
+  const written = writeBridgeConversation(root, claudeTranscriptToIr(readClaudeJsonl(file)));
+  const manifest = JSON.parse(fs.readFileSync(written.conversationPath, "utf8"));
+  manifest.conversation.version = 1;
+  manifest.contentSha256 = sha256Utf8(stableStringify({
+    version: 1,
+    conversation: manifest.conversation,
+    envelopes: manifest.envelopes,
+  }));
+  const legacyPath = conversationRevisionPath(root, "legacy-v1", manifest.contentSha256);
+  fs.writeFileSync(legacyPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  fs.writeFileSync(conversationPath(root, "legacy-v1"), `${JSON.stringify({
+    version: 1,
+    conversationId: "legacy-v1",
+    contentSha256: manifest.contentSha256,
+  }, null, 2)}\n`, "utf8");
+
+  const restored = readBridgeConversation(root, "legacy-v1");
+  assert.equal(restored.conversation.version, 2);
+  assert.deepEqual(restored.conversation.events.map((event) => event.kind), ["text"]);
+});
+
+test("bridge store writes only the current IR version", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-version-write-"));
+  const file = path.join(dir, "source.jsonl");
+  fs.writeFileSync(file, `${json({ type: "user", sessionId: "version-write", message: { content: "hello" } })}\n`);
+  const bundle = claudeTranscriptToIr(readClaudeJsonl(file));
+  for (const version of [1, 3]) {
+    const unsupported = {
+      ...bundle,
+      conversation: { ...bundle.conversation, version },
+    } as unknown as typeof bundle;
+    assert.throws(
+      () => writeBridgeConversation(path.join(dir, `store-v${version}`), unsupported),
+      /unsupported bridge IR version/i,
+    );
+  }
 });

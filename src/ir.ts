@@ -1,6 +1,6 @@
 import type { RawEnvelope } from "./envelope.ts";
 
-export const BRIDGE_IR_VERSION = 1 as const;
+export const BRIDGE_IR_VERSION = 2 as const;
 
 /**
  * Imported control records describe past state. They are never instructions to
@@ -80,6 +80,37 @@ export interface AccessSnapshotEvent extends BridgeEventBase {
   snapshot: unknown;
 }
 
+export interface ReasoningEvent extends BridgeEventBase {
+  kind: "reasoning";
+  summary: unknown;
+  content: unknown;
+}
+
+export interface MediaEvent extends BridgeEventBase {
+  kind: "media";
+  mediaType: "image" | "audio" | "file" | "unknown";
+  source: unknown;
+  metadata: unknown;
+}
+
+/** A known provider protocol record which has no portable behavioral meaning. */
+export interface ProtocolEvent extends BridgeEventBase {
+  kind: "protocol";
+  recordType: string;
+  protocolType: string | null;
+  payload: unknown;
+}
+
+export interface TurnContextEvent extends BridgeEventBase {
+  kind: "turn_context";
+  context: unknown;
+}
+
+export interface WorldStateEvent extends BridgeEventBase {
+  kind: "world_state";
+  state: unknown;
+}
+
 export interface UnknownEvent extends BridgeEventBase {
   kind: "unknown";
   reason: "invalid_json" | "unknown_record" | "unknown_content_block" | "unsupported_shape";
@@ -94,6 +125,11 @@ export type BridgeEvent =
   | CompactBoundaryEvent
   | GoalSnapshotEvent
   | AccessSnapshotEvent
+  | ReasoningEvent
+  | MediaEvent
+  | ProtocolEvent
+  | TurnContextEvent
+  | WorldStateEvent
   | UnknownEvent;
 
 export interface BridgeConversation {
