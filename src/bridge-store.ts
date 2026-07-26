@@ -17,8 +17,12 @@ import {
   type BridgeConversation,
   type BridgeOperation,
 } from "./ir.ts";
+import { validateCanonicalGoalSnapshot } from "./goal.ts";
 
-type LegacyBridgeConversationV1 = Omit<BridgeConversation, "version"> & { version: 1 };
+type LegacyBridgeConversationV1 = Omit<BridgeConversation, "version" | "goalState"> & {
+  version: 1;
+  goalState?: never;
+};
 
 interface StoredRawObject {
   version: 1;
@@ -182,6 +186,18 @@ function migrateConversation(
 function validateBundle(bundle: BridgeBundle): void {
   if (bundle.conversation.version !== BRIDGE_IR_VERSION) {
     throw new Error(`Cannot write unsupported bridge IR version: ${String(bundle.conversation.version)}`);
+  }
+  if (bundle.conversation.goalState !== undefined) {
+    validateCanonicalGoalSnapshot(bundle.conversation.goalState);
+    const sourceProvider = bundle.conversation.sourceProvider ??
+      (bundle.conversation.source === "codex-rollout" ? "codex" : bundle.conversation.source);
+    if (bundle.conversation.goalState.provider !== sourceProvider) {
+      throw new Error("Canonical Goal provider does not match the bridge conversation source");
+    }
+    const sourceThreadId = bundle.conversation.sourceThreadId ?? bundle.conversation.sourceSessionId;
+    if (sourceThreadId == null || bundle.conversation.goalState.sourceThreadId !== sourceThreadId) {
+      throw new Error("Canonical Goal thread does not match the bridge conversation source thread");
+    }
   }
   const ids = new Set<string>();
   for (const envelope of bundle.envelopes) {

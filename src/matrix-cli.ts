@@ -13,7 +13,7 @@ import {
 import { readClaudeJsonl } from "./claude-source.ts";
 import { claudeTranscriptToIr } from "./claude-to-ir.ts";
 import type { BridgeBundle, BridgeEvent } from "./ir.ts";
-import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
+import { codexRolloutToBridgeBundle, codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
 import { deriveSessionIdFromFilename, loadDesktopSessions, parseRollout } from "./codex-source.ts";
 import { writeBridgeConversation, defaultBridgeRoot } from "./bridge-store.ts";
 import { buildImportPlan, canonicalStringify, type ImportPlan, type ImportPlanSessionSummary } from "./import-plan.ts";
@@ -149,6 +149,7 @@ interface ForwardCodexInventory {
 }
 
 export interface BuildForwardMatrixPlanOptions {
+  codexHome?: string;
   claudeHome: string;
   bridgeRoot: string;
   selection?: SelectionOptions;
@@ -225,6 +226,7 @@ function enrichForwardSession(
 ): CodexSession {
   const session = { ...original };
   if (row) {
+    session.desktopThreadId = row.id;
     const rawCwd = row.cwd.replace(/^\\\\\?\\/, "");
     if (rawCwd !== "") {
       session.cwdOriginal = rawCwd;
@@ -283,8 +285,10 @@ function minimalCodexSession(rolloutPath: string): CodexSession {
   const source = typeof sourceValue === "string"
     ? sourceValue
     : sourceValue == null ? "" : JSON.stringify(sourceValue);
+  const sessionId = deriveSessionIdFromFilename(rolloutPath);
   return {
-    sessionId: deriveSessionIdFromFilename(rolloutPath),
+    sessionId,
+    desktopThreadId: sessionId,
     rolloutPath,
     cwd: rawCwd === "" ? "" : normalizeCwd(rawCwd),
     cwdOriginal: rawCwd,
@@ -771,10 +775,13 @@ function canonicalExistingPath(value: string): string {
 
 function loadForwardSource(
   session: CodexSession,
+  codexHome: string | undefined,
   claudeHome: string,
   renderMode: RenderMode,
 ): ForwardLoadedSource {
-  const bundle = codexRolloutToBridgeBundle(session);
+  const bundle = codexHome == null
+    ? codexRolloutToBridgeBundle(session)
+    : codexRolloutWithGoalToBridgeBundle(session, codexHome);
   const target = targetPathFor(claudeHome, session);
   const targetPath = canonicalExistingPath(target.targetPath);
   const projectRoot = session.cwdOriginal || session.cwd;
@@ -816,7 +823,7 @@ export function buildForwardMatrixPlan(
   const selection = options.selection ?? {};
   const claudeHome = canonicalExistingPath(options.claudeHome);
   const bridgeRoot = canonicalExistingPath(options.bridgeRoot);
-  const sources = sessions.map((session) => loadForwardSource(session, claudeHome, renderMode));
+  const sources = sessions.map((session) => loadForwardSource(session, options.codexHome, claudeHome, renderMode));
   const summaries = sources.map((source) => source.summary);
   const built = buildImportPlan(summaries, { selection });
   const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
@@ -956,6 +963,7 @@ export function main(argv = process.argv.slice(2)): void {
       const inventory = loadForwardCodexInventory(codexHome);
       const renderMode = parseRenderMode(option(argv, "--render-mode"));
       const built = buildForwardMatrixPlan(inventory.sessions, {
+        codexHome,
         claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
         bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
         selection,
@@ -1005,6 +1013,7 @@ export function main(argv = process.argv.slice(2)): void {
       const codexHome = resolveCodexHome(option(argv, "--codex-home"));
       const inventory = loadForwardCodexInventory(codexHome);
       const matrix = buildForwardMatrixPlan(inventory.sessions, {
+        codexHome,
         claudeHome: resolveClaudeHome(option(argv, "--claude-home")),
         bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
         selection,

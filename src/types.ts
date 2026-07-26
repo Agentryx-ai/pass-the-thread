@@ -59,6 +59,8 @@ export interface SessionMeta {
 /** A parsed Codex session ready for filtering / conversion. */
 export interface CodexSession {
   sessionId: string;
+  /** Authoritative Codex Desktop thread id, when resolved from the thread index. */
+  desktopThreadId?: string;
   rolloutPath: string;
   /** SHA-256 of the exact rollout bytes parsed into this snapshot. */
   sourceContentSha256?: string;

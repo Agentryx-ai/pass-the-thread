@@ -172,6 +172,7 @@ export function parseRollout(
 
   return {
     sessionId,
+    desktopThreadId: sessionId,
     rolloutPath,
     sourceContentSha256,
     cwd,
@@ -271,6 +272,7 @@ export function loadDesktopSessions(
         if (!r.rolloutPath) continue;
         const s = parseRollout(r.rolloutPath, opts);
         if (!s) continue;
+        s.desktopThreadId = r.id;
         if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
         s.codexName = nameFor(r);
         if (r.source) s.source = r.source;
@@ -299,6 +301,7 @@ export function loadDesktopSessions(
         if (opts.interactiveOnly && r.source.includes("exec")) continue;
         const s = parseRollout(r.rolloutPath, opts);
         if (!s) continue;
+        s.desktopThreadId = r.id;
         if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
         s.codexName = nameFor(r);
         if (r.source) s.source = r.source;
@@ -322,6 +325,7 @@ export function loadDesktopSessions(
       if (!r.rolloutPath) continue;
       const s = parseRollout(r.rolloutPath, opts);
       if (!s) continue;
+      s.desktopThreadId = r.id;
       if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
       s.codexName = nameFor(r);
       if (r.source) s.source = r.source;

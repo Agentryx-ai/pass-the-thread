@@ -7,6 +7,11 @@ import {
   type BridgeEvent,
 } from "./ir.ts";
 import type { ClaudeSourceTranscript } from "./claude-source.ts";
+import {
+  createCanonicalGoalSnapshot,
+  type CanonicalGoalSnapshot,
+  type GoalLifecycleStatus,
+} from "./goal.ts";
 
 type ObjectRecord = Record<string, unknown>;
 
@@ -81,6 +86,76 @@ function goalFrom(content: unknown, record: ObjectRecord): {
     status: match[1].toLowerCase(),
     goal: match[2].trim() || null,
   };
+}
+
+function goalStatusAttachment(record: ObjectRecord): ObjectRecord | null {
+  if (record.type !== "attachment") return null;
+  const attachment = asRecord(record.attachment);
+  return attachment?.type === "goal_status" ? attachment : null;
+}
+
+function claudeGoalStatus(attachment: ObjectRecord): GoalLifecycleStatus {
+  if (typeof attachment.met !== "boolean") {
+    throw new Error("Invalid Claude Goal status attachment: met must be a boolean");
+  }
+  if (attachment.failed !== undefined && typeof attachment.failed !== "boolean") {
+    throw new Error("Invalid Claude Goal status attachment: failed must be a boolean when present");
+  }
+  if (attachment.met === true && attachment.failed === true) {
+    throw new Error("Invalid Claude Goal status attachment: met and failed cannot both be true");
+  }
+  if (attachment.failed === true) return "failed";
+  if (attachment.met === true) return "complete";
+  return "active";
+}
+
+function authoritativeClaudeGoal(
+  source: ClaudeSourceTranscript,
+  sourceThreadId: string,
+): CanonicalGoalSnapshot | undefined {
+  let latest: { attachment: ObjectRecord; record: ObjectRecord; envelope: RawEnvelope } | null = null;
+  source.records.forEach((envelope, recordIndex) => {
+    const record = asRecord(envelope.parsed);
+    if (!record) return;
+    const attachment = goalStatusAttachment(record);
+    if (attachment) latest = { attachment, record, envelope };
+  });
+  if (latest == null) return undefined;
+  if (source.sessionId == null || source.sessionIds.length !== 1 || source.sessionIds[0] !== source.sessionId) {
+    throw new Error("Invalid Claude Goal source: transcript must contain exactly one session identity");
+  }
+  const selected = latest as { attachment: ObjectRecord; record: ObjectRecord; envelope: RawEnvelope };
+  if (selected.record.sessionId !== sourceThreadId) {
+    throw new Error(
+      `Invalid Claude Goal source: record ${selected.envelope.recordIndex} belongs to a different session`,
+    );
+  }
+  const objective = stringOrNull(selected.attachment.condition);
+  if (objective == null) {
+    throw new Error(
+      `Invalid Claude Goal status attachment at record ${selected.envelope.recordIndex}: missing condition`,
+    );
+  }
+  return createCanonicalGoalSnapshot({
+    authority: "native-transcript",
+    provider: "claude",
+    sourceThreadId,
+    sourceGoalId: null,
+    objective,
+    status: claudeGoalStatus(selected.attachment),
+    tokenBudget: null,
+    tokensUsed: null,
+    timeUsedSeconds: null,
+    createdAtMs: null,
+    updatedAtMs: null,
+    locator: {
+      sourcePath: source.sourcePath,
+      recordIndex: selected.envelope.recordIndex,
+      table: null,
+      key: null,
+    },
+    exactSourceSha256: selected.envelope.contentSha256,
+  });
 }
 
 function accessSnapshot(envelope: RawEnvelope, record: ObjectRecord): AccessSnapshotEvent | null {
@@ -221,6 +296,18 @@ export function claudeRecordToIr(envelope: RawEnvelope): BridgeEvent[] {
   const message = asRecord(record.message);
   const content = message?.content;
 
+  const goalAttachment = goalStatusAttachment(record);
+  if (goalAttachment) {
+    events.push({
+      ...base(envelope, "attachment", "goal_snapshot"),
+      kind: "goal_snapshot",
+      goal: stringOrNull(goalAttachment.condition),
+      status: claudeGoalStatus(goalAttachment),
+      snapshot: goalAttachment,
+    });
+    return events;
+  }
+
   if (origin?.kind === "task-notification" || type === "task-notification" || type === "task_notification") {
     events.push({
       ...base(envelope, "$", "task_notification"),
@@ -280,16 +367,20 @@ export function claudeRecordToIr(envelope: RawEnvelope): BridgeEvent[] {
 export function claudeTranscriptToIr(source: ClaudeSourceTranscript): BridgeBundle {
   const sourceSessionId = source.sessionId;
   const id = sourceSessionId ?? deterministicId("claude-conversation-v1", source.sourcePath);
+  const goalState = authoritativeClaudeGoal(source, id);
   return {
     conversation: {
       version: BRIDGE_IR_VERSION,
       id,
       source: "claude",
+      sourceProvider: "claude",
       sourcePath: source.sourcePath,
       sourceContentSha256: source.contentSha256,
       sourceSessionId,
+      sourceThreadId: id,
       cwd: source.cwd,
       title: source.title,
+      ...(goalState === undefined ? {} : { goalState }),
       recordEnvelopeIds: source.records.map((record) => record.id),
       events: source.records.flatMap(claudeRecordToIr),
     },

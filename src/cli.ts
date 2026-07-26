@@ -41,7 +41,7 @@ import { findContinuation } from "./continued.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
-import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
+import { codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
 import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
 import type { SessionFilter } from "./types.ts";
 
@@ -487,7 +487,7 @@ export function main(argv: string[]): number {
         imported += 1;
         continue;
       }
-      writeBridgeConversation(bridgeRoot, codexRolloutToBridgeBundle(s));
+      writeBridgeConversation(bridgeRoot, codexRolloutWithGoalToBridgeBundle(s, codexHome));
       const res = writeTranscript(claudeHome, s, lines);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a

@@ -11,6 +11,11 @@ import {
 import { splitUserMessage } from "./preamble.ts";
 import { decodeCanonicalUtf8 } from "./render-mode.ts";
 import type { CodexSession } from "./types.ts";
+import {
+  assertGoalSourceBinding,
+  readCodexGoalSnapshot,
+  type CanonicalGoalSnapshot,
+} from "./goal.ts";
 
 type ObjectRecord = Record<string, unknown>;
 
@@ -386,7 +391,18 @@ export function codexRecordToIr(envelope: RawEnvelope): BridgeEvent[] {
 }
 
 /** Build the provider-neutral canonical sidecar for a Codex source rollout. */
-export function codexRolloutToBridgeBundle(session: CodexSession): BridgeBundle {
+export function codexRolloutToBridgeBundle(
+  session: CodexSession,
+  goalState: CanonicalGoalSnapshot | null = null,
+): BridgeBundle {
+  const sourceThreadId = session.desktopThreadId ?? session.sessionId;
+  if (goalState != null) {
+    assertGoalSourceBinding(goalState, {
+      provider: "codex",
+      authority: "native-store",
+      sourceThreadId,
+    });
+  }
   const bytes = fs.readFileSync(session.rolloutPath);
   let contents: string;
   try {
@@ -409,13 +425,25 @@ export function codexRolloutToBridgeBundle(session: CodexSession): BridgeBundle 
       version: BRIDGE_IR_VERSION,
       id: session.sessionId || deterministicId("codex-conversation-v1", session.rolloutPath),
       source: "codex-rollout",
+      sourceProvider: "codex",
       sourcePath: session.rolloutPath,
       sourceContentSha256,
       sourceSessionId: session.sessionId || null,
+      sourceThreadId,
       cwd: session.cwdOriginal || session.cwd || null,
       title: session.codexName || session.title || null,
+      ...(goalState == null ? {} : { goalState }),
       recordEnvelopeIds: envelopes.map((envelope) => envelope.id),
       events: envelopes.flatMap(codexRecordToIr),
     },
   };
+}
+
+/** Join a rollout snapshot to Codex's read-only authoritative Goal store. */
+export function codexRolloutWithGoalToBridgeBundle(
+  session: CodexSession,
+  codexHome: string,
+): BridgeBundle {
+  const sourceThreadId = session.desktopThreadId ?? session.sessionId;
+  return codexRolloutToBridgeBundle(session, readCodexGoalSnapshot(codexHome, sourceThreadId));
 }

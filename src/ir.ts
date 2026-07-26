@@ -1,4 +1,5 @@
 import type { RawEnvelope } from "./envelope.ts";
+import type { CanonicalGoalSnapshot } from "./goal.ts";
 
 export const BRIDGE_IR_VERSION = 2 as const;
 
@@ -137,11 +138,17 @@ export interface BridgeConversation {
   id: string;
   /** Open provider/format identifier; provider-specific parsing lives in adapters. */
   source: string;
+  /** Provider identity when `source` names a provider-specific file format. */
+  sourceProvider?: string;
   sourcePath: string;
   sourceContentSha256: string;
   sourceSessionId: string | null;
+  /** Provider-native thread identity used to bind live control state. */
+  sourceThreadId?: string | null;
   cwd: string | null;
   title: string | null;
+  /** Authoritative current source Goal, separate from historical Goal events. */
+  goalState?: CanonicalGoalSnapshot;
   recordEnvelopeIds: string[];
   events: BridgeEvent[];
 }
