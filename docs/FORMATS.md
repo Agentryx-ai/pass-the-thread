@@ -10,14 +10,14 @@ What this tool reads and writes. These are **undocumented, internal** formats of
 { "timestamp": "2026-07-24T05:38:12.123Z", "type": "<item-type>", "payload": { … } }
 ```
 
-| `type` | Meaning | Used |
-| --- | --- | --- |
-| `session_meta` | first line: `id`, `cwd`, `cli_version`, `source`, `git`, `parent_thread_id`, … | yes |
-| `response_item` | model output and tool traffic | yes — the conversation is rebuilt from these |
-| `turn_context` | per-turn settings snapshot (model, cwd, approval policy) | model only |
-| `event_msg` | UI/protocol events (`agent_message`, `token_count`, …) | no (duplicates response items) |
-| `compacted` | context-compaction summary | no |
-| `world_state`, `inter_agent_communication_metadata` | agent internals | no |
+| `type` | Meaning | Byte-exact IR / sidecar | Semantic target rendering |
+| --- | --- | --- | --- |
+| `session_meta` | first line: `id`, `cwd`, `cli_version`, `source`, `git`, `parent_thread_id`, … | yes | selected conversation metadata, not chat |
+| `response_item` | model output and tool traffic | yes | supported messages, reasoning/media policy, and valid tool traffic |
+| `turn_context` | per-turn settings snapshot (model, cwd, approval policy) | yes | selected metadata only; the full record stays sidecar-only |
+| `event_msg` | UI/protocol events (`agent_message`, `token_count`, task/Goal updates, …) | yes | only explicitly typed projections such as inert task history or Goal state; generic protocol events stay sidecar-only |
+| `compacted` | context-compaction summary | yes | the latest portable summary may rebuild compact context; earlier or invalid boundaries stay sidecar-only |
+| `world_state`, `inter_agent_communication_metadata` | agent internals | yes | no live semantics; sidecar-only |
 
 `response_item` payload variants:
 
@@ -54,6 +54,48 @@ The name Codex shows is not the first thing the user typed. Codex generates a sh
 Renaming appends another line, so the newest `updated_at` wins. On the machine this was reconstructed from, 38 of 38 app-created threads had an entry and none of the 13 CLI/exec threads did.
 
 `threads.name` / `threads.title` is a weaker second source, used when there is no index file. `title` is seeded with `first_user_message` and replaced when Codex names the thread, so a `title` that differs from `first_user_message` is a generated name — but the DB lags renames (8 of 38 still carried the first message).
+
+## Target — Codex Desktop 26.721.41059
+
+Claude → Codex writes a new rollout under `sessions/YYYY/MM/DD` or
+`archived_sessions`, then registers that exact path in the `threads` table of
+the pinned `state_<n>.sqlite`. Equivalent existing project paths are resolved
+to one canonical filesystem identity before the rollout and index row are
+planned. The importer never writes `goals_1.sqlite`; eligible live Goals are
+activated only through the separately fingerprinted app-server Goal RPC after
+thread registration.
+
+Semantic mode emits human/model text and native tool traffic only for a
+contiguous parallel call batch from one assistant record/envelope followed by
+the exact result set in one distinct, direct-child user record/envelope. Native
+record lineage is mandatory; missing or ambiguous `uuid`/`parentUuid` fails
+closed to inert history. Task notifications,
+historical/superseded Goals, access snapshots, and other source controls are
+rendered as explicitly inert assistant history, never copied as raw user
+commands. Verbatim mode preserves the exact Claude JSONL as one inert context
+item. Both modes retain every original byte in the immutable bridge sidecar.
+
+Claude Desktop writes an auto-compact boundary followed by an
+`isCompactSummary` record. The adapter turns that summary into a nonempty Codex
+`compacted.payload.replacement_history` and appends post-boundary items once.
+In semantic mode, planning fails if no summary is recoverable. Verbatim mode
+keeps the original compact records as inert archival context and does not claim
+native resume semantics. Both modes fail when the conservative active-context
+estimate is above the pinned safe limit.
+
+Private writes are enabled only when separate rollout, thread-index, archive
+(when selected), project-identity, and Goal (when selected) bindings resolve to
+the exact audited 26.721.41059 artifacts. Unknown records and newer versions
+remain readable/plannable, but do not acquire write capability. Researching an
+unknown/new installed build requires a user-supplied provenance manifest that
+binds the live installed artifacts; it does not grant write capability until a
+new audited profile is implemented and registered.
+
+Apply takes a second full hash of the active Appx identity after Goal/journal
+and sidecar setup, immediately before the first Codex target mutation. That
+probe is the exact batch-start support snapshot. An application update during
+the subsequent multi-session batch is outside the importer's atomicity model;
+the importer does not re-hash per session.
 
 ## Target — Claude Desktop
 

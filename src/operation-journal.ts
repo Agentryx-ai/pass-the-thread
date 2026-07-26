@@ -325,6 +325,34 @@ export function recoverCreatedFiles(root: string, operationId: string): Operatio
   return journal;
 }
 
+/** Read-only readiness check for an exact target that already exists. */
+export function assertAlreadyAppliedOperationJournal(
+  root: string,
+  input: OperationJournalInput,
+): OperationJournal | null {
+  if (fs.existsSync(input.targetStagePath)) {
+    throw new Error(`already-applied operation has an orphaned target stage: ${input.targetStagePath}`);
+  }
+  const target = journalPath(root, input.operationId);
+  if (!fs.existsSync(target)) {
+    if (input.goalActivation != null) {
+      throw new Error("already-applied Goal target has no importer operation journal");
+    }
+    return null;
+  }
+  const current = loadOperationJournal(root, input.operationId);
+  assertSameOperation(current, input);
+  if (input.goalActivation != null && current.state !== "goal-verified" && current.state !== "committed") {
+    throw new Error(`already-applied Goal target is not verified in journal state ${current.state}`);
+  }
+  if (input.goalActivation == null && !new Set<OperationState>([
+    "prepared", "rollout-written", "thread-registered", "committed",
+  ]).has(current.state)) {
+    throw new Error(`already-applied target has contradictory journal state ${current.state}`);
+  }
+  return current;
+}
+
 /**
  * Reconcile the crash window after Goal set was requested. `thread/goal/clear`
  * is intentionally not used: its audited 41059 contract has only `threadId`

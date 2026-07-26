@@ -27,6 +27,15 @@ export function assertThreadSchema41059(db: DatabaseSync): void {
   if (missing.length) throw new Error(`unsupported Codex threads schema; missing ${missing.join(", ")}`);
 }
 
+export function assertThreadSchemaFile41059(dbPath: string): void {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    assertThreadSchema41059(db);
+  } finally {
+    db.close();
+  }
+}
+
 export function threadExists(dbPath: string, id: string): boolean {
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {

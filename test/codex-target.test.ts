@@ -4,7 +4,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { SUPPORTED_CODEX_TARGET, assertSupportedCodexTarget } from "../src/version-gate.ts";
+import {
+  SUPPORTED_CODEX_TARGET,
+  assertCodexPrivateWriteCapabilities,
+  assertSupportedCodexTarget,
+  probeCodexPrivateWriteProfile,
+} from "../src/version-gate.ts";
 import { buildCodexRollout41059 } from "../src/compat/codex/v26_721_41059.ts";
 import {
   acquireCodexTargetLock,
@@ -38,6 +43,21 @@ function sampleConversation() {
 test("version gate accepts only the audited 41059 artifacts", () => {
   assert.doesNotThrow(() => assertSupportedCodexTarget(EVIDENCE));
   assert.throws(() => assertSupportedCodexTarget({ ...EVIDENCE, internalVersion: "26.721.3996" }), /version gate failed/);
+});
+
+test("unknown Codex artifacts remain probeable but cannot acquire private-write capabilities", () => {
+  const unknown = { ...EVIDENCE, internalVersion: "26.999.1" };
+  const profile = probeCodexPrivateWriteProfile(unknown);
+  assert.equal(profile.structurallyVerified, false);
+  assert.equal(profile.capabilities.rollout, null);
+  assert.match(profile.artifactFingerprint, /^[0-9a-f]{64}$/);
+  assert.throws(
+    () => assertCodexPrivateWriteCapabilities(unknown, ["rollout", "threadIndex"]),
+    /private-write|version gate/,
+  );
+  const exact = assertCodexPrivateWriteCapabilities(EVIDENCE, ["rollout", "threadIndex", "projectIdentity"]);
+  assert.equal(exact.structurallyVerified, true);
+  assert.equal(exact.capabilities.threadIndex?.id, "codex.thread-index-sqlite/v26.721.41059");
 });
 
 test("rollout writes compact replacement history and historical task as non-live text", () => {
@@ -143,7 +163,7 @@ test("target planning refuses a source whose active compacted context cannot res
   const convo = {
     cwd: "C:\\repo", title: "too large", createdAt: "2026-07-26T00:00:00.000Z",
     messages: [{ role: "user" as const, text: "summary" }],
-    compaction: { activeMessageIndex: 0, postTokens: 670_194 },
+    compaction: { activeMessageIndex: 0, postTokens: 670_194, summary: "resumable summary" },
   };
   assert.ok(estimatedActiveTokens(convo) > 670_194);
   assert.throws(
@@ -173,6 +193,17 @@ test("a compact boundary before the first item is still serialized", () => {
     compaction: { activeItemIndex: 0, postTokens: 10, summary: "summary" },
   });
   assert.equal(lines[1].type, "compacted");
+});
+
+test("a compact boundary without replacement history fails closed before target planning", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-compact-missing-"));
+  assert.throws(() => planCodexTarget(
+    home,
+    path.join(home, "state_5.sqlite"),
+    "missing-summary",
+    "e".repeat(64),
+    { ...sampleConversation(), compaction: { activeItemIndex: 0, postTokens: 100 } },
+  ), /no replacement summary/);
 });
 
 test("operation journal can recover uncommitted files but not committed operations", () => {

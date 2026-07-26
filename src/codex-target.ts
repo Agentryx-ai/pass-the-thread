@@ -3,8 +3,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import type { CodexTargetEvidence } from "./version-gate.ts";
-import { assertSupportedCodexTarget } from "./version-gate.ts";
+import type { CodexPrivateWriteCapability, CodexTargetEvidence } from "./version-gate.ts";
+import { assertCodexPrivateWriteCapabilities } from "./version-gate.ts";
 import {
   buildCodexRollout41059,
   serializeCodexRollout41059,
@@ -47,6 +47,7 @@ export interface CodexTargetPlan {
   rolloutSha256: string;
   conversation: LogicalCodexConversation;
   goalActivation: CodexGoalActivationPlan | null;
+  requiredCapabilities: CodexPrivateWriteCapability[];
 }
 
 export interface ApplyCodexTargetOptions {
@@ -182,10 +183,13 @@ export function estimatedActiveTokens(conversation: Omit<LogicalCodexConversatio
   // least one UTF-8 byte, so byte length is a deliberately conservative upper
   // bound for CJK, emoji, ASCII, and high-entropy content.
   const appendedEstimate = Buffer.byteLength(JSON.stringify(active), "utf8");
+  const replacementEstimate = conversation.compaction?.summary == null
+    ? 0
+    : Buffer.byteLength(conversation.compaction.summary, "utf8");
   if (typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 0) {
     return explicit + appendedEstimate;
   }
-  return appendedEstimate;
+  return replacementEstimate + appendedEstimate;
 }
 
 export function deterministicThreadId(sourceId: string, sourceSha256: string): string {
@@ -203,6 +207,10 @@ export function planCodexTarget(
   goal: CanonicalGoalSnapshot | null = null,
   goalMode: GoalMigrationMode = "migrate",
 ): CodexTargetPlan {
+  if (conversation.compaction != null &&
+    (conversation.compaction.summary == null || conversation.compaction.summary.trim() === "")) {
+    throw new Error("compacted Claude history has no replacement summary and cannot be resumed safely");
+  }
   const activeTokens = estimatedActiveTokens(conversation);
   if (activeTokens > CODEX_41059_SAFE_ACTIVE_TOKENS) {
     throw new Error(
@@ -232,6 +240,12 @@ export function planCodexTarget(
     rolloutSha256: hashText(serializedRollout),
     conversation: fullConversation,
     goalActivation,
+    requiredCapabilities: [
+      "rollout",
+      "threadIndex",
+      "projectIdentity",
+      ...(archived ? ["archive" as const] : []),
+    ],
   };
 }
 
@@ -239,7 +253,7 @@ export function applyCodexTarget(plan: CodexTargetPlan, options: ApplyCodexTarge
   if (!options.allowWrite) throw new Error("Codex target apply is disabled; create and inspect a plan first");
   assertTargetLock(options.lock, plan.codexHome);
   (options.desktopGuard ?? assertCodexDesktopClosed)();
-  assertSupportedCodexTarget(options.evidence);
+  assertCodexPrivateWriteCapabilities(options.evidence, plan.requiredCapabilities);
   if (plan.goalActivation != null &&
     (plan.goalActivation.capabilityId !== CODEX_GOAL_TARGET_CAPABILITY_ID ||
       plan.goalActivation.profileFingerprint !== CODEX_GOAL_TARGET_FINGERPRINT)) {

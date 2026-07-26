@@ -32,17 +32,30 @@ import {
   releaseCodexTargetLock,
   type CodexTargetLock,
   type CodexTargetPlan,
+  type CodexTargetPlanState,
 } from "./codex-target.ts";
+import { assertThreadSchemaFile41059 } from "./codex-target-db.ts";
 import {
+  assertAlreadyAppliedOperationJournal,
   assertOperationJournalReady,
   commitOperationJournalIfPresent,
   loadOperationJournal,
   recoverCreatedFiles,
   reconcileGoalActivation,
+  type OperationJournal,
 } from "./operation-journal.ts";
 import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/v26_721_41059.ts";
-import { assertSupportedCodexTarget, loadInstalledCodexTargetEvidence } from "./version-gate.ts";
-import type { CodexTargetEvidence } from "./version-gate.ts";
+import {
+  assertCodexPrivateWriteCapabilities,
+  assertSupportedCodexTarget,
+  loadInstalledCodexTargetEvidence,
+  probeCodexPrivateWriteProfile,
+} from "./version-gate.ts";
+import type {
+  CodexPrivateWriteCapability,
+  CodexPrivateWriteProfile,
+  CodexTargetEvidence,
+} from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
 import { transcriptPathFor } from "./claude-target.ts";
 import {
@@ -94,6 +107,7 @@ export interface MatrixTargetSessionPlan {
   archived: boolean;
   activeTokenUpperBound: number;
   goalActivation: CodexGoalActivationPlan | null;
+  requiredCapabilities: CodexPrivateWriteCapability[];
 }
 
 function releaseTargetLockAfter(
@@ -130,6 +144,7 @@ export interface MatrixTargetBinding {
   dbPath: string;
   bridgeRoot: string;
   evidence: CodexTargetEvidence;
+  privateWriteProfile: CodexPrivateWriteProfile;
   goalCapabilityId: typeof CODEX_GOAL_TARGET_CAPABILITY_ID;
   goalCapabilityFingerprint: string;
   sessions: MatrixTargetSessionPlan[];
@@ -185,7 +200,7 @@ export interface MatrixForwardPlanFile {
 export type MatrixPlanFile = MatrixReversePlanFile | MatrixForwardPlanFile;
 export type MatrixDirection = MatrixPlanFile["direction"];
 
-interface LoadedSource {
+export interface LoadedSource {
   desktop: ClaudeDesktopSourceSession;
   bundle: BridgeBundle | null;
   summary: ImportPlanSessionSummary;
@@ -562,28 +577,55 @@ export function forwardLossObservations(
 }
 
 export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
-  const callIndexes = new Map<string, number[]>();
-  const resultIndexes = new Map<string, number[]>();
-  for (const [index, event] of events.entries()) {
+  const callCounts = new Map<string, number>();
+  const resultCounts = new Map<string, number>();
+  for (const event of events) {
     if (event.kind === "tool_use" && event.toolUseId) {
-      const indexes = callIndexes.get(event.toolUseId) ?? [];
-      indexes.push(index);
-      callIndexes.set(event.toolUseId, indexes);
+      callCounts.set(event.toolUseId, (callCounts.get(event.toolUseId) ?? 0) + 1);
     } else if (event.kind === "tool_result" && event.toolUseId) {
-      const indexes = resultIndexes.get(event.toolUseId) ?? [];
-      indexes.push(index);
-      resultIndexes.set(event.toolUseId, indexes);
+      resultCounts.set(event.toolUseId, (resultCounts.get(event.toolUseId) ?? 0) + 1);
     }
   }
   const valid = new Set<string>();
-  for (const [index, event] of events.entries()) {
-    if (event.kind !== "tool_use" || !event.toolUseId || !event.name) continue;
-    const plainInput = event.input != null && typeof event.input === "object" && !Array.isArray(event.input);
-    const calls = callIndexes.get(event.toolUseId) ?? [];
-    const results = resultIndexes.get(event.toolUseId) ?? [];
-    if (plainInput && calls.length === 1 && results.length <= 1 && (results.length === 0 || results[0]! > index)) {
-      valid.add(event.toolUseId);
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index]?.kind !== "tool_use") continue;
+    const calls: Extract<BridgeEvent, { kind: "tool_use" }>[] = [];
+    let cursor = index;
+    while (events[cursor]?.kind === "tool_use") {
+      calls.push(events[cursor] as Extract<BridgeEvent, { kind: "tool_use" }>);
+      cursor += 1;
     }
+    const results: Extract<BridgeEvent, { kind: "tool_result" }>[] = [];
+    while (events[cursor]?.kind === "tool_result") {
+      results.push(events[cursor] as Extract<BridgeEvent, { kind: "tool_result" }>);
+      cursor += 1;
+    }
+    const callIds = calls.map((call) => call.toolUseId);
+    const resultIds = results.map((result) => result.toolUseId);
+    const callEnvelopeId = calls[0]?.sourceEnvelopeId;
+    const resultEnvelopeId = results[0]?.sourceEnvelopeId;
+    const callRecordUuid = calls[0]?.sourceRecordUuid;
+    const resultRecordUuid = results[0]?.sourceRecordUuid;
+    const validCalls = calls.length > 0 && calls.every((call) =>
+      call.role === "assistant" && call.toolUseId != null && call.toolUseId.trim() !== "" &&
+      call.sourceEnvelopeId === callEnvelopeId && call.sourceRecordUuid === callRecordUuid &&
+      callRecordUuid != null && callRecordUuid.trim() !== "" &&
+      call.name != null && call.name.trim() !== "" &&
+      call.input != null && typeof call.input === "object" && !Array.isArray(call.input) &&
+      callCounts.get(call.toolUseId) === 1);
+    const validResults = results.length === calls.length && results.every((result) =>
+      result.role === "user" && result.toolUseId != null && result.toolUseId.trim() !== "" &&
+      result.sourceEnvelopeId === resultEnvelopeId && result.sourceRecordUuid === resultRecordUuid &&
+      resultRecordUuid != null && resultRecordUuid.trim() !== "" &&
+      result.sourceParentUuid === callRecordUuid &&
+      resultCounts.get(result.toolUseId) === 1);
+    if (validCalls && validResults &&
+      callEnvelopeId !== resultEnvelopeId && callRecordUuid !== resultRecordUuid &&
+      new Set(callIds).size === calls.length && new Set(resultIds).size === results.length &&
+      callIds.every((callId) => resultIds.includes(callId))) {
+      for (const callId of callIds) valid.add(callId!);
+    }
+    index = Math.max(index, cursor - 1);
   }
   return valid;
 }
@@ -705,7 +747,7 @@ function exactSourceText(source: LoadedSource): string {
   return source.bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join("");
 }
 
-function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<LogicalCodexConversation, "threadId"> {
+export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<LogicalCodexConversation, "threadId"> {
   if (!source.bundle) throw new Error(`source transcript is missing for ${source.desktop.sessionId}`);
   if (renderMode === "verbatim") {
     const createdAtMs = source.desktop.createdAtMs;
@@ -714,7 +756,7 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
       : new Date(0).toISOString();
     const literal = `${inertHistoricalNotice("Claude JSONL")}\n\n${exactSourceText(source)}`;
     const logical = {
-      cwd: source.desktop.cwd || os.homedir(),
+      cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
       title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
       createdAt,
       messages: [],
@@ -798,13 +840,30 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
       });
     } else if (event.kind === "compact_boundary") {
       if (event.activeContextStartsAfter) {
-        compaction = { activeItemIndex: items.length, ...compactNumbers(event.compactMetadata) };
+        const summary = compactSummary(event.compactMetadata) ?? pendingSummary;
+        compaction = {
+          activeItemIndex: items.length,
+          ...compactNumbers(event.compactMetadata),
+          ...(summary == null ? {} : { summary }),
+        };
+        pendingSummary = undefined;
       } else {
-        pendingSummary = compactSummary(event.compactMetadata) ?? pendingSummary;
+        const summary = compactSummary(event.compactMetadata);
+        if (summary != null && compaction != null && compaction.summary == null) {
+          // Claude Desktop 2.1.x writes the visible compact summary directly
+          // after the system compact_boundary record.
+          compaction.summary = summary;
+        } else {
+          pendingSummary = summary ?? pendingSummary;
+        }
       }
     }
   }
-  if (compaction && pendingSummary) compaction.summary = pendingSummary;
+  if (compaction != null && (compaction.summary == null || compaction.summary.trim() === "")) {
+    throw new Error(
+      `Claude compact boundary has no recoverable replacement summary: ${source.desktop.sessionId}`,
+    );
+  }
   let earliest = Number.POSITIVE_INFINITY;
   for (const event of events) {
     if (!event.timestamp) continue;
@@ -813,7 +872,7 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
   }
   const createdAt = new Date(source.desktop.createdAtMs ?? earliest);
   const logical = {
-    cwd: source.desktop.cwd || os.homedir(),
+    cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
     title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation",
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date(0).toISOString() : createdAt.toISOString(),
     messages,
@@ -1047,6 +1106,7 @@ function targetSummary(sourceSessionId: string, plan: CodexTargetPlan): MatrixTa
     archived: plan.archived,
     activeTokenUpperBound: estimatedActiveTokens(plan.conversation),
     goalActivation: plan.goalActivation,
+    requiredCapabilities: plan.requiredCapabilities,
   };
 }
 
@@ -1062,6 +1122,155 @@ function summariesForRenderMode(sources: LoadedSource[], renderMode: RenderMode)
       }],
     };
   });
+}
+
+export interface ReverseStaticPreflight {
+  states: Array<CodexTargetPlanState | null>;
+  blockers: string[];
+}
+
+/** Run every read-only private-target gate used by dry-run and real apply. */
+export function inspectReverseStaticPreflight(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+): ReverseStaticPreflight {
+  const blockers: string[] = [];
+  try {
+    assertThreadSchemaFile41059(dbPath);
+  } catch (error) {
+    blockers.push(`threads schema: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const states = targetPlans.map((targetPlan): CodexTargetPlanState | null => {
+    let state: CodexTargetPlanState;
+    try {
+      state = inspectCodexTargetPlan(targetPlan);
+    } catch (error) {
+      blockers.push(`${targetPlan.threadId}: target inspection failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+    try {
+      const journalInput = operationJournalInputForPlan(targetPlan);
+      if (state === "collision") {
+        throw new Error("target collision");
+      }
+      if (state === "absent") assertOperationJournalReady(bridgeRoot, journalInput);
+      else assertAlreadyAppliedOperationJournal(bridgeRoot, journalInput);
+    } catch (error) {
+      blockers.push(`${targetPlan.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return state;
+  });
+  return { states, blockers };
+}
+
+export function assertReverseStaticPreflight(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+): CodexTargetPlanState[] {
+  const preflight = inspectReverseStaticPreflight(targetPlans, bridgeRoot, dbPath);
+  if (preflight.blockers.length > 0) {
+    throw new Error(`Codex static preflight failed: ${preflight.blockers.join("; ")}`);
+  }
+  return preflight.states.map((state) => {
+    if (state == null) throw new Error("Codex static preflight returned no target state");
+    return state;
+  });
+}
+
+/** Preserve the required no-mutation ordering at the start of reverse apply. */
+export function beginReverseApply(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+  outputTarget: string | undefined,
+  codexHome: string,
+): CodexTargetLock {
+  assertReverseStaticPreflight(targetPlans, bridgeRoot, dbPath);
+  assertJsonOutputWritable(outputTarget);
+  return acquireCodexTargetLock(codexHome);
+}
+
+export function assertCodexTargetSnapshot(
+  expectedEvidence: CodexTargetEvidence,
+  expectedProfile: CodexPrivateWriteProfile,
+  targetPlans: readonly CodexTargetPlan[],
+  actualEvidence: CodexTargetEvidence,
+  phase: string,
+): void {
+  const actualProfile = probeCodexPrivateWriteProfile(actualEvidence);
+  if (canonicalStringify(actualEvidence) !== canonicalStringify(expectedEvidence) ||
+    canonicalStringify(actualProfile) !== canonicalStringify(expectedProfile)) {
+    throw new Error(`Codex artifacts or private-write capability profile changed ${phase}`);
+  }
+  for (const targetPlan of targetPlans) {
+    assertCodexPrivateWriteCapabilities(actualEvidence, targetPlan.requiredCapabilities);
+  }
+}
+
+export interface CodexRecoveryDependencies {
+  desktopGuard: () => void;
+  evidenceLoader: (manifestPath: string) => CodexTargetEvidence;
+  recoverFiles: typeof recoverCreatedFiles;
+  reconcileGoal: typeof reconcileGoalActivation;
+  goalRpcFactory: typeof createCodexGoalRpc;
+}
+
+const CODEX_RECOVERY_DEPENDENCIES: CodexRecoveryDependencies = {
+  desktopGuard: assertCodexDesktopClosed,
+  evidenceLoader: loadInstalledCodexTargetEvidence,
+  recoverFiles: recoverCreatedFiles,
+  reconcileGoal: reconcileGoalActivation,
+  goalRpcFactory: createCodexGoalRpc,
+};
+
+/** Execute the under-lock recovery decision after re-hashing the installed Appx. */
+export function recoverCodexOperation(
+  journal: OperationJournal,
+  bridgeRoot: string,
+  operationId: string,
+  codexHome: string,
+  evidencePath: string,
+  preLockEvidence: CodexTargetEvidence,
+  dependencies: CodexRecoveryDependencies = CODEX_RECOVERY_DEPENDENCIES,
+): OperationJournal {
+  dependencies.desktopGuard();
+  const postLockEvidence = dependencies.evidenceLoader(evidencePath);
+  const preLockProfile = probeCodexPrivateWriteProfile(preLockEvidence);
+  const postLockProfile = probeCodexPrivateWriteProfile(postLockEvidence);
+  if (canonicalStringify(postLockEvidence) !== canonicalStringify(preLockEvidence) ||
+    canonicalStringify(postLockProfile) !== canonicalStringify(preLockProfile)) {
+    throw new Error("Codex artifacts or private-write capability profile changed under the recovery lock");
+  }
+  assertSupportedCodexTarget(postLockEvidence);
+
+  const nativeGoalMayExist = journal.goalActivation != null && new Set([
+    "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+  ]).has(journal.state);
+  if (!nativeGoalMayExist) return dependencies.recoverFiles(bridgeRoot, operationId);
+
+  const rpc = dependencies.goalRpcFactory(postLockEvidence, codexHome);
+  let rpcError: unknown;
+  try {
+    rpc.probe();
+    return dependencies.reconcileGoal(
+      bridgeRoot,
+      operationId,
+      rpc.get(journal.targetThreadId, codexGoalSetBinding(operationId, journal.goalActivation!)),
+    );
+  } catch (error) {
+    rpcError = error;
+    throw error;
+  } finally {
+    try { rpc.dispose(); }
+    catch (cleanupError) {
+      if (rpcError != null) {
+        throw new AggregateError([rpcError, cleanupError], "Codex Goal recovery and RPC cleanup failed");
+      }
+      throw cleanupError;
+    }
+  }
 }
 
 function summariesForPlan(
@@ -1081,6 +1290,7 @@ function buildMatrixPlan(
 ): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
   const summaries = summariesForPlan(sources, renderMode, goalMode);
   const built = buildImportPlan(summaries, { selection });
+  const privateWriteProfile = probeCodexPrivateWriteProfile(evidence);
   const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
   const targetPlans = built.plan.sessions.map((selected) => {
     const source = byId.get(selected.sessionId);
@@ -1102,6 +1312,7 @@ function buildMatrixPlan(
       dbPath: canonicalExistingPath(dbPath),
       bridgeRoot: canonicalExistingPath(bridgeRoot),
       evidence,
+      privateWriteProfile,
       goalCapabilityId: CODEX_GOAL_TARGET_CAPABILITY_ID,
       goalCapabilityFingerprint: CODEX_GOAL_TARGET_FINGERPRINT,
       sessions: targetPlans.map((target, index) => targetSummary(built.plan.sessions[index].sessionId, target)),
@@ -1322,35 +1533,9 @@ export function main(argv = process.argv.slice(2)): void {
     let operationFailed = false;
     let operationError: unknown;
     try {
-      assertCodexDesktopClosed();
-      let recovered;
-      const nativeGoalMayExist = journal.goalActivation != null && new Set([
-        "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
-      ]).has(journal.state);
-      if (!nativeGoalMayExist) recovered = recoverCreatedFiles(bridgeRoot, operationId);
-      else {
-        const rpc = createCodexGoalRpc(evidence, codexHome);
-        let rpcError: unknown;
-        try {
-          rpc.probe();
-          recovered = reconcileGoalActivation(
-            bridgeRoot,
-            operationId,
-            rpc.get(journal.targetThreadId, codexGoalSetBinding(operationId, journal.goalActivation!)),
-          );
-        } catch (error) {
-          rpcError = error;
-          throw error;
-        } finally {
-          try { rpc.dispose(); }
-          catch (cleanupError) {
-            if (rpcError != null) {
-              throw new AggregateError([rpcError, cleanupError], "Codex Goal recovery and RPC cleanup failed");
-            }
-            throw cleanupError;
-          }
-        }
-      }
+      const recovered = recoverCodexOperation(
+        journal, bridgeRoot, operationId, codexHome, evidencePath, evidence,
+      );
       writeJson(option(argv, "--out"), recovered);
     } catch (error) {
       operationFailed = true;
@@ -1460,7 +1645,8 @@ export function main(argv = process.argv.slice(2)): void {
   const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixPlanFile;
   if (stored.schema !== "agentryx.import-plan/v3" || stored.direction !== "claude-to-codex" ||
     !["semantic", "verbatim"].includes(stored.renderMode) ||
-    !["migrate", "skip"].includes(stored.goalMode)) {
+    !["migrate", "skip"].includes(stored.goalMode) ||
+    stored.target.privateWriteProfile?.schema !== "pass-the-thread/codex-private-write-profile-v1") {
     throw new Error("unsupported import plan");
   }
   const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
@@ -1495,43 +1681,72 @@ export function main(argv = process.argv.slice(2)): void {
   if (rebuilt.file.digest !== stored.digest) {
     throw new Error("source inventory, render mode, Goal state/policy, or target binding changed after the plan was created");
   }
+  if (flag(argv, "--dry-run")) {
+    if (option(argv, "--out")) {
+      throw new Error("Codex-target --dry-run refuses --out because dry-run is zero-mutation");
+    }
+    const staticPreflight = inspectReverseStaticPreflight(rebuilt.targetPlans, bridgeRoot, dbPath);
+    const blockers = [...staticPreflight.blockers];
+    if (!rebuilt.file.target.privateWriteProfile.structurallyVerified) {
+      blockers.push("installed Codex artifacts do not match a registered private-write profile");
+    }
+    try {
+      assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
+    } catch (error) {
+      blockers.push(error instanceof Error ? error.message : String(error));
+    }
+    const requiresGoalProbe = rebuilt.targetPlans.some((plan) => plan.goalActivation != null);
+    process.stdout.write(`${JSON.stringify({
+      direction: stored.direction,
+      dryRun: true,
+      digest: stored.digest,
+      writeReadiness: blockers.length > 0
+        ? "blocked"
+        : requiresGoalProbe
+          ? "static-preflight-passed-goal-rpc-probe-required"
+          : "static-preflight-passed-runtime-gates-pending",
+      blockers,
+      unprovenGates: [
+        "Codex Desktop closed-state and post-lock installed-artifact re-probe",
+        ...(requiresGoalProbe
+          ? ["Codex app-server Goal RPC probe, collision check, and native Goal readback"]
+          : []),
+      ],
+      sessions: stored.plan.sessions.map((session, index) => ({
+        sessionId: session.sessionId,
+        state: staticPreflight.states[index],
+        requiredCapabilities: rebuilt.targetPlans[index].requiredCapabilities,
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
   assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
   const byId = new Map(loaded.sources.map((source) => [source.desktop.sessionId, source]));
   const operations: Array<{ sessionId: string; operationId: string; threadId: string; status: "applied" | "already-applied" }> = [];
-  assertJsonOutputWritable(option(argv, "--out"));
-  const lock = acquireCodexTargetLock(codexHome);
+  const lock = beginReverseApply(
+    rebuilt.targetPlans, bridgeRoot, dbPath, option(argv, "--out"), codexHome,
+  );
   let goalRpc: ReturnType<typeof createCodexGoalRpc> | null = null;
   let operationFailed = false;
   let operationError: unknown;
   try {
     assertCodexDesktopClosed();
+    const liveEvidence = loadInstalledCodexTargetEvidence(evidencePath);
+    assertCodexTargetSnapshot(
+      stored.target.evidence, stored.target.privateWriteProfile, rebuilt.targetPlans,
+      liveEvidence, "immediately before apply",
+    );
+    const states = assertReverseStaticPreflight(rebuilt.targetPlans, bridgeRoot, dbPath);
     goalRpc = rebuilt.targetPlans.some((plan) => plan.goalActivation != null)
-      ? createCodexGoalRpc(evidence, codexHome)
+      ? createCodexGoalRpc(liveEvidence, codexHome)
       : null;
     goalRpc?.probe();
-    const states = rebuilt.targetPlans.map(inspectCodexTargetPlan);
-    const collision = states.findIndex((state) => state === "collision");
-    if (collision >= 0) {
-      throw new Error(`target collision for ${stored.plan.sessions[collision].sessionId}; no sessions were written`);
-    }
     for (let index = 0; index < rebuilt.targetPlans.length; index += 1) {
       const journalInput = operationJournalInputForPlan(rebuilt.targetPlans[index]);
       if (states[index] === "already-applied") {
         if (rebuilt.targetPlans[index].goalActivation != null) {
-          let journal;
-          try {
-            journal = loadOperationJournal(bridgeRoot, journalInput.operationId);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-              throw new Error("already-applied Goal target has no importer operation journal");
-            }
-            throw error;
-          }
           if (goalRpc == null) {
-            throw new Error("already-applied Goal target has no importer operation journal");
-          }
-          if (journal.state !== "goal-verified" && journal.state !== "committed") {
-            throw new Error(`already-applied Goal target is not verified in journal state ${journal.state}`);
+            throw new Error("already-applied Goal target requires the native Goal RPC");
           }
           assertCodexGoalReadback(
             goalRpc.get(
@@ -1547,7 +1762,6 @@ export function main(argv = process.argv.slice(2)): void {
         commitOperationJournalIfPresent(bridgeRoot, journalInput);
         continue;
       }
-      assertOperationJournalReady(bridgeRoot, journalInput);
     }
     // Preserve every canonical source revision before the first target mutation.
     for (const selected of stored.plan.sessions) {
@@ -1555,6 +1769,11 @@ export function main(argv = process.argv.slice(2)): void {
       if (!source?.bundle) throw new Error(`source is unavailable: ${selected.sessionId}`);
       writeBridgeConversation(bridgeRoot, source.bundle);
     }
+    const batchEvidence = loadInstalledCodexTargetEvidence(evidencePath);
+    assertCodexTargetSnapshot(
+      stored.target.evidence, stored.target.privateWriteProfile, rebuilt.targetPlans,
+      batchEvidence, "at the Codex mutation batch boundary",
+    );
     for (let index = 0; index < rebuilt.targetPlans.length; index += 1) {
       const targetPlan = rebuilt.targetPlans[index];
       const selected = stored.plan.sessions[index];
@@ -1563,7 +1782,7 @@ export function main(argv = process.argv.slice(2)): void {
         continue;
       }
       const operation = applyCodexTarget(targetPlan, {
-        allowWrite: true, evidence, bridgeRoot, lock,
+        allowWrite: true, evidence: batchEvidence, bridgeRoot, lock,
         ...(goalRpc == null ? {} : { goalRpc }),
       });
       operations.push({ sessionId: selected.sessionId, operationId: operation.operationId, threadId: targetPlan.threadId, status: "applied" });

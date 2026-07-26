@@ -3,16 +3,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   matrixPlanDigest,
   buildForwardMatrixPlan,
+  bridgeToLogical,
+  beginReverseApply,
   assertGoalMigrationReady,
+  assertCodexTargetSnapshot,
   forwardLossObservations,
   main,
   nativeToolUseIds,
+  recoverCodexOperation,
   formatCliError,
   goalMigrationModeOption,
+  inspectReverseStaticPreflight,
   selectionFromPlan,
   selectionOptions,
   transcriptIdentityError,
@@ -28,6 +34,12 @@ import type { ClaudeSourceTranscript } from "../src/claude-source.ts";
 import { HISTORICAL_SAFETY, type BridgeEvent } from "../src/ir.ts";
 import type { CodexSession } from "../src/types.ts";
 import { targetPathFor } from "../src/claude-target.ts";
+import { probeCodexPrivateWriteProfile, SUPPORTED_CODEX_TARGET } from "../src/version-gate.ts";
+import { readClaudeJsonl } from "../src/claude-source.ts";
+import { claudeTranscriptToIr } from "../src/claude-to-ir.ts";
+import { buildCodexRollout41059 } from "../src/compat/codex/v26_721_41059.ts";
+import { operationJournalInputForPlan, planCodexTarget } from "../src/codex-target.ts";
+import { createOperationJournal } from "../src/operation-journal.ts";
 
 test("matrix CLI leaves absent repeatable selectors unconstrained", () => {
   assert.deepEqual(selectionOptions(["scan", "--archive", "all", "--limit", "1"]), {
@@ -78,6 +90,9 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
       dbPath: "C:\\.codex\\state_5.sqlite",
       bridgeRoot: "C:\\bridge",
       evidence: { internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b" },
+      privateWriteProfile: probeCodexPrivateWriteProfile({
+        internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b",
+      }),
       goalCapabilityId: "codex.goal-app-server/v1",
       goalCapabilityFingerprint: "c".repeat(64),
       sessions: [],
@@ -89,6 +104,16 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
   assert.notEqual(matrixPlanDigest({
     ...base,
     target: { ...base.target, goalCapabilityFingerprint: "d".repeat(64) },
+  }), semantic);
+  assert.notEqual(matrixPlanDigest({
+    ...base,
+    target: {
+      ...base.target,
+      privateWriteProfile: {
+        ...base.target.privateWriteProfile,
+        artifactFingerprint: "d".repeat(64),
+      },
+    },
   }), semantic);
   assert.notEqual(matrixPlanDigest({ ...base, target: { ...base.target, codexHome: "D:\\.codex" } }), semantic);
   assert.notEqual(matrixPlanDigest({
@@ -228,6 +253,9 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     target: {
       codexHome: path.join(root, "codex"), dbPath: path.join(root, "state.sqlite"), bridgeRoot,
       evidence: { internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b" }, sessions: [],
+      privateWriteProfile: probeCodexPrivateWriteProfile({
+        internalVersion: "26.721.41059", appAsarSha256: "a", codexExeSha256: "b",
+      }),
       goalCapabilityId: "codex.goal-app-server/v1" as const,
       goalCapabilityFingerprint: "c".repeat(64),
     },
@@ -489,21 +517,313 @@ test("Claude wrapper identity must agree with every transcript identity", () => 
 
 test("only ordered, structurally valid tool pairs are eligible for native rendering", () => {
   const base = {
-    id: "event", sourceEnvelopeId: "envelope", path: "$.message.content[0]",
+    id: "event", path: "$.message.content[0]",
     timestamp: null, safety: HISTORICAL_SAFETY,
   };
-  const call = (id: string, name: string | null, input: unknown): BridgeEvent => ({
-    ...base, id: `call-${id}`, kind: "tool_use", toolUseId: id, name, input,
+  const call = (
+    id: string, name: string | null, input: unknown,
+  ): Extract<BridgeEvent, { kind: "tool_use" }> => ({
+    ...base, id: `call-${id}`, sourceEnvelopeId: "assistant-envelope",
+    sourceRecordUuid: "assistant-record", sourceParentUuid: "prior-record",
+    kind: "tool_use", role: "assistant", toolUseId: id, name, input,
   });
-  const result = (id: string): BridgeEvent => ({
-    ...base, id: `result-${id}`, kind: "tool_result", toolUseId: id,
+  const result = (id: string): Extract<BridgeEvent, { kind: "tool_result" }> => ({
+    ...base, id: `result-${id}`, sourceEnvelopeId: "user-envelope",
+    sourceRecordUuid: "user-record", sourceParentUuid: "assistant-record",
+    kind: "tool_result", role: "user", toolUseId: id,
     content: "done", isError: false,
   });
 
   assert.deepEqual([...nativeToolUseIds([call("ok", "Read", {}), result("ok")])], ["ok"]);
+  assert.deepEqual(
+    [...nativeToolUseIds([
+      call("one", "Read", { file_path: "a" }),
+      call("two", "Read", { file_path: "b" }),
+      result("one"),
+      result("two"),
+    ])],
+    ["one", "two"],
+  );
   assert.equal(nativeToolUseIds([call("missing-name", null, {}), result("missing-name")]).size, 0);
   assert.equal(nativeToolUseIds([call("bad-input", "Read", "path") , result("bad-input")]).size, 0);
   assert.equal(nativeToolUseIds([result("reversed"), call("reversed", "Read", {})]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("same-envelope", "Read", {}),
+    { ...result("same-envelope"), sourceEnvelopeId: "assistant-envelope" },
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("wrong-parent", "Read", {}),
+    { ...result("wrong-parent"), sourceParentUuid: "different-assistant" },
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("missing-parent", "Read", {}),
+    { ...result("missing-parent"), sourceParentUuid: null },
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([{ ...call("wrong-call-role", "Read", {}), role: "user" }, result("wrong-call-role")]).size, 0);
+  assert.equal(nativeToolUseIds([call("wrong-result-role", "Read", {}), { ...result("wrong-result-role"), role: "assistant" }]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("duplicate", "Read", {}),
+    call("duplicate", "Read", {}),
+    result("duplicate"),
+    result("duplicate"),
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("split-one", "Read", {}),
+    { ...call("split-two", "Read", {}), sourceEnvelopeId: "second-assistant-envelope", sourceRecordUuid: "second-assistant-record" },
+    result("split-one"),
+    result("split-two"),
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("result-one", "Read", {}),
+    call("result-two", "Read", {}),
+    result("result-one"),
+    { ...result("result-two"), sourceEnvelopeId: "second-user-envelope", sourceRecordUuid: "second-user-record" },
+  ]).size, 0);
+  assert.equal(nativeToolUseIds([
+    call("interleaved", "Read", {}),
+    { ...base, id: "middle", sourceEnvelopeId: "assistant-envelope", kind: "text", role: "assistant", text: "middle", authoredByHuman: false },
+    result("interleaved"),
+  ]).size, 0);
+});
+
+test("Claude compact boundary plus following summary becomes nonempty resumable replacement history", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-reverse-compact-"));
+  const cwdVariant = path.join(root, "project", "nested", "..");
+  fs.mkdirSync(path.join(root, "project", "nested"), { recursive: true });
+  const transcriptPath = path.join(root, "compact.jsonl");
+  const sessionId = "11111111-1111-4111-8111-111111111111";
+  const records = [
+    { type: "system", subtype: "compact_boundary", sessionId, timestamp: "2026-07-26T00:00:00.000Z", compactMetadata: { trigger: "auto", preTokens: 500000, postTokens: 2000 } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:00.001Z", isCompactSummary: true, message: { role: "user", content: "authoritative compact summary" } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:01.000Z", message: { role: "user", content: "continue from here" } },
+  ];
+  fs.writeFileSync(transcriptPath, `${records.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf8");
+  const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
+  const logical = bridgeToLogical({
+    desktop: {
+      wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
+      cliSessionId: sessionId, sessionId, cwd: cwdVariant, title: "compact", isArchived: false,
+      createdAtMs: Date.parse("2026-07-26T00:00:00.000Z"), lastActivityAtMs: Date.parse("2026-07-26T00:00:01.000Z"),
+      transcriptPath, transcriptExists: true, transcriptStatus: "available",
+    },
+    bundle,
+    summary: { sessionId, cwd: cwdVariant, hasProject: true, isArchived: false, targetExists: false },
+  }, "semantic");
+  assert.equal(logical.compaction?.summary, "authoritative compact summary");
+  assert.equal(logical.cwd, fs.realpathSync.native(path.join(root, "project")));
+  const rollout = buildCodexRollout41059({ ...logical, threadId: sessionId });
+  const compacted = rollout.find((line) => line.type === "compacted");
+  assert.ok(compacted);
+  assert.equal((compacted.payload.replacement_history as unknown[]).length, 1);
+  assert.match(JSON.stringify(compacted.payload.replacement_history), /authoritative compact summary/);
+});
+
+test("Claude compact boundary without a summary fails closed instead of writing empty replacement history", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-reverse-compact-fail-"));
+  const transcriptPath = path.join(root, "compact.jsonl");
+  const sessionId = "22222222-2222-4222-8222-222222222222";
+  fs.writeFileSync(transcriptPath, [
+    JSON.stringify({ type: "system", subtype: "compact_boundary", sessionId, timestamp: "2026-07-26T00:00:00.000Z", compactMetadata: { trigger: "auto", postTokens: 1000 } }),
+    JSON.stringify({ type: "user", sessionId, timestamp: "2026-07-26T00:00:01.000Z", message: { role: "user", content: "post compact" } }),
+  ].join("\n") + "\n", "utf8");
+  const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
+  assert.throws(() => bridgeToLogical({
+    desktop: {
+      wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
+      cliSessionId: sessionId, sessionId, cwd: root, title: "compact", isArchived: false,
+      createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true,
+      transcriptStatus: "available",
+    },
+    bundle,
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+  }, "semantic"), /no recoverable replacement summary/);
+});
+
+test("verbatim reverse rendering preserves compact source as inert history without requiring a summary", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-reverse-verbatim-compact-"));
+  const transcriptPath = path.join(root, "compact.jsonl");
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  const raw = [
+    JSON.stringify({ type: "system", subtype: "compact_boundary", sessionId, timestamp: "2026-07-26T00:00:00.000Z", compactMetadata: { trigger: "auto", postTokens: 1000 } }),
+    JSON.stringify({ type: "user", sessionId, timestamp: "2026-07-26T00:00:01.000Z", message: { role: "user", content: "post compact" } }),
+  ].join("\n") + "\n";
+  fs.writeFileSync(transcriptPath, raw, "utf8");
+  const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
+  const logical = bridgeToLogical({
+    desktop: {
+      wrapperPath: path.join(root, "wrapper.json"), wrapperSessionId: sessionId,
+      cliSessionId: sessionId, sessionId, cwd: root, title: "compact", isArchived: false,
+      createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true,
+      transcriptStatus: "available",
+    },
+    bundle,
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+  }, "verbatim");
+  assert.equal(logical.compaction, undefined);
+  assert.match(JSON.stringify(logical.items), /compact_boundary/);
+  assert.match(JSON.stringify(logical.items), /post compact/);
+
+  const oversizedPath = path.join(root, "oversized.jsonl");
+  fs.writeFileSync(oversizedPath, `${JSON.stringify({
+    type: "user", sessionId, timestamp: "2026-07-26T00:00:02.000Z",
+    message: { role: "user", content: "x".repeat(240_000) },
+  })}\n`, "utf8");
+  const oversizedBundle = claudeTranscriptToIr(readClaudeJsonl(oversizedPath));
+  const oversized = bridgeToLogical({
+    desktop: {
+      wrapperPath: path.join(root, "oversized-wrapper.json"), wrapperSessionId: sessionId,
+      cliSessionId: sessionId, sessionId, cwd: root, title: "oversized", isArchived: false,
+      createdAtMs: null, lastActivityAtMs: null, transcriptPath: oversizedPath,
+      transcriptExists: true, transcriptStatus: "available",
+    },
+    bundle: oversizedBundle,
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+  }, "verbatim");
+  assert.throws(() => planCodexTarget(
+    path.join(root, "codex"),
+    path.join(root, "codex", "state_5.sqlite"),
+    "oversized",
+    oversizedBundle.conversation.sourceContentSha256,
+    oversized,
+  ), /safe limit/);
+});
+
+function createFullThreadsDb(dbPath: string): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER, updated_at INTEGER,
+      source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT,
+      approval_mode TEXT, tokens_used INTEGER, has_user_event INTEGER, archived INTEGER,
+      archived_at INTEGER, cli_version TEXT, first_user_message TEXT, memory_mode TEXT,
+      created_at_ms INTEGER, updated_at_ms INTEGER, preview TEXT, recency_at INTEGER,
+      recency_at_ms INTEGER, history_mode TEXT
+    )`);
+  } finally {
+    db.close();
+  }
+}
+
+test("reverse static preflight reports missing schema and orphan journal stages without mutation", () => {
+  const missingRoot = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-preflight-schema-"));
+  const missingHome = path.join(missingRoot, "codex");
+  fs.mkdirSync(missingHome);
+  const missingDb = path.join(missingHome, "state_5.sqlite");
+  const partial = new DatabaseSync(missingDb);
+  partial.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)");
+  partial.close();
+  const missingPlan = planCodexTarget(missingHome, missingDb, "missing", "a".repeat(64), {
+    cwd: missingRoot, title: "missing schema", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [{ role: "user", text: "hello" }],
+  });
+  const missing = inspectReverseStaticPreflight([missingPlan], path.join(missingRoot, "bridge"), missingDb);
+  assert.match(missing.blockers.join("\n"), /threads schema: unsupported Codex threads schema; missing/);
+  const missingOutput = path.join(missingRoot, "output", "nested", "result.json");
+  const missingLock = path.join(missingHome, ".agentryx-session-import-lock.sqlite");
+  assert.throws(() => beginReverseApply(
+    [missingPlan], path.join(missingRoot, "bridge"), missingDb, missingOutput, missingHome,
+  ), /Codex static preflight failed/);
+  assert.equal(fs.existsSync(path.dirname(missingOutput)), false);
+  assert.equal(fs.existsSync(missingLock), false);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-preflight-journal-"));
+  const codexHome = path.join(root, "codex");
+  const bridgeRoot = path.join(root, "bridge");
+  fs.mkdirSync(codexHome);
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  createFullThreadsDb(dbPath);
+  const plan = planCodexTarget(codexHome, dbPath, "source", "b".repeat(64), {
+    cwd: root, title: "orphan stage", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [{ role: "user", text: "hello" }],
+  });
+  fs.mkdirSync(path.dirname(plan.stagePath), { recursive: true });
+  fs.writeFileSync(plan.stagePath, "partial", "utf8");
+  const stageBefore = fs.readFileSync(plan.stagePath, "utf8");
+  const staged = inspectReverseStaticPreflight([plan], bridgeRoot, dbPath);
+  assert.match(staged.blockers.join("\n"), /orphaned target stage requires inspection/);
+  assert.equal(fs.readFileSync(plan.stagePath, "utf8"), stageBefore);
+  const stagedOutput = path.join(root, "output", "nested", "result.json");
+  const lockPath = path.join(codexHome, ".agentryx-session-import-lock.sqlite");
+  assert.throws(() => beginReverseApply(
+    [plan], bridgeRoot, dbPath, stagedOutput, codexHome,
+  ), /Codex static preflight failed/);
+  assert.equal(fs.existsSync(path.dirname(stagedOutput)), false);
+  assert.equal(fs.existsSync(lockPath), false);
+
+  fs.rmSync(plan.stagePath);
+  const journal = createOperationJournal(bridgeRoot, operationJournalInputForPlan(plan));
+  const journalPath = path.join(bridgeRoot, "operations", `${plan.operationId}.json`);
+  const journalBefore = fs.readFileSync(journalPath, "utf8");
+  const journaled = inspectReverseStaticPreflight([plan], bridgeRoot, dbPath);
+  assert.match(journaled.blockers.join("\n"), /operation journal is not retryable in state prepared/);
+  assert.equal(fs.readFileSync(journalPath, "utf8"), journalBefore);
+  assert.equal(journal.state, "prepared");
+});
+
+test("Codex batch snapshot revalidation rejects an artifact change before target mutation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-batch-evidence-"));
+  const codexHome = path.join(root, "codex");
+  fs.mkdirSync(codexHome);
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  createFullThreadsDb(dbPath);
+  const plan = planCodexTarget(codexHome, dbPath, "source", "c".repeat(64), {
+    cwd: root, title: "batch evidence", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [{ role: "user", text: "hello" }],
+  });
+  const evidence = { ...SUPPORTED_CODEX_TARGET };
+  const profile = probeCodexPrivateWriteProfile(evidence);
+  assert.doesNotThrow(() => assertCodexTargetSnapshot(
+    evidence, profile, [plan], evidence, "at the Codex mutation batch boundary",
+  ));
+  assert.throws(() => assertCodexTargetSnapshot(
+    evidence, profile, [plan], { ...evidence, codexExeSha256: "0".repeat(64) },
+    "at the Codex mutation batch boundary",
+  ), /changed at the Codex mutation batch boundary/);
+});
+
+test("Codex recover re-hashes under lock and blocks both recovery branches before mutation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-recover-evidence-"));
+  const codexHome = path.join(root, "codex");
+  const bridgeRoot = path.join(root, "bridge");
+  fs.mkdirSync(codexHome);
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  createFullThreadsDb(dbPath);
+  const plan = planCodexTarget(codexHome, dbPath, "source", "d".repeat(64), {
+    cwd: root, title: "recover evidence", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [{ role: "user", text: "hello" }],
+  });
+  const journal = createOperationJournal(bridgeRoot, operationJournalInputForPlan(plan));
+  const preLockEvidence = { ...SUPPORTED_CODEX_TARGET };
+  const driftedEvidence = { ...preLockEvidence, appAsarSha256: "0".repeat(64) };
+  let desktopChecks = 0;
+  let evidenceLoads = 0;
+  let recoveryMutations = 0;
+  let goalRpcFactories = 0;
+  let goalReconciliations = 0;
+  const dependencies = {
+    desktopGuard: () => { desktopChecks += 1; },
+    evidenceLoader: () => { evidenceLoads += 1; return driftedEvidence; },
+    recoverFiles: () => { recoveryMutations += 1; return journal; },
+    reconcileGoal: () => { goalReconciliations += 1; return journal; },
+    goalRpcFactory: () => { goalRpcFactories += 1; throw new Error("must not create Goal RPC after drift"); },
+  };
+
+  assert.throws(() => recoverCodexOperation(
+    journal, bridgeRoot, plan.operationId, codexHome, "manifest.json", preLockEvidence, dependencies,
+  ), /changed under the recovery lock/);
+  const goalJournal = {
+    ...journal,
+    state: "reconciliation-required" as const,
+    goalActivation: {} as never,
+  };
+  assert.throws(() => recoverCodexOperation(
+    goalJournal, bridgeRoot, plan.operationId, codexHome, "manifest.json", preLockEvidence, dependencies,
+  ), /changed under the recovery lock/);
+  assert.equal(desktopChecks, 2);
+  assert.equal(evidenceLoads, 2);
+  assert.equal(recoveryMutations, 0);
+  assert.equal(goalRpcFactories, 0);
+  assert.equal(goalReconciliations, 0);
 });
 
 test("CLI aggregate errors expose every preserved primary and cleanup cause", () => {

@@ -47,7 +47,7 @@ flow. `codex-to-claude` remains an executable alias for compatibility.
 ```text
 threadpass scan  [selection]
 threadpass plan  [selection] --render-mode <mode> --goal-mode <mode> --evidence <manifest.json> --out <plan.json>
-threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json>
+threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json> [--dry-run]
 threadpass recover --operation <id> --evidence <manifest.json>
 ```
 
@@ -64,8 +64,16 @@ archive option, `scan` inventories active and archived records; `plan` safely
 defaults to active. A plan's SHA-256 digest binds the selected source revisions,
 render mode, canonical Codex home and database, audited target hashes, generated
 thread IDs, rollout paths/hashes, active-context upper bounds, Goal source hash,
-Goal target thread/readback, and target capability fingerprint. `apply`
+Goal target thread/readback, and separate rollout, thread-index, archive,
+project-identity, and Goal capability fingerprints. `apply`
 rebuilds all of it and refuses if any binding changed.
+
+Unknown or newer Codex builds may still be scanned and may produce plans and
+dry-run reports. Their private-write capabilities are null, so real apply and
+recovery remain blocked. This release registers exactly one write profile:
+Electron `26.721.41059` with the pinned `app.asar` and `codex.exe` hashes. Apply
+re-hashes the live installation again after taking the importer lock and before
+the first sidecar or Codex conversation mutation.
 
 The forward plan additionally binds the typed renderer fingerprint, exact
 semantic or verbatim output hashes, target transcript, Claude account/device
@@ -76,8 +84,10 @@ in the lossless sidecar, never accidental user text. Verbatim mode puts the
 byte-exact UTF-8 source in one inert metadata record. Goal controls are appended
 through the native Claude Goal adapter; `skip` still retains inert Goal history.
 
-Forward `--dry-run` refuses `--out` and creates no directory, sidecar, journal,
-backup, transcript or wrapper. A real apply preflights every selected target,
+Either direction's `--dry-run` refuses `--out` and creates no directory, sidecar, journal,
+backup, transcript or wrapper. Reverse dry-run reports every read-only static
+blocker and explicitly names live gates, including Goal RPC probing, that it
+cannot prove without applying. A real apply preflights every selected target,
 stores canonical sources, creates immutable content-hash backups for all
 existing targets, and only then begins target mutation. Existing targets need
 both `--allow-overwrite` and the unchanged plan-time SHA-256 proof. The durable
@@ -85,9 +95,12 @@ batch journal reconciles write-before-journal crash windows by exact before/afte
 hash; `recover --operation <id>` rolls an uncommitted batch back and refuses
 committed history. Archived Codex sessions produce archived Claude wrappers.
 If no Claude workspace can be resolved, plan with `--no-register` explicitly;
-the transcript will not appear in Claude Desktop. Active context after the last
-portable compact boundary is capped at 1,000,000 serialized characters and
-fails closed instead of creating a conversation that cannot resume.
+the transcript will not appear in Claude Desktop. Semantic active context after
+the last portable compact boundary is capped at 1,000,000 serialized characters
+and fails closed instead of creating a conversation that cannot resume.
+Verbatim mode keeps compact source records as inert archival context without
+claiming native resume semantics, and still enforces its conservative
+active-size refusal.
 
 `recover` is the only supported interrupted-write cleanup path. It revalidates
 the exact installed Codex build, requires Codex Desktop to be closed, obtains
@@ -110,12 +123,12 @@ Selection options:
 | `--limit <n>` | explicit newest-first cap; omitted means no cap |
 | `--workspace-dir` | exact Claude Desktop account/device record directory |
 | `--claude-home`, `--codex-home`, `--sessions-root` | override detected roots |
-| `--out <path>` | JSON output file; omitted or `-` writes stdout; forbidden by forward `apply --dry-run` |
+| `--out <path>` | JSON output file; omitted or `-` writes stdout; forbidden by `apply --dry-run` |
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
 | `--goal-mode <mode>` | `migrate` (default) or `skip`; independent of render mode and included in the digest |
 | `--no-migrate-goal` | alias for `--goal-mode skip`; conflicting flags are rejected |
 | `--allow-overwrite` | forward apply only: authorize overwrite after exact unchanged-target proof |
-| `--dry-run` | forward apply only: rebuild and validate the confirmed plan with zero mutation |
+| `--dry-run` | rebuild and run read-only static preflights with zero mutation; reports blockers and live gates it cannot prove |
 
 Apply requirements:
 
@@ -126,9 +139,16 @@ Apply requirements:
 - unchanged Claude wrapper records and transcripts.
 
 The evidence loader independently resolves the active Appx package and hashes
-its live artifacts. Unknown or changed binaries fail closed. Apply obtains one
-exclusive lock for the target, preflights every session before the first target
-write, and treats an exact previous result as already applied. Each committed
+its live artifacts. Unknown or changed binaries fail closed. Planning research
+for another installed build requires a user-supplied provenance manifest bound
+to those live artifacts; the manifest does not itself grant write capability.
+Apply first runs the same read-only schema/journal/stage preflight before output
+directory creation or lock-database mutation, then obtains one exclusive lock
+and repeats the preflight for TOCTOU protection. After Goal/journal/sidecar
+setup it full-hashes the active Appx identity again immediately before the first
+Codex target mutation; a mismatch fails closed. This is the exact batch-start
+support snapshot. An update during the subsequent multi-session batch is
+outside atomicity, and artifacts are not re-hashed per session. Apply treats an exact previous result as already applied. Each committed
 session gets a bridge sidecar and operation journal. An unexpected runtime or
 I/O failure can still leave earlier session transactions committed, so inspect
 the plan and loss report before confirmation.

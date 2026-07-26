@@ -188,6 +188,8 @@ function messageEvents(envelope: RawEnvelope, record: ObjectRecord): BridgeEvent
   const role = roleValue === "user" || roleValue === "assistant" || roleValue === "system"
     ? roleValue
     : "unknown";
+  const sourceRecordUuid = stringOrNull(record.uuid);
+  const sourceParentUuid = stringOrNull(record.parentUuid);
   const origin = asRecord(record.origin);
   const authoredByHuman =
     role === "user" &&
@@ -204,6 +206,9 @@ function messageEvents(envelope: RawEnvelope, record: ObjectRecord): BridgeEvent
     return [{
       ...base(envelope, "message.content", "tool_result"),
       kind: "tool_result",
+      role,
+      sourceRecordUuid,
+      sourceParentUuid,
       toolUseId,
       content,
       isError: null,
@@ -247,6 +252,9 @@ function messageEvents(envelope: RawEnvelope, record: ObjectRecord): BridgeEvent
       events.push({
         ...base(envelope, path, "tool_use"),
         kind: "tool_use",
+        role,
+        sourceRecordUuid,
+        sourceParentUuid,
         toolUseId: stringOrNull(block.id),
         name: stringOrNull(block.name),
         input: block.input ?? null,
@@ -257,6 +265,9 @@ function messageEvents(envelope: RawEnvelope, record: ObjectRecord): BridgeEvent
       const event: Extract<BridgeEvent, { kind: "tool_result" }> = {
         ...base(envelope, path, "tool_result"),
         kind: "tool_result",
+        role,
+        sourceRecordUuid,
+        sourceParentUuid,
         toolUseId: stringOrNull(block.tool_use_id),
         content: block.content ?? null,
         isError: typeof block.is_error === "boolean" ? block.is_error : null,

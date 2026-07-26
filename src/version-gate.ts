@@ -19,6 +19,78 @@ export interface CodexTargetEvidence {
   codexExePath?: string;
 }
 
+export const CODEX_PRIVATE_WRITE_CAPABILITIES = {
+  rollout: "codex.rollout-jsonl/v26.721.41059",
+  threadIndex: "codex.thread-index-sqlite/v26.721.41059",
+  archive: "codex.archive-registration/v26.721.41059",
+  projectIdentity: "codex.project-cwd-identity/v26.721.41059",
+} as const;
+
+export type CodexPrivateWriteCapability = keyof typeof CODEX_PRIVATE_WRITE_CAPABILITIES;
+
+export interface CodexCapabilityBinding {
+  id: string;
+  fingerprint: string;
+}
+
+export interface CodexPrivateWriteProfile {
+  schema: "pass-the-thread/codex-private-write-profile-v1";
+  artifactFingerprint: string;
+  structurallyVerified: boolean;
+  capabilities: Record<CodexPrivateWriteCapability, CodexCapabilityBinding | null>;
+}
+
+function capabilityFingerprint(capability: CodexPrivateWriteCapability): string {
+  return createHash("sha256").update(JSON.stringify({
+    capability: CODEX_PRIVATE_WRITE_CAPABILITIES[capability],
+    target: SUPPORTED_CODEX_TARGET,
+  }), "utf8").digest("hex");
+}
+
+/**
+ * Probe a private-write profile without rejecting unknown/new applications.
+ * Read, scan, plan and dry-run callers retain the artifact fingerprint and see
+ * null capabilities. Mutation callers must separately assert the capabilities
+ * they need.
+ */
+export function probeCodexPrivateWriteProfile(evidence: CodexTargetEvidence): CodexPrivateWriteProfile {
+  const artifactFingerprint = createHash("sha256").update(JSON.stringify({
+    internalVersion: evidence.internalVersion,
+    appAsarSha256: evidence.appAsarSha256.toLowerCase(),
+    codexExeSha256: evidence.codexExeSha256.toLowerCase(),
+    containerVersion: evidence.containerVersion ?? null,
+  }), "utf8").digest("hex");
+  const structurallyVerified = codexTargetVersionErrors(evidence).length === 0;
+  const binding = (capability: CodexPrivateWriteCapability): CodexCapabilityBinding | null =>
+    structurallyVerified
+      ? { id: CODEX_PRIVATE_WRITE_CAPABILITIES[capability], fingerprint: capabilityFingerprint(capability) }
+      : null;
+  return {
+    schema: "pass-the-thread/codex-private-write-profile-v1",
+    artifactFingerprint,
+    structurallyVerified,
+    capabilities: {
+      rollout: binding("rollout"),
+      threadIndex: binding("threadIndex"),
+      archive: binding("archive"),
+      projectIdentity: binding("projectIdentity"),
+    },
+  };
+}
+
+export function assertCodexPrivateWriteCapabilities(
+  evidence: CodexTargetEvidence,
+  required: readonly CodexPrivateWriteCapability[],
+): CodexPrivateWriteProfile {
+  assertSupportedCodexTarget(evidence);
+  const profile = probeCodexPrivateWriteProfile(evidence);
+  const missing = required.filter((capability) => profile.capabilities[capability] == null);
+  if (missing.length > 0) {
+    throw new Error(`Codex private-write capability gate failed: ${missing.join(", ")}`);
+  }
+  return profile;
+}
+
 interface SnapshotArtifact {
   name?: unknown;
   source_path?: unknown;

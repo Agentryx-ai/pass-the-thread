@@ -41,6 +41,11 @@ export interface TextEvent extends BridgeEventBase {
 
 export interface ToolUseEvent extends BridgeEventBase {
   kind: "tool_use";
+  /** Source message role when the provider records one. */
+  role?: "user" | "assistant" | "system" | "unknown";
+  /** Provider-native message identity used only to prove source adjacency. */
+  sourceRecordUuid?: string | null;
+  sourceParentUuid?: string | null;
   toolUseId: string | null;
   name: string | null;
   input: unknown;
@@ -48,6 +53,11 @@ export interface ToolUseEvent extends BridgeEventBase {
 
 export interface ToolResultEvent extends BridgeEventBase {
   kind: "tool_result";
+  /** Source message role when the provider records one. */
+  role?: "user" | "assistant" | "system" | "unknown";
+  /** Provider-native message identity used only to prove source adjacency. */
+  sourceRecordUuid?: string | null;
+  sourceParentUuid?: string | null;
   toolUseId: string | null;
   content: unknown;
   isError: boolean | null;
