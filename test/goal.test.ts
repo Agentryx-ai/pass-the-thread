@@ -115,6 +115,7 @@ function codexSession(rolloutPath: string): CodexSession {
     title: "Goal source",
     source: "vscode",
     isChild: false,
+    isArchived: false,
     userMessageCount: 0,
   };
 }
@@ -155,7 +156,7 @@ test("Goal migration decisions are deterministic and never bind an unimplemented
 
 test("Goal mode, source hash, and status change the source inventory digest", () => {
   const build = (goalDecision: ReturnType<typeof planGoalMigration>) => buildImportPlan([{
-    sessionId: "goal-digest", cwd: "C:/repo", sourceSha256: "transcript-stable", goalDecision,
+    sessionId: "goal-digest", cwd: "C:/repo", sourceSha256: "transcript-stable", isArchived: false, goalDecision,
   }]);
   const active = canonicalGoal("active", "a");
   const baseline = build(planGoalMigration(active));

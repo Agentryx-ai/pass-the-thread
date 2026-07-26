@@ -55,7 +55,7 @@ test("matrix CLI leaves absent repeatable selectors unconstrained", () => {
 
 test("an empty normalized plan selector remains unconstrained during apply", () => {
   const plan = {
-    version: 2,
+    version: 3,
     selection: {
       archive: "all", projectScope: "all", sessionIds: [], projects: [],
       fromMs: null, toMs: null, limit: null,
@@ -72,12 +72,12 @@ test("an empty normalized plan selector remains unconstrained during apply", () 
 
 test("the confirmed matrix digest binds render mode and target identity", () => {
   const base: Omit<Extract<MatrixPlanFile, { direction: "claude-to-codex" }>, "digest"> = {
-    schema: "agentryx.import-plan/v3",
+    schema: "agentryx.import-plan/v4",
     direction: "claude-to-codex",
     renderMode: "semantic",
     goalMode: "migrate",
     plan: {
-      version: 2,
+      version: 3,
       selection: { archive: "active", projectScope: "all", sessionIds: [], projects: [], fromMs: null, toMs: null, limit: null },
       sessions: [],
       losses: {
@@ -165,6 +165,28 @@ function codexSession(
   };
 }
 
+function createForwardIndex(codexHome: string): DatabaseSync {
+  fs.mkdirSync(codexHome, { recursive: true });
+  const db = new DatabaseSync(path.join(codexHome, "state_5.sqlite"));
+  db.exec(`CREATE TABLE threads (
+    id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, cwd TEXT, title TEXT, name TEXT,
+    first_user_message TEXT, source TEXT, recency_at_ms INTEGER, updated_at_ms INTEGER,
+    updated_at INTEGER, sandbox_policy TEXT, approval_mode TEXT, reasoning_effort TEXT,
+    archived INTEGER, archived_at INTEGER
+  ); CREATE TABLE thread_spawn_edges (child_thread_id TEXT)`);
+  return db;
+}
+
+function writeIndexedRollout(dir: string, id: string, cwd: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  const rolloutPath = path.join(dir, `rollout-2026-07-25T10-00-00-${id}.jsonl`);
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({ timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd, source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: id }] } }),
+  ].join("\n") + "\n");
+  return rolloutPath;
+}
+
 test("forward semantic plan is exhaustive, deterministic, and read-only", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-"));
   const claudeHome = path.join(root, "claude-home");
@@ -184,7 +206,9 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     { timestamp: "2026-07-25T10:00:05.000Z", type: "response_item", payload: { type: "reasoning", summary: "why", content: "because" } },
     { timestamp: "2026-07-25T10:00:06.000Z", type: "response_item", payload: { type: "function_call", call_id: "c-1", name: "read", arguments: "{}" } },
     { timestamp: "2026-07-25T10:00:07.000Z", type: "response_item", payload: { type: "function_call_output", call_id: "c-1", output: "done" } },
-    { timestamp: "2026-07-25T10:00:08.000Z", type: "compacted", payload: { replacement_history: [] } },
+    { timestamp: "2026-07-25T10:00:08.000Z", type: "compacted", payload: { replacement_history: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "compact summary" }] },
+    ] } },
   ]);
 
   const first = buildForwardMatrixPlan([session], {
@@ -218,7 +242,10 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     },
   }), first.file.digest);
   assert.equal(first.file.target.sessions[0]?.targetPath, path.resolve(targetPathFor(claudeHome, session).targetPath));
-  assert.equal(first.file.target.sessions[0]?.targetExists, false);
+  assert.equal(first.file.target.sessions[0]?.targetConversationExists, false);
+  assert.equal(first.file.target.sessions[0]?.sourceCodexRolloutId, session.sessionId);
+  assert.equal(first.file.target.sessions[0]?.sourceCodexThreadId, session.desktopThreadId ?? null);
+  assert.equal(first.file.target.sessions[0]?.targetClaudeCliSessionId, session.sessionId);
   assert.equal(fs.existsSync(claudeHome), false);
   assert.equal(fs.existsSync(bridgeRoot), false);
   assert.deepEqual(
@@ -245,7 +272,7 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
   assert.ok(eventKinds.has("media"));
 
   const reverseLike = {
-    schema: "agentryx.import-plan/v3" as const,
+    schema: "agentryx.import-plan/v4" as const,
     direction: "claude-to-codex" as const,
     renderMode: first.file.renderMode,
     goalMode: first.file.goalMode,
@@ -340,14 +367,18 @@ test("forward CLI dry-run is zero-mutation and confirmed apply writes transcript
   assert.equal(wrapper.cliSessionId, id);
 });
 
-test("legacy reverse v2 plans are rejected with a Goal migration message", () => {
+test("persisted v3 envelopes and nested v2 plans require regeneration before apply", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-legacy-goal-"));
-  const planPath = path.join(root, "legacy.json");
-  fs.writeFileSync(planPath, JSON.stringify({
-    schema: "agentryx.import-plan/v2", direction: "claude-to-codex", renderMode: "semantic",
-    goalMode: "skip",
-  }));
-  assert.throws(() => main(["apply", "--plan", planPath]), /predates Goal migration binding; regenerate/);
+  for (const direction of ["claude-to-codex", "codex-to-claude"] as const) {
+    const planPath = path.join(root, `${direction}.json`);
+    fs.writeFileSync(planPath, JSON.stringify({
+      schema: "agentryx.import-plan/v3", direction, renderMode: "semantic", goalMode: "skip",
+      digest: "old-digest",
+      plan: { version: 2, selection: {}, sessions: [], losses: {} },
+      target: {},
+    }));
+    assert.throws(() => main(["apply", "--plan", planPath]), /regenerate plan with current threadpass/);
+  }
 });
 
 test("active migrate fails closed while skip and historical-only decisions are ready", () => {
@@ -360,13 +391,13 @@ test("active migrate fails closed while skip and historical-only decisions are r
     targetCapabilityId: null, targetGoalId: null,
   });
   const plan = (goalDecision: ReturnType<typeof decision>) => buildImportPlan([{
-    sessionId: "goal", cwd: "C:/repo", goalDecision,
+    sessionId: "goal", cwd: "C:/repo", isArchived: false, goalDecision,
   }]).plan;
   assert.throws(() => assertGoalMigrationReady(plan(decision("migrate", true)), "migrate"), /not implemented/);
   assert.doesNotThrow(() => assertGoalMigrationReady(plan(decision("skip", true)), "skip"));
   assert.doesNotThrow(() => assertGoalMigrationReady(plan(decision("migrate", false)), "migrate"));
   const absent = buildImportPlan([{
-    sessionId: "none", cwd: "C:/repo", goalDecision: planGoalMigration(null),
+    sessionId: "none", cwd: "C:/repo", isArchived: false, goalDecision: planGoalMigration(null),
   }]).plan;
   assert.doesNotThrow(() => assertGoalMigrationReady(absent, "migrate"));
   assert.ok(plan(decision("skip", true)).losses.byKind.some((loss) =>
@@ -375,7 +406,7 @@ test("active migrate fails closed while skip and historical-only decisions are r
 
 test("only the wired Claude Goal capability is accepted as ready", () => {
   const ready = buildImportPlan([{
-    sessionId: "ready", cwd: "C:/repo",
+    sessionId: "ready", cwd: "C:/repo", isArchived: false,
     goalDecision: planGoalMigration({
       version: 1, authority: "native-store", provider: "codex", sourceThreadId: "ready",
       sourceGoalId: "g", objective: "ship", status: "active", migrationEligible: true,
@@ -390,7 +421,7 @@ test("only the wired Claude Goal capability is accepted as ready", () => {
 
 test("Goal readiness is direction-specific for the Codex app-server capability", () => {
   const ready = buildImportPlan([{
-    sessionId: "reverse-ready", cwd: "C:/repo",
+    sessionId: "reverse-ready", cwd: "C:/repo", isArchived: false,
     goalDecision: planGoalMigration({
       version: 1, authority: "native-transcript", provider: "claude", sourceThreadId: "reverse-ready",
       sourceGoalId: null, objective: "ship", status: "active", migrationEligible: true,
@@ -452,13 +483,83 @@ test("forward CLI plan includes protocol-only active and archived rollouts witho
     stored.plan.sessions.map((session) => session.sessionId).sort(),
     [archivedId, sessionId].sort(),
   );
-  assert.equal(stored.plan.sessions.find((session) => session.sessionId === archivedId)?.archived, true);
+  assert.equal(stored.plan.sessions.find((session) => session.sessionId === archivedId)?.archiveState, "archived");
   assert.ok(stored.plan.sessions.every((session) => session.projectName === "FixtureProject"));
   assert.equal(fs.existsSync(claudeHome), false);
   assert.equal(fs.existsSync(bridgeRoot), false);
 });
 
-test("forward selection supports exact target existence, filters, explicit limits, and no implicit 50 cap", () => {
+test("forward scan preserves malformed indexed archive columns as unknown", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-archive-malformed-"));
+  const codexHome = path.join(root, "codex");
+  const cwd = path.join(root, "repo");
+  const id = "11111111-aaaa-4bbb-8ccc-222222222222";
+  const rolloutPath = writeIndexedRollout(path.join(codexHome, "sessions", "2026", "07", "25"), id, cwd);
+  const db = createForwardIndex(codexHome);
+  db.prepare(`INSERT INTO threads (
+    id, rollout_path, cwd, title, source, recency_at_ms, archived, archived_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(id, rolloutPath, cwd, id, "vscode", 1, 1, "malformed");
+  db.close();
+  const out = path.join(root, "scan.json");
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "all", "--out", out]);
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { unknownArchive: number };
+    selected: Array<{ archiveState: string; archiveProvenance: string }>;
+  };
+  assert.equal(scan.inventory.unknownArchive, 1);
+  assert.equal(scan.selected[0]?.archiveState, "unknown");
+  assert.equal(scan.selected[0]?.archiveProvenance, "codex-thread-index-invalid-archive-columns");
+  assert.throws(() => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "active", "--out", path.join(root, "active.json")]),
+  /archive state is unknown/);
+  const planPath = path.join(root, "plan.json");
+  const claudeHome = path.join(root, "claude-target");
+  const bridgeRoot = path.join(root, "bridge");
+  main(["plan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", claudeHome, "--bridge-root", bridgeRoot, "--archive", "all",
+    "--goal-mode", "skip", "--no-register", "--out", planPath]);
+  const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixForwardPlanFile;
+  assert.throws(() => main(["apply", "--plan", planPath, "--confirm", stored.digest]),
+    /source archive state is unknown; target write refused/);
+  assert.equal(fs.existsSync(claudeHome), false);
+  assert.equal(fs.existsSync(bridgeRoot), false);
+});
+
+test("forward scan reports both indexed archive and rollout-location disagreements", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-archive-conflict-"));
+  const codexHome = path.join(root, "codex");
+  const cwd = path.join(root, "repo");
+  const activeDbId = "33333333-aaaa-4bbb-8ccc-444444444444";
+  const archivedDbId = "55555555-aaaa-4bbb-8ccc-666666666666";
+  const physicallyArchived = writeIndexedRollout(path.join(codexHome, "archived_sessions"), activeDbId, cwd);
+  const physicallyActive = writeIndexedRollout(path.join(codexHome, "sessions", "2026", "07", "25"), archivedDbId, cwd);
+  const db = createForwardIndex(codexHome);
+  const insert = db.prepare(`INSERT INTO threads (
+    id, rollout_path, cwd, title, source, recency_at_ms, archived, archived_at
+  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+  insert.run(activeDbId, physicallyArchived, cwd, activeDbId, "vscode", 2, 0, null);
+  insert.run(archivedDbId, physicallyActive, cwd, archivedDbId, "vscode", 1, 1, 1_700_000_000);
+  db.close();
+  const out = path.join(root, "scan.json");
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "all", "--out", out]);
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { unknownArchive: number };
+    selected: Array<{ archiveState: string; archiveProvenance: string }>;
+  };
+  assert.equal(scan.inventory.unknownArchive, 2);
+  assert.deepEqual(scan.selected.map((session) => session.archiveState), ["unknown", "unknown"]);
+  assert.ok(scan.selected.every((session) =>
+    session.archiveProvenance === "codex-thread-index-rollout-location-conflict"));
+  for (const archive of ["active", "archived"]) {
+    assert.throws(() => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+      "--claude-home", path.join(root, "claude"), "--archive", archive, "--out", path.join(root, `${archive}.json`)]),
+    /archive state is unknown/);
+  }
+});
+
+test("forward selection treats existing-targets as a project-root filter and reports conversation collisions separately", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-select-"));
   const claudeHome = path.join(root, "claude");
   const bridgeRoot = path.join(root, "bridge");
@@ -476,6 +577,9 @@ test("forward selection supports exact target existence, filters, explicit limit
   const existing = sessions[4]!;
   const existingPath = targetPathFor(claudeHome, existing).targetPath;
   fs.mkdirSync(path.dirname(existingPath), { recursive: true });
+  const projectOnly = sessions[3]!;
+  const projectOnlyPath = targetPathFor(claudeHome, projectOnly).targetPath;
+  fs.mkdirSync(path.dirname(projectOnlyPath), { recursive: true });
   fs.writeFileSync(existingPath, "existing\n");
   const selected = buildForwardMatrixPlan(sessions, {
     claudeHome,
@@ -483,20 +587,49 @@ test("forward selection supports exact target existence, filters, explicit limit
     selection: {
       archive: "active",
       projectScope: "existing-targets",
-      sessionIds: [existing.sessionId],
+      sessionIds: [projectOnly.sessionId, existing.sessionId],
       fromMs: existing.lastTsMs!,
       toMs: existing.lastTsMs!,
       limit: 1,
     },
   });
   assert.deepEqual(selected.file.plan.sessions.map((row) => row.sessionId), [existing.sessionId]);
-  assert.equal(selected.file.target.sessions[0]?.targetExists, true);
+  assert.equal(selected.file.target.sessions[0]?.targetProjectExists, true);
+  assert.equal(selected.file.target.sessions[0]?.targetConversationExists, true);
+  assert.equal(selected.file.target.sessions[0]?.targetConversationState, "collision");
   assert.equal(selected.file.target.sessions[0]?.targetPath, fs.realpathSync.native(existingPath));
+
+  const projectSelected = buildForwardMatrixPlan([projectOnly], {
+    claudeHome, bridgeRoot,
+    selection: { archive: "all", projectScope: "existing-targets" },
+  });
+  assert.equal(projectSelected.file.plan.sessions[0]?.targetProjectExists, true);
+  assert.equal(projectSelected.file.plan.sessions[0]?.targetConversationExists, false);
+
+  fs.writeFileSync(
+    projectSelected.applyPlans[0]!.transcript.path,
+    projectSelected.applyPlans[0]!.transcript.afterContents,
+  );
+  const exact = buildForwardMatrixPlan([projectOnly], {
+    claudeHome, bridgeRoot, selection: { archive: "all" },
+  });
+  assert.equal(exact.file.target.sessions[0]?.targetConversationState, "exact-existing");
+  assert.equal(exact.file.plan.sessions[0]?.targetConversationState, "exact-existing");
+  assert.notEqual(exact.file.digest, projectSelected.file.digest, "target existence is plan-bound");
 
   const archived = buildForwardMatrixPlan(sessions, {
     claudeHome, bridgeRoot, selection: { archive: "archived", limit: 1 },
   });
   assert.deepEqual(archived.file.plan.sessions.map((row) => row.sessionId), [sessions[54]!.sessionId]);
+
+  fs.rmSync(path.dirname(projectOnlyPath), { recursive: true });
+  assert.throws(() => buildForwardMatrixPlan(sessions, {
+    claudeHome,
+    bridgeRoot,
+    selection: { archive: "all", projectScope: "existing-targets" },
+    expectedTargets: projectSelected.file.target.sessions,
+  }), /target project ceased to exist/);
+  assert.equal(fs.existsSync(bridgeRoot), false, "apply rebuild must fail before bridge or target mutation");
 });
 
 test("Claude wrapper identity must agree with every transcript identity", () => {
@@ -586,6 +719,92 @@ test("only ordered, structurally valid tool pairs are eligible for native render
   ]).size, 0);
 });
 
+test("scan exposes unreadable Desktop membership and membership filters fail without mutating global state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-membership-unknown-"));
+  const codexHome = path.join(root, "codex");
+  const sourceDir = path.join(codexHome, "sessions", "2026", "07", "27");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const id = "12345678-aaaa-4bbb-8ccc-123456789abc";
+  fs.writeFileSync(path.join(sourceDir, `rollout-2026-07-27T10-00-00-${id}.jsonl`), [
+    JSON.stringify({ timestamp: "2026-07-27T10:00:00.000Z", type: "session_meta", payload: { id, cwd: path.join(root, "repo"), source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-27T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] } }),
+  ].join("\n") + "\n");
+  const globalState = path.join(codexHome, ".codex-global-state.json");
+  fs.writeFileSync(globalState, "{broken", "utf8");
+  const before = fs.readFileSync(globalState);
+  const out = path.join(root, "scan.json");
+
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "all", "--out", out]);
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { projectMembership: { status: string } };
+    selected: Array<{ projectMembership: string; projectMembershipProvenance: string }>;
+  };
+  assert.equal(scan.inventory.projectMembership.status, "unreadable");
+  assert.equal(scan.selected[0]?.projectMembership, "unknown");
+  assert.equal(scan.selected[0]?.projectMembershipProvenance, "codex-global-state-unavailable");
+  assert.deepEqual(fs.readFileSync(globalState), before);
+  assert.throws(() => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--project-scope", "projectless"]), /membership is unknown/);
+});
+
+test("typed rollout walk does not cwd-infer an ID absent from authoritative assignments", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-membership-assigned-"));
+  const codexHome = path.join(root, "codex");
+  const repo = path.join(root, "repo");
+  const sourceDir = path.join(codexHome, "sessions", "2026", "07", "27");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.mkdirSync(repo, { recursive: true });
+  const id = "12345678-bbbb-4ccc-8ddd-123456789abc";
+  fs.writeFileSync(path.join(sourceDir, `rollout-2026-07-27T10-00-00-${id}.jsonl`), [
+    JSON.stringify({ timestamp: "2026-07-27T10:00:00.000Z", type: "session_meta", payload: { id, cwd: repo, source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-27T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] } }),
+  ].join("\n") + "\n");
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": { project: { name: "Repo", rootPaths: [repo] } },
+    "thread-project-assignments": {},
+    "projectless-thread-ids": [],
+  }));
+  const out = path.join(root, "scan.json");
+
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "all", "--out", out]);
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { projectMembership: { status: string } };
+    selected: Array<{ projectMembership: string; projectMembershipProvenance: string }>;
+  };
+  assert.equal(scan.inventory.projectMembership.status, "available");
+  assert.equal(scan.selected[0]?.projectMembership, "unknown");
+  assert.equal(scan.selected[0]?.projectMembershipProvenance, "codex-global-state-unavailable");
+  assert.throws(() => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", path.join(root, "claude"), "--archive", "all", "--project-scope", "projects"]), /membership is unknown/);
+});
+
+test("reverse scan exposes unknown wrapper archive state and archive filters fail visibly", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-archive-unknown-"));
+  const workspace = path.join(root, "workspace");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.writeFileSync(path.join(workspace, "local_unknown.json"), JSON.stringify({
+    sessionId: "local_unknown", cwd: path.join(root, "repo"), transcriptUnavailable: true,
+  }));
+  const out = path.join(root, "scan.json");
+  const base = ["scan", "--direction", "claude-to-codex", "--workspace-dir", workspace,
+    "--claude-home", path.join(root, "claude"), "--codex-home", path.join(root, "codex")];
+
+  main([...base, "--archive", "all", "--out", out]);
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { active: number; archived: number; unknownArchive: number };
+    selected: Array<{ archiveState: string; archiveProvenance: string }>;
+  };
+  assert.deepEqual(scan.inventory, {
+    total: 1, selected: 1, active: 0, archived: 0, unknownArchive: 1, unavailable: 1,
+  });
+  assert.equal(scan.selected[0]?.archiveState, "unknown");
+  assert.equal(scan.selected[0]?.archiveProvenance, "claude-wrapper-missing-isArchived");
+  assert.throws(() => main([...base, "--archive", "active"]), /archive state is unknown/);
+  assert.throws(() => main([...base, "--archive", "archived"]), /archive state is unknown/);
+});
+
 test("Claude compact boundary plus following summary becomes nonempty resumable replacement history", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-reverse-compact-"));
   const cwdVariant = path.join(root, "project", "nested", "..");
@@ -607,7 +826,7 @@ test("Claude compact boundary plus following summary becomes nonempty resumable 
       transcriptPath, transcriptExists: true, transcriptStatus: "available",
     },
     bundle,
-    summary: { sessionId, cwd: cwdVariant, hasProject: true, isArchived: false, targetExists: false },
+    summary: { sessionId, cwd: cwdVariant, hasProject: true, isArchived: false, targetProjectExists: false },
   }, "semantic");
   assert.equal(logical.compaction?.summary, "authoritative compact summary");
   assert.equal(logical.cwd, fs.realpathSync.native(path.join(root, "project")));
@@ -616,6 +835,36 @@ test("Claude compact boundary plus following summary becomes nonempty resumable 
   assert.ok(compacted);
   assert.equal((compacted.payload.replacement_history as unknown[]).length, 1);
   assert.match(JSON.stringify(compacted.payload.replacement_history), /authoritative compact summary/);
+});
+
+test("semantic reverse rendering keeps the latest compact summary and appends post-boundary items exactly once", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-reverse-latest-compact-"));
+  const transcriptPath = path.join(root, "compact.jsonl");
+  const sessionId = "19191919-1919-4191-8191-191919191919";
+  const records = [
+    { type: "system", subtype: "compact_boundary", sessionId, timestamp: "2026-07-26T00:00:00.000Z", compactMetadata: { preTokens: 100, postTokens: 20 } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:00.001Z", isCompactSummary: true, message: { role: "user", content: "old summary" } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:01.000Z", message: { role: "user", content: "between boundaries" } },
+    { type: "system", subtype: "compact_boundary", sessionId, timestamp: "2026-07-26T00:00:02.000Z", compactMetadata: { preTokens: 120, postTokens: 10 } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:02.001Z", isCompactSummary: true, message: { role: "user", content: "latest summary" } },
+    { type: "user", sessionId, timestamp: "2026-07-26T00:00:03.000Z", message: { role: "user", content: "active once" } },
+  ];
+  fs.writeFileSync(transcriptPath, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  const bundle = claudeTranscriptToIr(readClaudeJsonl(transcriptPath));
+  const logical = bridgeToLogical({
+    desktop: {
+      wrapperPath: path.join(root, "local_wrapper.json"), wrapperSessionId: "local_wrapper",
+      cliSessionId: sessionId, sessionId: "local_wrapper", cwd: root, title: "compact", isArchived: false,
+      createdAtMs: null, lastActivityAtMs: null, transcriptPath, transcriptExists: true, transcriptStatus: "available",
+    },
+    bundle,
+    summary: { sessionId: "local_wrapper", cwd: root, hasProject: true, isArchived: false, targetProjectExists: false },
+  }, "semantic");
+  assert.equal(logical.compaction?.summary, "latest summary");
+  const rollout = JSON.stringify(buildCodexRollout41059({ ...logical, threadId: "target" }));
+  assert.equal((rollout.match(/active once/g) ?? []).length, 1);
+  assert.equal((rollout.match(/latest summary/g) ?? []).length, 1);
+  assert.doesNotMatch(rollout, /old summary/);
 });
 
 test("Claude compact boundary without a summary fails closed instead of writing empty replacement history", () => {
@@ -635,7 +884,7 @@ test("Claude compact boundary without a summary fails closed instead of writing 
       transcriptStatus: "available",
     },
     bundle,
-    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetProjectExists: false },
   }, "semantic"), /no recoverable replacement summary/);
 });
 
@@ -657,7 +906,7 @@ test("verbatim reverse rendering preserves compact source as inert history witho
       transcriptStatus: "available",
     },
     bundle,
-    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetProjectExists: false },
   }, "verbatim");
   assert.equal(logical.compaction, undefined);
   assert.match(JSON.stringify(logical.items), /compact_boundary/);
@@ -677,7 +926,7 @@ test("verbatim reverse rendering preserves compact source as inert history witho
       transcriptExists: true, transcriptStatus: "available",
     },
     bundle: oversizedBundle,
-    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetExists: false },
+    summary: { sessionId, cwd: root, hasProject: true, isArchived: false, targetProjectExists: false },
   }, "verbatim");
   assert.throws(() => planCodexTarget(
     path.join(root, "codex"),
@@ -685,7 +934,7 @@ test("verbatim reverse rendering preserves compact source as inert history witho
     "oversized",
     oversizedBundle.conversation.sourceContentSha256,
     oversized,
-  ), /safe limit/);
+  ), /UTF-8 bytes/);
 });
 
 function createFullThreadsDb(dbPath: string): void {

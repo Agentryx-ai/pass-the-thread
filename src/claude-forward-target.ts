@@ -143,26 +143,37 @@ export function renderForwardClaudeTranscript(
     }
   } else {
     const events = bundle.conversation.events;
-    const validTools = new Set<string>();
+    const lastPortableBoundaryIndex = events.findLastIndex((candidate) =>
+      candidate.kind === "compact_boundary" && candidate.activeContextStartsAfter);
+    const activeEvents = lastPortableBoundaryIndex < 0 ? events : events.slice(lastPortableBoundaryIndex);
+    const validToolUses = new Set<string>();
     const calls = new Map<string, number>();
     const results = new Map<string, number>();
-    for (const event of events) {
+    for (const event of activeEvents) {
       if (event.kind === "tool_use" && event.toolUseId) calls.set(event.toolUseId, (calls.get(event.toolUseId) ?? 0) + 1);
       if (event.kind === "tool_result" && event.toolUseId) results.set(event.toolUseId, (results.get(event.toolUseId) ?? 0) + 1);
     }
-    for (const [index, event] of events.entries()) {
+    for (const [index, event] of activeEvents.entries()) {
       const resultIndex = event.kind === "tool_use" && event.toolUseId
-        ? events.findIndex((candidate) => candidate.kind === "tool_result" && candidate.toolUseId === event.toolUseId)
+        ? activeEvents.findIndex((candidate) => candidate.kind === "tool_result" && candidate.toolUseId === event.toolUseId)
         : -1;
       const plainInput = event.kind === "tool_use" && event.input != null && typeof event.input === "object" && !Array.isArray(event.input);
       if (event.kind === "tool_use" && event.toolUseId && event.name && plainInput && calls.get(event.toolUseId) === 1 &&
         (results.get(event.toolUseId) ?? 0) <= 1 && (resultIndex < 0 || resultIndex > index)) {
-        validTools.add(event.toolUseId);
+        validToolUses.add(event.id);
       }
     }
     const handledResults = new Set<string>();
+    const earlierCompactEnvelopeIds = new Set(events
+      .filter((event, index) => event.kind === "compact_boundary" && event.activeContextStartsAfter &&
+        index !== lastPortableBoundaryIndex)
+      .map((event) => event.sourceEnvelopeId));
+    if (lastPortableBoundaryIndex >= 0) {
+      assertPortableCompactReplacement(events, lastPortableBoundaryIndex, validToolUses, session.sessionId);
+    }
     for (let index = 0; index < events.length; index += 1) {
       const event = events[index]!;
+      if (earlierCompactEnvelopeIds.has(event.sourceEnvelopeId)) continue;
       if (event.kind === "text") {
         if (event.role === "assistant") {
           const citation = splitCitations(event.text);
@@ -176,7 +187,7 @@ export function renderForwardClaudeTranscript(
       } else if (event.kind === "reasoning") {
         const thinking = [text(event.summary), text(event.content)].filter(Boolean).join("\n\n");
         if (thinking) emit("user", [{ type: "text", text: `[pass-the-thread] Historical Codex reasoning (not a signed Claude thinking block):\n${thinking}` }], event, true);
-      } else if (event.kind === "tool_use" && event.toolUseId && validTools.has(event.toolUseId)) {
+      } else if (event.kind === "tool_use" && event.toolUseId && validToolUses.has(event.id)) {
         const resultIndex = events.findIndex((candidate, candidateIndex) => candidateIndex > index &&
           candidate.kind === "tool_result" && candidate.toolUseId === event.toolUseId);
         const result = resultIndex >= 0 ? events[resultIndex] as Extract<BridgeEvent, { kind: "tool_result" }> : null;
@@ -198,6 +209,7 @@ export function renderForwardClaudeTranscript(
           emit("user", [image], event, !event.authoredByHuman);
         }
       } else if (event.kind === "compact_boundary" && event.activeContextStartsAfter) {
+        if (index !== lastPortableBoundaryIndex) continue;
         const recordUuid = uuid(`${bundle.conversation.sourceContentSha256}:${event.id}:${sequence++}`);
         const line: ClaudeTranscriptLine = {
           parentUuid, isSidechain: false, userType: "external", cwd: session.cwd,
@@ -230,6 +242,35 @@ export function renderForwardClaudeTranscript(
     );
   }
   return composed;
+}
+
+function assertPortableCompactReplacement(
+  events: readonly BridgeEvent[],
+  boundaryIndex: number,
+  validToolUses: ReadonlySet<string>,
+  sessionId: string,
+): void {
+  const boundary = events[boundaryIndex]!;
+  const replacement: BridgeEvent[] = [];
+  for (let index = boundaryIndex + 1; index < events.length; index += 1) {
+    const event = events[index]!;
+    if (event.sourceEnvelopeId !== boundary.sourceEnvelopeId) break;
+    replacement.push(event);
+  }
+  if (replacement.some((event) => event.kind === "unknown")) {
+    throw new Error(`Codex compact replacement contains unknown or malformed content: ${sessionId}`);
+  }
+  const portableCount = replacement.filter((event) => {
+    if (event.kind === "text") return event.text.trim() !== "";
+    if (event.kind === "reasoning") return [text(event.summary), text(event.content)].join("\n").trim() !== "";
+    if (event.kind === "task_notification") return notificationText(event).trim() !== "";
+    if (event.kind === "media") return imageBlock(event) != null;
+    if (event.kind === "tool_use") return event.toolUseId != null && validToolUses.has(event.id);
+    return false;
+  }).length;
+  if (portableCount === 0) {
+    throw new Error(`Codex compact boundary has no safely renderable replacement content: ${sessionId}`);
+  }
 }
 
 export interface ForwardAssetPlan {

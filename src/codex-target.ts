@@ -31,8 +31,9 @@ import {
   type CodexGoalRpc,
 } from "./codex-goal-target.ts";
 
-export const CODEX_41059_CONTEXT_WINDOW = 258_400;
-export const CODEX_41059_SAFE_ACTIVE_TOKENS = 230_000;
+export const CODEX_41059_PROVIDER_CONTEXT_WINDOW_TOKENS = 258_400;
+/** Conservative offline refusal cap; this is serialized UTF-8 bytes, not provider tokens. */
+export const CODEX_41059_SAFE_ACTIVE_UTF8_BYTES = 230_000;
 
 export interface CodexTargetPlan {
   operationId: string;
@@ -67,6 +68,12 @@ export interface CodexTargetLock {
 }
 
 export type CodexTargetPlanState = "absent" | "already-applied" | "collision";
+
+interface CodexTargetThreadReadback {
+  rolloutPath: string;
+  archived: number;
+  archivedAt: number | bigint | null;
+}
 
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -147,14 +154,42 @@ export function releaseCodexTargetLock(lock: CodexTargetLock): void {
 
 export function inspectCodexTargetPlan(plan: CodexTargetPlan): CodexTargetPlanState {
   const rolloutExists = fs.existsSync(plan.rolloutPath);
-  const registeredPath = fs.existsSync(plan.dbPath) ? threadRolloutPath(plan.dbPath, plan.threadId) : null;
-  if (!rolloutExists && registeredPath == null) return "absent";
-  if (rolloutExists && registeredPath != null &&
-    canonicalPath(registeredPath) === canonicalPath(plan.rolloutPath) &&
+  const registered = fs.existsSync(plan.dbPath) ? targetThreadReadback(plan.dbPath, plan.threadId) : null;
+  if (!rolloutExists && registered == null) return "absent";
+  if (rolloutExists && registered != null &&
+    canonicalPath(registered.rolloutPath) === canonicalPath(plan.rolloutPath) &&
+    archiveReadbackMatches(plan.archived, registered) &&
     createHash("sha256").update(fs.readFileSync(plan.rolloutPath)).digest("hex") === plan.rolloutSha256) {
     return "already-applied";
   }
   return "collision";
+}
+
+function targetThreadReadback(dbPath: string, threadId: string): CodexTargetThreadReadback | null {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const row = db.prepare("SELECT rollout_path, archived, archived_at FROM threads WHERE id = ?")
+      .get(threadId) as { rollout_path?: unknown; archived?: unknown; archived_at?: unknown } | undefined;
+    if (row == null) return null;
+    if (typeof row.rollout_path !== "string" || typeof row.archived !== "number" ||
+      ![0, 1].includes(row.archived) ||
+      (row.archived_at !== null && typeof row.archived_at !== "number" && typeof row.archived_at !== "bigint")) {
+      return { rolloutPath: "", archived: -1, archivedAt: null };
+    }
+    return { rolloutPath: row.rollout_path, archived: row.archived, archivedAt: row.archived_at };
+  } finally {
+    db.close();
+  }
+}
+
+function archiveReadbackMatches(
+  plannedArchived: boolean,
+  readback: Pick<CodexTargetThreadReadback, "archived" | "archivedAt">,
+): boolean {
+  if (!plannedArchived) return readback.archived === 0 && readback.archivedAt === null;
+  if (readback.archived !== 1 || readback.archivedAt == null) return false;
+  const archivedAt = Number(readback.archivedAt);
+  return Number.isSafeInteger(archivedAt) && archivedAt >= 0;
 }
 
 export function operationJournalInputForPlan(plan: CodexTargetPlan): OperationJournalInput {
@@ -171,25 +206,31 @@ export function operationJournalInputForPlan(plan: CodexTargetPlan): OperationJo
   };
 }
 
-export function estimatedActiveTokens(conversation: Omit<LogicalCodexConversation, "threadId">): number {
-  const explicit = conversation.compaction?.postTokens;
+export function estimatedActiveBytes(conversation: Omit<LogicalCodexConversation, "threadId">): number {
   const items = conversation.items ?? conversation.messages;
-  const activeIndex = conversation.compaction?.activeItemIndex ??
-    conversation.compaction?.activeMessageIndex ?? 0;
+  const configuredIndex = conversation.compaction?.activeItemIndex ??
+    conversation.compaction?.activeMessageIndex;
+  if (conversation.compaction != null && configuredIndex == null) {
+    throw new Error("compacted history must identify its active-item boundary");
+  }
+  const activeIndex = configuredIndex ?? 0;
+  if (!Number.isSafeInteger(activeIndex) || activeIndex < 0 || activeIndex > items.length) {
+    throw new Error(`compaction active-item index ${activeIndex} is outside 0..${items.length}`);
+  }
+  for (const [name, value] of [
+    ["source pre-compaction token counter", conversation.compaction?.preTokens],
+    ["source post-compaction token counter", conversation.compaction?.postTokens],
+  ] as const) {
+    if (value != null && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new Error(`${name} must be a non-negative safe integer`);
+    }
+  }
   const active = items.slice(activeIndex);
-  // A conservative offline estimate used only as a refusal threshold. Exact
-  // tokenisation is model-specific; callers see this estimate in the plan.
-  // The pinned tokenizer is not available locally. Every token consumes at
-  // least one UTF-8 byte, so byte length is a deliberately conservative upper
-  // bound for CJK, emoji, ASCII, and high-entropy content.
-  const appendedEstimate = Buffer.byteLength(JSON.stringify(active), "utf8");
-  const replacementEstimate = conversation.compaction?.summary == null
+  const appendedBytes = Buffer.byteLength(JSON.stringify(active), "utf8");
+  const replacementBytes = conversation.compaction?.summary == null
     ? 0
     : Buffer.byteLength(conversation.compaction.summary, "utf8");
-  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 0) {
-    return explicit + appendedEstimate;
-  }
-  return replacementEstimate + appendedEstimate;
+  return replacementBytes + appendedBytes;
 }
 
 export function deterministicThreadId(sourceId: string, sourceSha256: string): string {
@@ -211,10 +252,11 @@ export function planCodexTarget(
     (conversation.compaction.summary == null || conversation.compaction.summary.trim() === "")) {
     throw new Error("compacted Claude history has no replacement summary and cannot be resumed safely");
   }
-  const activeTokens = estimatedActiveTokens(conversation);
-  if (activeTokens > CODEX_41059_SAFE_ACTIVE_TOKENS) {
+  const activeBytes = estimatedActiveBytes(conversation);
+  if (activeBytes > CODEX_41059_SAFE_ACTIVE_UTF8_BYTES) {
     throw new Error(
-      `active imported context is about ${activeTokens} tokens; safe limit is ${CODEX_41059_SAFE_ACTIVE_TOKENS}`,
+      `active imported context is ${activeBytes} UTF-8 bytes; conservative offline limit is ` +
+      `${CODEX_41059_SAFE_ACTIVE_UTF8_BYTES} UTF-8 bytes (no provider token count is inferred)`,
     );
   }
   const threadId = deterministicThreadId(sourceId, sourceSha256);
@@ -323,6 +365,9 @@ function applyCodexTargetAfterGoalPreflight(
       firstUserMessage: firstUser,
       preview: firstUser.slice(0, 500),
     });
+    if (inspectCodexTargetPlan(plan) !== "already-applied") {
+      throw new Error(`Codex target archive/path/hash readback differs after registration: ${plan.threadId}`);
+    }
     journal = updateOperationJournal(options.bridgeRoot, journal, { state: "thread-registered" });
     if (plan.goalActivation != null) {
       if (goalRpc == null) throw new Error("Codex Goal RPC preflight was not established");

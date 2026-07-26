@@ -5,6 +5,8 @@ import { canonicalProjectIdentity } from "./project-identity.ts";
 import { planGoalMigration, type GoalMigrationDecision } from "./goal.ts";
 import {
   selectSessions,
+  archiveState,
+  projectMembership,
   type SelectionOptions,
   type SelectionSession,
 } from "./selection.ts";
@@ -22,11 +24,15 @@ export interface ImportPlanSession {
   sessionId: string;
   projectPath: string | null;
   projectKey: string | null;
-  projectExists: boolean;
+  sourceProjectRootExists: boolean;
   projectName: string | null;
-  hasProject: boolean;
-  archived: boolean;
-  targetExists: boolean;
+  projectMembership: "project" | "projectless" | "unknown";
+  projectMembershipProvenance: string;
+  archiveState: "active" | "archived" | "unknown";
+  archiveProvenance: string;
+  targetProjectExists: boolean | null;
+  targetConversationExists: boolean | null;
+  targetConversationState: "absent" | "exact-existing" | "collision" | "unknown";
   activityAtMs: number | null;
   sourcePath: string | null;
   sourceSha256: string | null;
@@ -36,7 +42,7 @@ export interface ImportPlanSession {
 }
 
 export interface ImportPlan {
-  version: 2;
+  version: 3;
   selection: {
     archive: "active" | "all" | "archived";
     projectScope: "all" | "projects" | "projectless" | "existing-targets";
@@ -61,6 +67,22 @@ export interface BuiltImportPlan {
   digest: string;
 }
 
+export const REGENERATE_PLAN_MESSAGE = "regenerate plan with current threadpass";
+
+export function assertCurrentImportPlan(value: unknown): asserts value is ImportPlan {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`unsupported nested import plan; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+  const plan = value as Record<string, unknown>;
+  if (plan.version !== 3) {
+    throw new Error(`unsupported nested import plan version ${String(plan.version)}; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+  if (plan.selection == null || typeof plan.selection !== "object" || Array.isArray(plan.selection) ||
+    !Array.isArray(plan.sessions) || plan.losses == null || typeof plan.losses !== "object" || Array.isArray(plan.losses)) {
+    throw new Error(`malformed nested import plan; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+}
+
 /**
  * Build a deterministic, side-effect-free import plan from parsed summaries.
  * Session input order and object insertion order do not affect the output.
@@ -81,7 +103,7 @@ export function buildImportPlan(
   ));
 
   const plan: ImportPlan = {
-    version: 2,
+    version: 3,
     selection: normalizeSelection(selection),
     sessions: rows,
     losses: summarizeLosses(selected.map((session) => ({
@@ -94,6 +116,7 @@ export function buildImportPlan(
 }
 
 export function digestImportPlan(plan: ImportPlan): Pick<BuiltImportPlan, "canonicalJson" | "digest"> {
+  assertCurrentImportPlan(plan);
   const canonicalJson = canonicalStringify(plan);
   const digest = createHash("sha256").update(canonicalJson, "utf8").digest("hex");
   return { canonicalJson, digest };
@@ -129,11 +152,19 @@ function toPlanSession(session: ImportPlanSessionSummary): ImportPlanSession {
     sessionId: session.sessionId,
     projectPath: identity?.path ?? null,
     projectKey: identity?.key ?? null,
-    projectExists: identity?.exists ?? false,
+    sourceProjectRootExists: identity?.exists ?? false,
     projectName: session.projectName ?? null,
-    hasProject: session.hasProject === true,
-    archived: session.isArchived === true,
-    targetExists: session.targetExists === true,
+    projectMembership: projectMembership(session),
+    projectMembershipProvenance: session.projectMembershipProvenance ??
+      (session.projectMembership != null || session.hasProject != null ? "source-observation" : "unresolved"),
+    archiveState: archiveState(session),
+    archiveProvenance: session.archiveProvenance ??
+      (session.archiveState != null || session.isArchived != null ? "source-observation" : "unresolved"),
+    targetProjectExists: session.targetProjectExists ?? null,
+    targetConversationExists: session.targetConversationExists ?? null,
+    targetConversationState: session.targetConversationState ??
+      (session.targetConversationExists === true ? "collision" :
+        session.targetConversationExists === false ? "absent" : "unknown"),
     activityAtMs: session.lastTsMs ?? session.firstTsMs ?? null,
     sourcePath: session.sourcePath ?? null,
     sourceSha256: session.sourceSha256 ?? null,

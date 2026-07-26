@@ -1,6 +1,7 @@
 import { canonicalProjectIdentity } from "./project-identity.ts";
 
 export type ArchiveSelection = "active" | "all" | "archived";
+export type ArchiveState = "active" | "archived" | "unknown";
 export type ProjectScope = "all" | "projects" | "projectless" | "existing-targets";
 
 /** Minimal structural contract accepted from any source reader. */
@@ -10,8 +11,18 @@ export interface SelectionSession {
   projectRoot?: string;
   projectName?: string;
   hasProject?: boolean;
+  /** Explicit source grouping. Omitted legacy booleans are treated as unknown. */
+  projectMembership?: "project" | "projectless" | "unknown";
+  projectMembershipProvenance?: string;
+  /** Legacy native boolean, retained for source adapters that already know it. */
   isArchived?: boolean;
-  targetExists?: boolean;
+  archiveState?: ArchiveState;
+  archiveProvenance?: string;
+  /** Canonical target project/group/root registration status. */
+  targetProjectExists?: boolean | null;
+  /** Exact planned target conversation artifact/registration status. */
+  targetConversationExists?: boolean;
+  targetConversationState?: "absent" | "exact-existing" | "collision" | "unknown";
   firstTsMs?: number | null;
   lastTsMs?: number | null;
 }
@@ -48,25 +59,57 @@ export function selectSessions<T extends SelectionSession>(
   const projects = options.projects == null ? null : [...options.projects];
 
   const selected = sessions.filter((session) => {
-    if (archive === "active" && session.isArchived === true) return false;
-    if (archive === "archived" && session.isArchived !== true) return false;
-
-    if (projectScope === "projects" && session.hasProject !== true) return false;
-    if (projectScope === "projectless" && session.hasProject === true) return false;
-    if (projectScope === "existing-targets" && session.targetExists !== true) return false;
-
     if (sessionIds != null && !sessionIds.has(session.sessionId)) return false;
+
+    const observedArchive = archiveState(session);
+    if (archive !== "all" && observedArchive === "unknown") {
+      throw new Error(`archive state is unknown for ${session.sessionId}`);
+    }
+    if (archive === "active" && observedArchive !== "active") return false;
+    if (archive === "archived" && observedArchive !== "archived") return false;
+
+    const membership = projectMembership(session);
+    if ((projectScope === "projects" || projectScope === "projectless" || projects != null) &&
+      membership === "unknown") {
+      throw new Error(`project membership is unknown for ${session.sessionId}`);
+    }
+    if (projectScope === "projects" && membership !== "project") return false;
+    if (projectScope === "projectless" && membership !== "projectless") return false;
+    if (projectScope === "existing-targets") {
+      if (session.targetProjectExists == null) {
+        throw new Error(`target project existence is unknown for ${session.sessionId}`);
+      }
+      if (!session.targetProjectExists) return false;
+    }
+
     if (projects != null && !projects.some((selector) => matchesProject(session, selector))) {
       return false;
     }
 
     const activity = session.lastTsMs ?? session.firstTsMs ?? null;
-    if (options.fromMs != null && (activity == null || activity < options.fromMs)) return false;
-    if (options.toMs != null && (activity == null || activity > options.toMs)) return false;
+    if ((options.fromMs != null || options.toMs != null) && activity == null) {
+      throw new Error(`source activity timestamp is unknown for ${session.sessionId}`);
+    }
+    if (options.fromMs != null && activity! < options.fromMs) return false;
+    if (options.toMs != null && activity! > options.toMs) return false;
     return true;
   });
 
   return options.limit == null ? selected : selected.slice(0, options.limit);
+}
+
+export function projectMembership(session: SelectionSession): "project" | "projectless" | "unknown" {
+  if (session.projectMembership != null) return session.projectMembership;
+  if (session.hasProject === true) return "project";
+  if (session.hasProject === false) return "projectless";
+  return "unknown";
+}
+
+export function archiveState(session: SelectionSession): ArchiveState {
+  if (session.archiveState != null) return session.archiveState;
+  if (session.isArchived === true) return "archived";
+  if (session.isArchived === false) return "active";
+  return "unknown";
 }
 
 function matchesProject(session: SelectionSession, selector: string): boolean {

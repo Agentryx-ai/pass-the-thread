@@ -22,7 +22,15 @@ export interface DbThreadRow {
   sandboxPolicy: string | null;
   approvalMode: string | null;
   reasoningEffort: string | null;
-  archived: boolean;
+  archived: boolean | null;
+  archivedAt: number | null;
+  archiveState: "active" | "archived" | "unknown";
+  archiveProvenance: string;
+}
+
+export interface CodexArchiveClassification {
+  state: "active" | "archived" | "unknown";
+  provenance: string;
 }
 
 export interface DbSelectOptions {
@@ -30,6 +38,60 @@ export interface DbSelectOptions {
   interactiveOnly?: boolean;
   /** Include archived threads (Desktop hides these by default). Default false. */
   includeArchived?: boolean;
+}
+
+function positiveSafeInteger(value: unknown): number | null {
+  if (typeof value === "bigint") {
+    return value > 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+  }
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function archiveColumns(archived: unknown, archivedAt: unknown): Pick<DbThreadRow,
+  "archived" | "archivedAt" | "archiveState" | "archiveProvenance"> {
+  if ((archived === 0 || archived === 0n) && archivedAt === null) {
+    return { archived: false, archivedAt: null, archiveState: "active", archiveProvenance: "codex-thread-index" };
+  }
+  const timestamp = positiveSafeInteger(archivedAt);
+  if ((archived === 1 || archived === 1n) && timestamp != null) {
+    return { archived: true, archivedAt: timestamp, archiveState: "archived", archiveProvenance: "codex-thread-index" };
+  }
+  return {
+    archived: null, archivedAt: null, archiveState: "unknown",
+    archiveProvenance: "codex-thread-index-invalid-archive-columns",
+  };
+}
+
+function canonicalExisting(value: string): string {
+  const resolved = path.resolve(value);
+  try { return fs.realpathSync.native(resolved); } catch { return resolved; }
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
+}
+
+export function reconcileCodexArchive(
+  codexHome: string,
+  rolloutPath: string,
+  row?: Pick<DbThreadRow, "archiveState" | "archiveProvenance">,
+): CodexArchiveClassification {
+  const candidate = canonicalExisting(rolloutPath);
+  const activeRoot = canonicalExisting(path.join(codexHome, "sessions"));
+  const archivedRoot = canonicalExisting(path.join(codexHome, "archived_sessions"));
+  const locationState = isWithin(activeRoot, candidate)
+    ? "active"
+    : isWithin(archivedRoot, candidate) ? "archived" : "unknown";
+  if (locationState === "unknown") {
+    return { state: "unknown", provenance: "codex-rollout-location-outside-canonical-roots" };
+  }
+  if (!row) return { state: locationState, provenance: "codex-rollout-location" };
+  if (row.archiveState === "unknown") return { state: "unknown", provenance: row.archiveProvenance };
+  if (row.archiveState !== locationState) {
+    return { state: "unknown", provenance: "codex-thread-index-rollout-location-conflict" };
+  }
+  return { state: locationState, provenance: "codex-thread-index+rollout-location" };
 }
 
 /** Locate the newest state DB: state_<n>.sqlite with the highest <n>. */
@@ -86,7 +148,7 @@ export function loadDesktopThreads(
       `source, ` +
       `COALESCE(recency_at_ms, updated_at_ms, updated_at) AS updatedAtMs, ` +
       `sandbox_policy AS sandboxPolicy, approval_mode AS approvalMode, ` +
-      `reasoning_effort AS reasoningEffort, archived AS archived ` +
+      `reasoning_effort AS reasoningEffort, archived AS archived, archived_at AS archivedAt ` +
       `FROM threads WHERE ${where.join(" AND ")} ` +
       `ORDER BY updatedAtMs DESC`;
 
@@ -103,7 +165,10 @@ export function loadDesktopThreads(
       sandboxPolicy: r.sandboxPolicy != null ? String(r.sandboxPolicy) : null,
       approvalMode: r.approvalMode != null ? String(r.approvalMode) : null,
       reasoningEffort: r.reasoningEffort != null ? String(r.reasoningEffort) : null,
-      archived: Number((r as unknown as { archived?: unknown }).archived ?? 0) === 1,
+      ...archiveColumns(
+        (r as unknown as { archived?: unknown }).archived,
+        (r as unknown as { archivedAt?: unknown }).archivedAt,
+      ),
     }));
   } catch {
     return null;
@@ -139,7 +204,7 @@ export function loadThreadsByIds(
       `name, first_user_message AS firstUserMessage, ` +
       `COALESCE(recency_at_ms, updated_at_ms, updated_at) AS updatedAtMs, ` +
       `sandbox_policy AS sandboxPolicy, approval_mode AS approvalMode, ` +
-      `reasoning_effort AS reasoningEffort, archived AS archived ` +
+      `reasoning_effort AS reasoningEffort, archived AS archived, archived_at AS archivedAt ` +
       `FROM threads WHERE id IN (${placeholders}) ${archClause} ORDER BY updatedAtMs DESC`;
     const rows = db.prepare(sql).all(...ids) as unknown as DbThreadRow[];
     return rows.map((r) => ({
@@ -154,7 +219,10 @@ export function loadThreadsByIds(
       sandboxPolicy: r.sandboxPolicy != null ? String(r.sandboxPolicy) : null,
       approvalMode: r.approvalMode != null ? String(r.approvalMode) : null,
       reasoningEffort: r.reasoningEffort != null ? String(r.reasoningEffort) : null,
-      archived: Number((r as unknown as { archived?: unknown }).archived ?? 0) === 1,
+      ...archiveColumns(
+        (r as unknown as { archived?: unknown }).archived,
+        (r as unknown as { archivedAt?: unknown }).archivedAt,
+      ),
     }));
   } catch {
     return null;

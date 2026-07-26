@@ -37,9 +37,22 @@ Calls and results are flat and paired by `call_id`, not nested.
 
 Not every rollout is a conversation in the sidebar. Sub-agent threads, `codex exec` automation runs and archived threads all live in the same directory. It resolves the list from Codex's own state, in this order:
 
-1. `~/.codex/.codex-global-state.json` — the sidebar's grouping, in one of two shapes. Older builds record `thread-project-assignments` (thread → project) plus `projectless-thread-ids`, which together *are* the membership. Current builds drop the assignment map: projects are registered under `local-projects` with `rootPaths`, and a thread belongs to whichever project's root contains its `cwd` (longest match), so membership comes from the index below and this file only supplies the names.
+1. `~/.codex/.codex-global-state.json` — the sidebar's grouping, in one of two shapes. Older builds record `thread-project-assignments` (thread → project) plus `projectless-thread-ids`, which together *are* the membership. Presence of even an empty valid assignment map selects this authoritative mode; absent thread ids remain unknown rather than being inferred from `cwd`. Current builds drop the assignment map: projects are registered under `local-projects` with `rootPaths`, and a thread belongs to whichever project's root contains its `cwd` (longest match), so membership comes from the index below and this file only supplies the names. Malformed membership substructures make otherwise valid JSON unusable instead of being coerced.
 2. `~/.codex/state_<n>.sqlite` — `threads` (`archived`, `rollout_path`, `title`, `name`, `first_user_message`, `cwd`, `source`, `recency_at_ms`) and `thread_spawn_edges` (parent → child). Used to drop archived and spawned threads, and to resolve each thread's rollout file.
 3. Rollout-file scan, applying the equivalent rules from `session_meta` (`parent_thread_id`, `source`), when neither is available.
+
+DB/rollout fallback inventory does not invent project membership. Scan output
+marks membership and provenance explicitly when global state is missing,
+unreadable, or unusable; any filter that needs that fact fails closed. Project
+roots use one canonical filesystem identity: `realpath` for existing paths and
+normalized absolute spelling for missing paths. Reading or planning never
+rewrites `.codex-global-state.json`, registers a project, or derives a duplicate
+display name.
+
+The rollout filename id, `session_meta.id`, and SQLite thread id have distinct
+roles. The adapter validates available joins and reports them as source rollout
+and native/index thread identities instead of assuming that similarly named ids
+are equal.
 
 ### Conversation names
 
@@ -65,6 +78,10 @@ planned. The importer never writes `goals_1.sqlite`; eligible live Goals are
 activated only through the separately fingerprinted app-server Goal RPC after
 thread registration.
 
+Idempotent readback binds the rollout path/hash and archive columns together:
+active requires `archived = 0` with null `archived_at`; archived requires
+`archived = 1` with a valid non-null `archived_at`. Any mismatch is a collision.
+
 Semantic mode emits human/model text and native tool traffic only for a
 contiguous parallel call batch from one assistant record/envelope followed by
 the exact result set in one distinct, direct-child user record/envelope. Native
@@ -80,8 +97,12 @@ Claude Desktop writes an auto-compact boundary followed by an
 `compacted.payload.replacement_history` and appends post-boundary items once.
 In semantic mode, planning fails if no summary is recoverable. Verbatim mode
 keeps the original compact records as inert archival context and does not claim
-native resume semantics. Both modes fail when the conservative active-context
-estimate is above the pinned safe limit.
+native resume semantics. Both modes fail when serialized active context exceeds
+the conservative pinned UTF-8 byte limit. This offline refusal check is named
+and reported in bytes; it does not compare source provider token counters with
+character/byte counts or claim to calculate a Codex token budget. Source
+compaction counters remain only in bridge/rollout provenance, and target
+`tokens_used` starts at zero.
 
 Private writes are enabled only when separate rollout, thread-index, archive
 (when selected), project-identity, and Goal (when selected) bindings resolve to
@@ -127,7 +148,7 @@ Observed on Windows and macOS; the Linux location follows Electron's convention 
 
 Only non-archived records are listed. The `<accountId>/<deviceId>` pair comes from `oauthAccount` in `~/.claude.json`; if that is missing it falls back to the directory with active records and the most recent activity. Existing records are never touched.
 
-`cliSessionId` is not a stable identity. Continuing an imported conversation makes Claude fork it into a session of its own and rewrite that field to point at the fork, after which the record no longer looks like one this tool wrote. `sessionId` — the record's own id, and its file name — does not change, so the import history remembers the records it wrote by that instead. A repointed record is Claude's conversation and is left alone; its transcript is at `projects/<projectKey>/<its cliSessionId>.jsonl`, which is where messages sent after the import will be.
+`cliSessionId` is not a stable identity. It is also not the wrapper `sessionId`: the former identifies the CLI transcript, while the latter identifies the Desktop wrapper/file. Continuing an imported conversation makes Claude fork it into a session of its own and rewrite `cliSessionId` to point at the fork, after which the record no longer looks like one this tool wrote. `sessionId` — the record's own id, and its file name — does not change, so the import history remembers the records it wrote by that instead. Inventory validates that the wrapper's CLI id agrees with every transcript record before semantic planning. A repointed record is Claude's conversation and is left alone; its transcript is at `projects/<projectKey>/<its cliSessionId>.jsonl`, which is where messages sent after the import will be.
 
 ### 2. Transcript (the content)
 

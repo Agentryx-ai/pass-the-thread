@@ -144,6 +144,126 @@ test("compacted replacement history is rendered after the active boundary", () =
   assert.ok(replacement > boundary);
 });
 
+test("semantic renderer rejects nonportable compact replacements while verbatim remains inert", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-empty-compact-"));
+  const id = "44444444-5555-4666-8777-888888888888";
+  const rolloutPath = path.join(root, "compact.jsonl");
+  const session: CodexSession = {
+    sessionId: id, rolloutPath, cwd: root, cwdOriginal: root, meta: {}, firstTsMs: 0, lastTsMs: 1,
+    items: [], model: null, messageCount: 0, title: "compact", source: "vscode", isChild: false, userMessageCount: 0,
+  };
+  const write = (replacement: unknown[]): ReturnType<typeof codexRolloutToBridgeBundle> => {
+    fs.writeFileSync(rolloutPath, [
+      JSON.stringify({ timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd: root } }),
+      JSON.stringify({ timestamp: "2026-07-25T10:00:01.000Z", type: "compacted", payload: { replacement_history: replacement } }),
+    ].join("\n") + "\n");
+    session.sourceContentSha256 = undefined;
+    const bundle = codexRolloutToBridgeBundle(session);
+    session.sourceContentSha256 = bundle.conversation.sourceContentSha256;
+    return bundle;
+  };
+  for (const replacement of [
+    [],
+    [{ type: "compaction" }],
+    [{ future: "malformed" }],
+    [{ type: "message", role: "user", content: [{ type: "input_text", text: "   " }] }],
+  ]) {
+    assert.throws(() => renderForwardClaudeTranscript(session, write(replacement), {
+      renderMode: "semantic", goalMode: "skip",
+    }), /no safely renderable replacement content|unknown or malformed content/);
+  }
+  const verbatim = write([{ future: "malformed" }]);
+  assert.doesNotThrow(() => renderForwardClaudeTranscript(session, verbatim, {
+    renderMode: "verbatim", goalMode: "skip",
+  }));
+});
+
+test("only the latest Codex compact boundary and replacement become portable", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-latest-compact-"));
+  const id = "55555555-6666-4777-8888-999999999999";
+  const rolloutPath = path.join(root, "compact.jsonl");
+  fs.writeFileSync(rolloutPath, [
+    { timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd: root } },
+    { timestamp: "2026-07-25T10:00:01.000Z", type: "compacted", payload: { replacement_history: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "obsolete replacement" }] },
+    ] } },
+    { timestamp: "2026-07-25T10:00:02.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "before latest" }] } },
+    { timestamp: "2026-07-25T10:00:03.000Z", type: "compacted", payload: { replacement_history: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "latest replacement" }] },
+    ] } },
+    { timestamp: "2026-07-25T10:00:04.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "post boundary once" }] } },
+  ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+  const session: CodexSession = {
+    sessionId: id, rolloutPath, cwd: root, cwdOriginal: root, meta: {}, firstTsMs: 0, lastTsMs: 4,
+    items: [], model: null, messageCount: 3, title: "latest compact", source: "vscode", isChild: false, userMessageCount: 2,
+  };
+  const bundle = codexRolloutToBridgeBundle(session);
+  session.sourceContentSha256 = bundle.conversation.sourceContentSha256;
+  const lines = renderForwardClaudeTranscript(session, bundle, { renderMode: "semantic", goalMode: "skip" });
+  const rendered = JSON.stringify(lines);
+  assert.equal(lines.filter((line) => line.type === "system" && line.subtype === "compact_boundary").length, 1);
+  assert.equal(rendered.includes("obsolete replacement"), false);
+  assert.equal(rendered.match(/latest replacement/g)?.length, 1);
+  assert.equal(rendered.match(/post boundary once/g)?.length, 1);
+});
+
+test("a compact replacement tool pair wins over the same pre-compact call id", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-compact-tool-scope-"));
+  const id = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+  const rolloutPath = path.join(root, "compact.jsonl");
+  fs.writeFileSync(rolloutPath, [
+    { timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd: root } },
+    { timestamp: "2026-07-25T10:00:01.000Z", type: "response_item", payload: { type: "function_call", call_id: "reused", name: "old", arguments: "{}" } },
+    { timestamp: "2026-07-25T10:00:02.000Z", type: "response_item", payload: { type: "function_call_output", call_id: "reused", output: "old result" } },
+    { timestamp: "2026-07-25T10:00:03.000Z", type: "compacted", payload: { replacement_history: [
+      { type: "function_call", call_id: "reused", name: "latest", arguments: "{}" },
+      { type: "function_call_output", call_id: "reused", output: "latest result" },
+    ] } },
+  ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+  const session: CodexSession = {
+    sessionId: id, rolloutPath, cwd: root, cwdOriginal: root, meta: {}, firstTsMs: 0, lastTsMs: 3,
+    items: [], model: null, messageCount: 0, title: "compact tool", source: "vscode", isChild: false, userMessageCount: 0,
+  };
+  const bundle = codexRolloutToBridgeBundle(session);
+  session.sourceContentSha256 = bundle.conversation.sourceContentSha256;
+  const lines = renderForwardClaudeTranscript(session, bundle, { renderMode: "semantic", goalMode: "skip" });
+  const rendered = JSON.stringify(lines);
+  assert.equal(rendered.match(/"type":"tool_use"/g)?.length, 1);
+  assert.equal(rendered.match(/"type":"tool_result"/g)?.length, 1);
+  assert.match(rendered, /"name":"latest"/);
+  assert.doesNotMatch(rendered, /"name":"old"/);
+  assert.match(rendered, /invalid historical tool call/);
+});
+
+test("the latest compact replacement tool pair wins across repeated compact snapshots", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-latest-compact-tool-"));
+  const id = "77777777-8888-4999-8aaa-cccccccccccc";
+  const rolloutPath = path.join(root, "compact.jsonl");
+  const compact = (timestamp: string, name: string, output: string) => ({
+    timestamp, type: "compacted", payload: { replacement_history: [
+      { type: "function_call", call_id: "reused", name, arguments: "{}" },
+      { type: "function_call_output", call_id: "reused", output },
+    ] },
+  });
+  fs.writeFileSync(rolloutPath, [
+    { timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id, cwd: root } },
+    compact("2026-07-25T10:00:01.000Z", "obsolete", "obsolete result"),
+    compact("2026-07-25T10:00:02.000Z", "latest", "latest result"),
+  ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+  const session: CodexSession = {
+    sessionId: id, rolloutPath, cwd: root, cwdOriginal: root, meta: {}, firstTsMs: 0, lastTsMs: 2,
+    items: [], model: null, messageCount: 0, title: "latest compact tool", source: "vscode", isChild: false, userMessageCount: 0,
+  };
+  const bundle = codexRolloutToBridgeBundle(session);
+  session.sourceContentSha256 = bundle.conversation.sourceContentSha256;
+  const lines = renderForwardClaudeTranscript(session, bundle, { renderMode: "semantic", goalMode: "skip" });
+  const rendered = JSON.stringify(lines);
+  assert.equal(rendered.match(/"type":"tool_use"/g)?.length, 1);
+  assert.equal(rendered.match(/"type":"tool_result"/g)?.length, 1);
+  assert.match(rendered, /"name":"latest"/);
+  assert.doesNotMatch(rendered, /obsolete/);
+});
+
 test("verbatim renderer preserves exact canonical text as one inert payload", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "forward-verbatim-"));
   const { session, exact } = fixture(root);
@@ -180,7 +300,9 @@ test("renderer fails closed on oversized active context but honors the last comp
   }), /active context.*maximum is 1000000/);
 
   write([...records,
-    { timestamp: "2026-07-25T10:00:02.000Z", type: "compacted", payload: { replacement_history: [] } },
+    { timestamp: "2026-07-25T10:00:02.000Z", type: "compacted", payload: { replacement_history: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "compact summary" }] },
+    ] } },
     { timestamp: "2026-07-25T10:00:03.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "resume here" }] } },
   ]);
   session.sourceContentSha256 = undefined;

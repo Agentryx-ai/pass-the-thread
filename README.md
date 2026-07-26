@@ -81,15 +81,16 @@ threadpass plan --archive active --project-scope existing-targets \
   --out import-plan.json
 ```
 
-There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, date bounds, and an explicit `--limit`. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/access records and superseded Goal events always remain inert. A separately identified authoritative active Goal is restored by default in either render mode; `--goal-mode skip` keeps it as history without live activation.
+There is no implicit 30-day or 50-session cap. Filters include exact sessions, projects, archive state, existing-target projects, inclusive date bounds, and an explicit `--limit`. `existing-targets` means the canonical target project/group/root already exists; it does not mean that the exact target conversation exists. Plans report those facts separately as `targetProjectExists` and `targetConversationExists` (plus an exact/collision state). Unknown project membership, archive state, or activity time stays visible in an `all`/unfiltered inventory and fails closed if a requested filter needs it. Every selected source revision remains byte-exact in the bridge sidecar. `semantic` (default) renders supported meaning into the target; `verbatim` renders the entire canonical source as inert historical text. Historical task/access records and superseded Goal events always remain inert. A separately identified authoritative active Goal is restored by default in either render mode; `--goal-mode skip` keeps it as history without live activation.
 
 Applying a reverse plan is intentionally strict and Windows-only for this first target. It requires Codex Desktop to be closed, the exact saved plan digest, and the pinned [26.721.41059 evidence manifest](reference/codex-desktop/26.721.41059/manifest.json). The loader re-hashes the installed `app.asar` and `codex.exe`; a copied manifest by itself is not accepted as live-version evidence. Apply probes once under the lock, performs Goal/journal/sidecar setup, then full-hashes the active Appx identity again immediately before the first Codex target mutation. A mismatch fails closed. That second probe is the exact batch-start support snapshot; updates during the subsequent multi-session batch are outside atomicity, so artifacts are not re-hashed per session. Unknown/new builds can still be scanned and planned, but receive no private-write capability. Research or dry-run planning for another installed build requires a user-supplied provenance manifest that binds those live artifacts; that manifest does not itself enable writes. The plan independently binds rollout, thread-index, archive, project-identity, and Goal capabilities. `apply --dry-run` writes nothing, reports static blockers, and names live gates it cannot prove without applying. See [CLI](docs/CLI.md#experimental-bidirectional-matrix).
 
 Semantic Claude history is only made resumable when its compact summary can be
 recovered into a nonempty Codex `replacement_history`; otherwise planning fails
 closed. Verbatim mode instead keeps compact records as inert archival context
-without claiming native resume semantics. Both modes enforce the conservative
-active-context limit. Project roots are canonicalized before registration so
+without claiming native resume semantics. Both modes enforce a conservative
+serialized UTF-8 byte limit; the offline check does not claim to calculate
+provider tokens. Project roots are canonicalized before registration so
 equivalent path spellings do not create a second Codex project identity.
 
 Forward plans (`--direction codex-to-claude`) are now applicable too. They bind
@@ -101,7 +102,9 @@ an interrupted uncommitted batch can be reconciled or rolled back with
 `threadpass recover --operation <id>`. Unsupported protocol, world/access state
 and unknown records remain in the canonical sidecar instead of leaking as raw
 chat; task notifications are readable inert metadata, and archived state is
-preserved in the Claude wrapper.
+preserved in the Claude wrapper. Semantic compaction activates only the latest
+portable boundary and requires its replacement to contain safely renderable,
+nonempty content; earlier boundaries remain sidecar-only.
 
 ## How it works
 
@@ -112,7 +115,7 @@ Claude Desktop keeps a conversation in two places, and needs both to show it:
 | Session record | `<app-data>/Claude/claude-code-sessions/<account>/<device>/local_<uuid>.json` | Builds the conversation list. Points at a transcript by `cliSessionId` and `cwd`. |
 | Transcript | `~/.claude/projects/<encoded-cwd>/<cliSessionId>.jsonl` | The conversation itself. |
 
-Writing only a transcript leaves it invisible, so this writes both.
+The wrapper `sessionId` and transcript/CLI `cliSessionId` are distinct identities and are validated separately. Codex plans likewise label the source rollout id, native/index thread id, and deterministic target thread id by role even when native evidence makes two values equal. Writing only a transcript leaves it invisible, so this writes both.
 
 ```
 ~/.codex/sessions/**/rollout-*.jsonl

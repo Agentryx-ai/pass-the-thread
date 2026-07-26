@@ -14,7 +14,8 @@ import { buildCodexRollout41059 } from "../src/compat/codex/v26_721_41059.ts";
 import {
   acquireCodexTargetLock,
   deterministicThreadId,
-  estimatedActiveTokens,
+  estimatedActiveBytes,
+  inspectCodexTargetPlan,
   planCodexTarget,
   releaseCodexTargetLock,
 } from "../src/codex-target.ts";
@@ -24,6 +25,7 @@ import {
   recoverCreatedFiles,
   updateOperationJournal,
 } from "../src/operation-journal.ts";
+import { registerCodexThread41059 } from "../src/codex-target-db.ts";
 import { createHash } from "node:crypto";
 
 const EVIDENCE = {
@@ -158,17 +160,17 @@ test("target planning is deterministic and has no implicit 50-session behavior",
   assert.equal(a.threadId, deterministicThreadId("claude-1", "a".repeat(64)));
 });
 
-test("target planning refuses a source whose active compacted context cannot resume", () => {
+test("target planning uses an honest UTF-8 byte cap and preserves source token counters only as metadata", () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-budget-"));
   const convo = {
     cwd: "C:\\repo", title: "too large", createdAt: "2026-07-26T00:00:00.000Z",
-    messages: [{ role: "user" as const, text: "summary" }],
-    compaction: { activeMessageIndex: 0, postTokens: 670_194, summary: "resumable summary" },
+    messages: [{ role: "user" as const, text: "x".repeat(240_000) }],
+    compaction: { activeMessageIndex: 0, postTokens: 2_000, summary: "resumable summary" },
   };
-  assert.ok(estimatedActiveTokens(convo) > 670_194);
+  assert.ok(estimatedActiveBytes(convo) > 230_000);
   assert.throws(
     () => planCodexTarget(home, path.join(home, "state_5.sqlite"), "s", "b".repeat(64), convo),
-    /safe limit/,
+    /UTF-8 bytes.*no provider token count is inferred/,
   );
 });
 
@@ -177,14 +179,23 @@ test("post-compaction messages count toward the resume budget", () => {
     ...sampleConversation(),
     messages: [{ role: "user" as const, text: "x".repeat(60_000) }],
     items: [{ kind: "message" as const, role: "user" as const, text: "x".repeat(60_000) }],
-    compaction: { activeItemIndex: 0, postTokens: 220_000 },
+    compaction: { activeItemIndex: 0, postTokens: 2_000, summary: "summary" },
   };
-  assert.ok(estimatedActiveTokens(conversation) > 230_000);
+  assert.ok(estimatedActiveBytes(conversation) > 60_000);
 });
 
-test("resume-budget bound is conservative for CJK and emoji", () => {
+test("resume-budget unit is UTF-8 bytes for CJK and emoji", () => {
   const cjk = { ...sampleConversation(), messages: [{ role: "user" as const, text: "한😀".repeat(20_000) }] };
-  assert.ok(estimatedActiveTokens(cjk) >= Buffer.byteLength(JSON.stringify(cjk.messages), "utf8"));
+  assert.equal(estimatedActiveBytes(cjk), Buffer.byteLength(JSON.stringify(cjk.messages), "utf8"));
+});
+
+test("compaction bounds and source counters fail closed", () => {
+  assert.throws(() => estimatedActiveBytes({
+    ...sampleConversation(), compaction: { activeItemIndex: 2, summary: "summary" },
+  }), /outside 0\.\.1/);
+  assert.throws(() => estimatedActiveBytes({
+    ...sampleConversation(), compaction: { activeItemIndex: 0, postTokens: -1, summary: "summary" },
+  }), /source post-compaction token counter/);
 });
 
 test("a compact boundary before the first item is still serialized", () => {
@@ -204,6 +215,78 @@ test("a compact boundary without replacement history fails closed before target 
     "e".repeat(64),
     { ...sampleConversation(), compaction: { activeItemIndex: 0, postTokens: 100 } },
   ), /no replacement summary/);
+});
+
+test("archive status binds rollout location and indexed archived readback", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-archive-"));
+  const dbPath = path.join(home, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE threads (
+    id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT,
+    model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT,
+    tokens_used INTEGER, has_user_event INTEGER, archived INTEGER, archived_at INTEGER,
+    cli_version TEXT, first_user_message TEXT, memory_mode TEXT, created_at_ms INTEGER,
+    updated_at_ms INTEGER, preview TEXT, recency_at INTEGER, recency_at_ms INTEGER, history_mode TEXT
+  )`);
+  db.close();
+  const plan = planCodexTarget(home, dbPath, "archived-source", "f".repeat(64), sampleConversation(), true);
+  assert.equal(path.dirname(plan.rolloutPath), path.join(home, "archived_sessions"));
+  registerCodexThread41059(dbPath, {
+    id: plan.threadId, rolloutPath: plan.rolloutPath, cwd: plan.conversation.cwd,
+    title: plan.conversation.title, createdAtMs: Date.parse(plan.conversation.createdAt),
+    updatedAtMs: Date.parse(plan.conversation.createdAt), archived: plan.archived,
+    firstUserMessage: "hello", preview: "hello",
+  });
+  const readback = new DatabaseSync(dbPath, { readOnly: true });
+  const row = readback.prepare("SELECT rollout_path, archived, archived_at, tokens_used FROM threads WHERE id = ?")
+    .get(plan.threadId) as { rollout_path: string; archived: number; archived_at: number | null; tokens_used: number };
+  readback.close();
+  assert.equal(row.rollout_path, plan.rolloutPath);
+  assert.equal(row.archived, 1);
+  assert.ok(row.archived_at != null);
+  assert.equal(row.tokens_used, 0, "source provider usage is not copied into target usage");
+});
+
+test("target inspection binds active and archived database state exactly", () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-archive-inspect-"));
+  const dbPath = path.join(home, "state_5.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE threads (
+    id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER, source TEXT,
+    model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT,
+    tokens_used INTEGER, has_user_event INTEGER, archived INTEGER, archived_at INTEGER,
+    cli_version TEXT, first_user_message TEXT, memory_mode TEXT, created_at_ms INTEGER,
+    updated_at_ms INTEGER, preview TEXT, recency_at INTEGER, recency_at_ms INTEGER, history_mode TEXT
+  )`);
+  db.close();
+
+  const register = (archived: boolean) => {
+    const plan = planCodexTarget(home, dbPath, archived ? "archived" : "active", (archived ? "a" : "b").repeat(64), sampleConversation(), archived);
+    fs.mkdirSync(path.dirname(plan.rolloutPath), { recursive: true });
+    fs.writeFileSync(plan.rolloutPath, plan.serializedRollout);
+    registerCodexThread41059(dbPath, {
+      id: plan.threadId, rolloutPath: plan.rolloutPath, cwd: plan.conversation.cwd,
+      title: plan.conversation.title, createdAtMs: Date.parse(plan.conversation.createdAt),
+      updatedAtMs: Date.parse(plan.conversation.createdAt), archived,
+      firstUserMessage: "hello", preview: "hello",
+    });
+    return plan;
+  };
+  const active = register(false);
+  const archived = register(true);
+  assert.equal(inspectCodexTargetPlan(active), "already-applied");
+  assert.equal(inspectCodexTargetPlan(archived), "already-applied");
+
+  const mutate = new DatabaseSync(dbPath);
+  mutate.prepare("UPDATE threads SET archived = 1, archived_at = 1 WHERE id = ?").run(active.threadId);
+  assert.equal(inspectCodexTargetPlan(active), "collision");
+  mutate.prepare("UPDATE threads SET archived = 0, archived_at = 1 WHERE id = ?").run(active.threadId);
+  assert.equal(inspectCodexTargetPlan(active), "collision");
+  mutate.prepare("UPDATE threads SET archived_at = NULL WHERE id = ?").run(archived.threadId);
+  assert.equal(inspectCodexTargetPlan(archived), "collision");
+  mutate.prepare("UPDATE threads SET archived = 0, archived_at = NULL WHERE id = ?").run(archived.threadId);
+  assert.equal(inspectCodexTargetPlan(archived), "collision");
+  mutate.close();
 });
 
 test("operation journal can recover uncommitted files but not committed operations", () => {
