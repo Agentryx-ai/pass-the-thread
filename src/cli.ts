@@ -39,6 +39,7 @@ import {
 } from "./claude-desktop-target.ts";
 import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
 import { classifyTargetContent, overwriteEligible, type TargetContentVerdict } from "./continued.ts";
+import type { TargetState, TranscriptLocation } from "./claude-target.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
@@ -51,6 +52,43 @@ import {
   claudeGoalHistoryIdentity,
 } from "./claude-goal-target.ts";
 import { applyBudget } from "./repair.ts";
+
+/**
+ * The verdict to open the overwrite decision with, before any fork is checked.
+ *
+ * `location.state === "absent"` is meant to mean nothing is at `targetPath` at
+ * all, in which case there is nothing to read and "unchanged" can be assumed
+ * outright. But `locateTranscriptFrom` reaches "absent" by scanning every
+ * Claude project directory for the session id, and swallows any
+ * `readdirSync`/`statSync` failure — an EPERM from a virus scanner touching
+ * `.claude/projects`, an EMFILE under fd pressure — into an empty scan, which
+ * reports "absent" even when a transcript sits right at `targetPath`. `state`
+ * is the independent check: `inspectTarget`'s own `existsSync` on that exact
+ * path. Only when both agree nothing is there is "unchanged" synthesized
+ * without reading the file; otherwise the file is classified (or, if it turns
+ * out unreadable after all, `classifyTargetContent` itself returns
+ * `undecidable` — never a silently assumed "unchanged").
+ */
+export function initialTargetVerdict(
+  location: Pick<TranscriptLocation, "state">,
+  state: TargetState,
+  targetPath: string,
+  importedAtMs: number | undefined | null,
+  expectedSha256: string | null,
+): TargetContentVerdict {
+  if (location.state === "absent" && state === "absent") {
+    return {
+      classification: "unchanged",
+      continuation: null,
+      assistantLines: 0,
+      incidentalLines: 0,
+      undecidable: null,
+      markerLines: 0,
+      sha256Matches: null,
+    };
+  }
+  return classifyTargetContent(targetPath, importedAtMs, { expectedSha256 });
+}
 
 export const LEGACY_HELP = `threadpass — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
 
@@ -490,19 +528,13 @@ export function main(argv: string[]): number {
         workspaceDir != null
           ? ourRecords(workspaceDir, prior?.recordSessionIds ?? [], s.sessionId)
           : { current: null, repointed: [] };
-      let verdict: TargetContentVerdict = location.state === "absent"
-        ? {
-          classification: "unchanged",
-          continuation: null,
-          assistantLines: 0,
-          incidentalLines: 0,
-          undecidable: null,
-          markerLines: 0,
-          sha256Matches: null,
-        }
-        : classifyTargetContent(targetPath, prior?.importedAtMs, {
-          expectedSha256: prior?.targetSha256 ?? null,
-        });
+      let verdict: TargetContentVerdict = initialTargetVerdict(
+        location,
+        state,
+        targetPath,
+        prior?.importedAtMs,
+        prior?.targetSha256 ?? null,
+      );
       let verdictIn = targetPath;
       for (const fork of owned.repointed) {
         if (verdict.classification === "modified") break;

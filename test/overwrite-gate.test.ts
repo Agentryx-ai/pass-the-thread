@@ -16,6 +16,7 @@ import { createHash } from "node:crypto";
 
 import { classifyTargetContent, overwriteEligible, type TargetContentClass } from "../src/continued.ts";
 import {
+  inspectTarget,
   locateTranscript,
   locateTranscriptFrom,
   priorImportsFrom,
@@ -26,6 +27,7 @@ import { canonicalProjectIdentity, sameProject } from "../src/project-identity.t
 import { buildImportPlan } from "../src/import-plan.ts";
 import { applyForwardSessions, type ForwardSessionApplyPlan } from "../src/claude-forward-target.ts";
 import { encodeProjectDir } from "../src/paths.ts";
+import { initialTargetVerdict } from "../src/cli.ts";
 
 const IMPORTED_AT_MS = Date.parse("2026-07-13T10:00:00.000Z");
 const BEFORE = "2026-07-13T09:59:00.000Z";
@@ -234,6 +236,121 @@ test("a message of the user's outweighs a line that cannot be placed", (t) => {
   const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
   assert.equal(verdict.classification, "modified", "a torn line must not hide a real turn");
   assert.equal(verdict.continuation?.firstText, "still mine");
+});
+
+// ---------------------------------------------------------------------------
+// A blanket timestamp rule catches a line of ANY type stamped after the
+// import, rather than enumerating which types can carry the user's words —
+// enumeration is exactly what let a `queue-operation` enqueue (the user's
+// typed message, timestamped, written the instant they submit it — before any
+// `user` line exists for it) slip through as "unchanged".
+// ---------------------------------------------------------------------------
+
+test("a queue-operation enqueue after the import is modification, not unchanged", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [
+    importedLine(),
+    { type: "mode", mode: "default" },
+    {
+      type: "queue-operation",
+      operation: "enqueue",
+      timestamp: AFTER,
+      sessionId: "s",
+      content: "말하는 설정이란게 뭐 모델인지 steer인지 뭔지",
+    },
+  ]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "modified");
+  assert.equal(overwriteEligible(verdict), false, "the only record of what the user typed must not be discarded");
+});
+
+test("a queued-command attachment after the import is modification, not unchanged", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [
+    importedLine(),
+    {
+      type: "attachment",
+      timestamp: AFTER,
+      attachment: { type: "queued_command", prompt: "run the tests" },
+    },
+  ]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "modified");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("any unrecognized line stamped after the import is modification, not unchanged", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [
+    importedLine(),
+    { type: "some-future-line-type-nobody-enumerated-yet", timestamp: AFTER, value: "whatever" },
+  ]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "modified");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("a bare local-time timestamp is untrustworthy, not a usable stamp", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  // No trailing Z or numeric offset: Date.parse would read this as local time,
+  // which on a UTC+9 machine could shift it 9 hours earlier and hide a real
+  // continuation rather than flag it. It must be treated as unplaceable.
+  writeTranscriptFile(target, [importedLine(), typedLine("mine", "2026-07-25T12:00:00.000")]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "undecidable");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+// ---------------------------------------------------------------------------
+// `location.state === "absent"` must not be trusted blindly: the directory
+// scan behind it swallows its own read errors into an empty result, which can
+// report "absent" for a transcript that is actually sitting at `targetPath`.
+// ---------------------------------------------------------------------------
+
+test("a file that exists is not synthesized as unchanged just because the location scan reports absent", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  // Content that, if read, would be MODIFIED (a real continuation) — chosen so
+  // that a wrongly-synthesized "unchanged" verdict is unambiguously wrong here.
+  const sha = writeTranscriptFile(target, [importedLine(), typedLine("still here")]);
+  assert.equal(inspectTarget(target, sha), "ours", "the file genuinely exists");
+
+  // Simulate what `locateTranscriptFrom` reports when its directory scan
+  // failed and was swallowed to an empty result: "absent", despite the file
+  // being right there at targetPath.
+  const verdict = initialTargetVerdict(
+    { state: "absent" },
+    inspectTarget(target, sha),
+    target,
+    IMPORTED_AT_MS,
+    sha,
+  );
+
+  assert.notEqual(verdict.classification, "unchanged", "a live continuation must never be synthesized away");
+  assert.equal(verdict.classification, "modified");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("initialTargetVerdict still synthesizes unchanged when nothing is genuinely there", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "gone.jsonl");
+
+  const verdict = initialTargetVerdict({ state: "absent" }, "absent", target, IMPORTED_AT_MS, null);
+
+  assert.equal(verdict.classification, "unchanged");
+  assert.ok(overwriteEligible(verdict));
 });
 
 // ---------------------------------------------------------------------------

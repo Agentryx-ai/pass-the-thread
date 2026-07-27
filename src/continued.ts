@@ -125,6 +125,18 @@ export function classifyTargetContent(
   // A line that cannot be placed does not stop the scan: whatever else the file
   // holds is still worth finding, and a message of the user's outweighs it.
   let unplaceable: string | null = null;
+  // Lines of a type this function does not otherwise recognise, but that carry a
+  // trustworthy post-import timestamp. Enumerating "the types that can hold user
+  // text" is what let a real loss through: `queue-operation` records the user's
+  // typed message, timestamped, the instant they submit it — before any `user`
+  // line exists for it — and was being skipped by a `type !== "user"` check the
+  // same shape as the one below. `attachment` (queued-command prompts),
+  // `ai-title`, `permission-mode` and others carry the same risk. Rather than
+  // name each one, anything stamped after the import counts, whatever it is
+  // called: we cannot show it holds nothing of the user's, so it is not
+  // something to write over. `mode` needs no exception — every `mode` line on
+  // disk is unstamped, so it can never cross the timestamp check below.
+  let unrecognizedStamped = 0;
   const lines = raw.split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
@@ -147,11 +159,17 @@ export function classifyTargetContent(
       markerLines += 1;
       continue;
     }
-    // Only conversation lines can carry a message. Summaries, system notices and
-    // file-history snapshots are Claude's bookkeeping and are often unstamped.
-    if (rec.type !== "user" && rec.type !== "assistant") continue;
-    const at = typeof rec.timestamp === "string" ? Date.parse(rec.timestamp) : Number.NaN;
-    if (Number.isNaN(at)) {
+    if (rec.type !== "user" && rec.type !== "assistant") {
+      // Not a conversation line — Claude's bookkeeping, or an out-of-band record
+      // like `queue-operation`. Most of it (like `mode`) is unstamped and says
+      // nothing; whatever does carry a timestamp after the import is treated as
+      // evidence of its own, per the note above.
+      const stamp = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
+      if (stamp != null && stamp > importedAtMs + 1000) unrecognizedStamped += 1;
+      continue;
+    }
+    const at = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
+    if (at == null) {
       unplaceable ??= `a ${rec.type} line at ${index + 1} of ${targetPath} has no usable timestamp`;
       continue;
     }
@@ -178,14 +196,20 @@ export function classifyTargetContent(
   }
 
   const continuation = turns > 0 ? { turns, firstText, firstAtMs } : null;
-  if (turns === 0 && assistantLines === 0 && markerLines === 0 && unplaceable != null) {
+  if (
+    turns === 0 && assistantLines === 0 && markerLines === 0 && unrecognizedStamped === 0
+    && unplaceable != null
+  ) {
     return { ...undecided(unplaceable), incidentalLines };
   }
   // A marker cannot say what was done, only that something was, so it settles
   // the question the same way a turn does: this is not a transcript to write over.
-  const classification: TargetContentClass = turns > 0 || assistantLines > 0 || markerLines > 0
-    ? "modified"
-    : incidentalLines > 0 ? "trivial" : "unchanged";
+  // A stamped line of an unrecognised type settles it the same way: it might be
+  // bookkeeping, but it might be the only record of something the user typed.
+  const classification: TargetContentClass =
+    turns > 0 || assistantLines > 0 || markerLines > 0 || unrecognizedStamped > 0
+      ? "modified"
+      : incidentalLines > 0 ? "trivial" : "unchanged";
   return { classification, continuation, assistantLines, incidentalLines, undecidable: null, markerLines, sha256Matches };
 }
 
@@ -240,6 +264,21 @@ function isAuthored(rec: AnyLine): boolean {
   const content = rec.message?.content;
   if (typeof content === "string" && content.startsWith("<local-command-stdout>")) return false;
   return true;
+}
+
+/**
+ * Parse a timestamp only when it carries an explicit UTC offset (a trailing
+ * `Z` or a `±HH:MM` suffix). `Date.parse` accepts a bare local date-time too,
+ * interpreting it in the machine's own timezone — on a UTC+9 machine that
+ * shifts a stamp up to 9 hours earlier, which could move a real post-import
+ * continuation back before `importedAtMs` and let it be skipped rather than
+ * flagged. Every stamp this tool and Claude write carries `Z`; anything else is
+ * untrustworthy, so it is treated as no timestamp at all rather than guessed at.
+ */
+function parseStrictTimestamp(value: string): number | null {
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : at;
 }
 
 /** Text the user typed, from either shape Claude writes for a user message. */
