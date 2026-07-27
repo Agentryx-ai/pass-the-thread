@@ -163,19 +163,42 @@ export function classifyTargetContent(
       // Not a conversation line — Claude's bookkeeping, or an out-of-band record
       // like `queue-operation`. Most of it (like `mode`) is unstamped and says
       // nothing; whatever does carry a timestamp after the import is treated as
-      // evidence of its own, per the note above.
-      const stamp = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
-      if (stamp != null && stamp > importedAtMs + 1000) unrecognizedStamped += 1;
+      // evidence of its own, per the note above. A line with NO `timestamp`
+      // property at all is the ordinary unstamped-bookkeeping case (`mode`,
+      // `ai-title`, `permission-mode`, `bridge-session`, ...) and stays inert.
+      // A line that DOES carry a `timestamp` but whose value cannot be placed —
+      // not a string, or a string in a format we do not trust to parse — is
+      // exactly as untrustworthy as one we cannot read the type of: we cannot
+      // show it holds nothing of the user's, so it is not something to write
+      // over.
+      if (rec.timestamp !== undefined) {
+        const stamp = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
+        if (stamp != null) {
+          if (stamp > importedAtMs + 1000) unrecognizedStamped += 1;
+        } else {
+          unplaceable ??=
+            `a ${String(rec.type)} line at ${index + 1} of ${targetPath} carries a timestamp that could not be placed`;
+        }
+      }
       continue;
     }
-    const at = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
-    if (at == null) {
+    // A `user`/`assistant` line whose timestamp is a string we cannot strictly
+    // parse (no explicit offset, an unfamiliar format, ...) is still known to be
+    // a turn somebody typed or a reply Claude wrote — unlike an unrecognized
+    // type, its authorship is not in question, only its clock. We cannot show
+    // it was written before the import, so it is treated the same as a stamp we
+    // can place after it, just without a reliable `firstAtMs`. Only a line with
+    // no usable timestamp at all (missing, or not a string) is truly unplaceable.
+    const hasTimestamp = typeof rec.timestamp === "string";
+    const at = hasTimestamp ? parseStrictTimestamp(rec.timestamp as string) : null;
+    if (!hasTimestamp) {
       unplaceable ??= `a ${rec.type} line at ${index + 1} of ${targetPath} has no usable timestamp`;
       continue;
     }
     // A second's slack: our own lines are stamped from Codex and are far older,
-    // so this only guards against clock jitter around the write itself.
-    if (at <= importedAtMs + 1000) continue;
+    // so this only guards against clock jitter around the write itself. Only a
+    // stamp we could actually place is eligible to be skipped as pre-import.
+    if (at != null && at <= importedAtMs + 1000) continue;
 
     if (rec.type === "assistant") {
       assistantLines += 1;

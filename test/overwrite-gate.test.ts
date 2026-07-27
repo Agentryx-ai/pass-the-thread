@@ -299,17 +299,86 @@ test("any unrecognized line stamped after the import is modification, not unchan
   assert.equal(overwriteEligible(verdict), false);
 });
 
-test("a bare local-time timestamp is untrustworthy, not a usable stamp", (t) => {
+// ---------------------------------------------------------------------------
+// DEFECT 1: an unrecognized-type line that HAS a `timestamp` but whose value
+// cannot be placed must not be silently ignored — it must be treated the same
+// as a line whose type is unreadable: not something to write over. Only a
+// line with NO `timestamp` property at all (the ordinary unstamped-bookkeeping
+// case: `mode`, `ai-title`, `permission-mode`, `bridge-session`, ...) may stay
+// inert.
+// ---------------------------------------------------------------------------
+
+function queueOperation(timestamp: unknown): Record<string, unknown> {
+  return {
+    type: "queue-operation",
+    operation: "enqueue",
+    timestamp,
+    sessionId: "s",
+    content: "말하는 설정이란게 뭐 모델인지 steer인지 뭔지",
+  };
+}
+
+test("an unrecognized-type line with a +0900 (no colon) offset is not overwrite-eligible", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [importedLine(), queueOperation("2026-07-25T12:00:00.000+0900")]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.notEqual(verdict.classification, "unchanged");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("an unrecognized-type line with a lowercase z is not overwrite-eligible", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [importedLine(), queueOperation("2026-07-25t12:00:00.000z")]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.notEqual(verdict.classification, "unchanged");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("an unrecognized-type line with a numeric (non-string) timestamp is not overwrite-eligible", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  writeTranscriptFile(target, [importedLine(), queueOperation(Date.parse(AFTER))]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.notEqual(verdict.classification, "unchanged");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
+test("an unrecognized-type line with NO timestamp property at all stays unchanged", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  // The 22-session / 13349-`mode`-line regression guard: bookkeeping with no
+  // `timestamp` property must keep classifying `unchanged`, or every session
+  // currently eligible for re-import becomes undecidable and re-import blocks.
+  writeTranscriptFile(target, [importedLine(), { type: "mode", mode: "default" }]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "unchanged");
+  assert.ok(overwriteEligible(verdict));
+});
+
+test("a bare local-time timestamp is untrustworthy, but the turn it stamps is still real", (t) => {
   const root = scratch(t);
   const target = path.join(root, "session.jsonl");
   // No trailing Z or numeric offset: Date.parse would read this as local time,
   // which on a UTC+9 machine could shift it 9 hours earlier and hide a real
-  // continuation rather than flag it. It must be treated as unplaceable.
+  // continuation rather than flag it. The clock cannot be trusted, but the line
+  // is still a `user` line nobody but the user could have written — it must
+  // settle as `modified` (never forceable), not merely `undecidable` (forceable
+  // with --force/--allow-overwrite).
   writeTranscriptFile(target, [importedLine(), typedLine("mine", "2026-07-25T12:00:00.000")]);
 
   const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
 
-  assert.equal(verdict.classification, "undecidable");
+  assert.equal(verdict.classification, "modified");
   assert.equal(overwriteEligible(verdict), false);
 });
 
