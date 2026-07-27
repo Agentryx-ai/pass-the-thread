@@ -14,8 +14,14 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 
-import { classifyTargetContent, overwriteEligible } from "../src/continued.ts";
-import { locateTranscript, locateTranscriptFrom, transcriptPathFor } from "../src/claude-target.ts";
+import { classifyTargetContent, overwriteEligible, type TargetContentClass } from "../src/continued.ts";
+import {
+  locateTranscript,
+  locateTranscriptFrom,
+  priorImportsFrom,
+  readPriorImports,
+  transcriptPathFor,
+} from "../src/claude-target.ts";
 import { canonicalProjectIdentity, sameProject } from "../src/project-identity.ts";
 import { buildImportPlan } from "../src/import-plan.ts";
 import { applyForwardSessions, type ForwardSessionApplyPlan } from "../src/claude-forward-target.ts";
@@ -380,4 +386,106 @@ test("locateTranscriptFrom tolerates a Claude home with no projects directory", 
   const root = scratch(t);
   const location = locateTranscriptFrom(root, path.join(root, "projects", "p", "s.jsonl"), "s");
   assert.equal(location.state, "absent");
+});
+
+// ---------------------------------------------------------------------------
+// The forward pipeline carries the same verdict the classifier reaches, so the
+// converter worth re-importing with is no longer the one that cannot tell a
+// continued conversation from an untouched one.
+// ---------------------------------------------------------------------------
+
+/** The gate's own refusals, as opposed to anything that goes wrong after it. */
+const GATE_REFUSAL = /requires --allow-overwrite|will not be overwritten/;
+
+function gateRefusal(
+  claudeHome: string,
+  session: ForwardSessionApplyPlan,
+  held: TargetContentClass | undefined,
+  allowOverwrite: boolean,
+): string | null {
+  try {
+    applyForwardSessions([session], {
+      bridgeRoot: path.join(claudeHome, "bridge"),
+      claudeHome,
+      workspaceDir: null,
+      planDigest: "d".repeat(64),
+      allowOverwrite,
+      targetContent: held == null ? undefined : new Map([[session.sessionId, held]]),
+    });
+    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return GATE_REFUSAL.test(message) ? message : null;
+  }
+}
+
+function existingTarget(t: { after: (fn: () => void) => void }): {
+  claudeHome: string;
+  session: ForwardSessionApplyPlan;
+} {
+  const claudeHome = scratch(t);
+  const cwd = String.raw`C:\_projects\Widget`;
+  const sessionId = "019f0000-0000-7000-8000-00000000beef";
+  const targetPath = transcriptPathFor(claudeHome, cwd, sessionId);
+  const before = `${JSON.stringify(importedLine())}\n`;
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, before, "utf8");
+  const afterContents = `${JSON.stringify(importedLine("re-rendered"))}\n`;
+  return {
+    claudeHome,
+    session: {
+      sessionId,
+      operationId: "00000000-0000-4000-8000-000000000000",
+      sourceSha256: "0".repeat(64),
+      transcript: {
+        path: targetPath,
+        beforeSha256: createHash("sha256").update(before, "utf8").digest("hex"),
+        afterSha256: createHash("sha256").update(afterContents, "utf8").digest("hex"),
+        afterContents,
+      },
+      wrapper: null,
+    },
+  };
+}
+
+for (const held of ["unchanged", "trivial"] as const) {
+  test(`a transcript holding only the import is written without --allow-overwrite (${held})`, (t) => {
+    const { claudeHome, session } = existingTarget(t);
+    assert.equal(gateRefusal(claudeHome, session, held, false), null);
+  });
+}
+
+test("a continued transcript is refused whether or not the flag is passed", (t) => {
+  const { claudeHome, session } = existingTarget(t);
+  for (const allowOverwrite of [false, true]) {
+    assert.match(
+      gateRefusal(claudeHome, session, "modified", allowOverwrite) ?? "",
+      /will not be overwritten/,
+      `--allow-overwrite=${allowOverwrite} must not authorize discarding it`,
+    );
+  }
+});
+
+test("a session the history says nothing about still needs the flag", (t) => {
+  const { claudeHome, session } = existingTarget(t);
+  assert.match(gateRefusal(claudeHome, session, undefined, false) ?? "", /requires --allow-overwrite/);
+  assert.equal(gateRefusal(claudeHome, session, undefined, true), null);
+});
+
+test("a history that cannot be read leaves every session undecidable, never safe", (t) => {
+  const root = scratch(t);
+  const absent = readPriorImports(path.join(root, "no-such-home"));
+  assert.equal(absent.size, 0);
+
+  const malformed = path.join(root, "malformed");
+  fs.mkdirSync(malformed, { recursive: true });
+  fs.writeFileSync(path.join(malformed, "codex-import-history.json"), "{ not json", "utf8");
+  assert.equal(readPriorImports(malformed).size, 0);
+
+  // A record that cannot say which session it is, or when, is not evidence either.
+  assert.equal(priorImportsFrom({ version: 1, records: [
+    { importedSessionId: "", importedAtMs: 1 },
+    { importedSessionId: "s", importedAtMs: Number.NaN },
+    { importedSessionId: "s2", importedAtMs: 5, targetSha256: "a".repeat(64) },
+  ] } as never).size, 1);
 });

@@ -11,6 +11,7 @@ import { splitUserMessage } from "./preamble.ts";
 import { validateTranscript } from "./validate.ts";
 import { DEFAULT_MAX_TRANSCRIPT_CHARS } from "./repair.ts";
 import { locateTranscriptFrom, serializeLines, sha256File, sha256Text } from "./claude-target.ts";
+import type { TargetContentClass } from "./continued.ts";
 import { buildWrapperRecord, type WrapperRecord } from "./claude-desktop-target.ts";
 import type { AnthropicBlock, ClaudeTranscriptLine, ClaudeTranscriptRecord, CodexSession } from "./types.ts";
 
@@ -685,6 +686,19 @@ export interface ApplyForwardOptions {
   workspaceDir: string | null;
   planDigest: string;
   allowOverwrite: boolean;
+  /**
+   * What each session's existing transcript was found to hold, by session id,
+   * taken from the confirmed plan. A session with no entry counts as
+   * `undecidable`, so a caller that says nothing gets the gate exactly as it was:
+   * every existing target behind `--allow-overwrite`.
+   *
+   * `unchanged` and `trivial` authorize the write on their own — the transcript
+   * demonstrably holds nothing but what the import put there, and the flag would
+   * be asking the user to confirm something already proved. `modified` refuses
+   * with or without the flag: no authorization is offered for discarding a
+   * conversation, and one asked for in ignorance of it is not one.
+   */
+  targetContent?: ReadonlyMap<string, TargetContentClass>;
   failureAfterWrites?: number;
   failureAfterMoves?: number;
   afterCommittedJournal?: () => void;
@@ -697,10 +711,22 @@ export function applyForwardSessions(
 ): ForwardApplyJournal {
   const operationId = uuid(`forward:${options.planDigest}`);
   assertForwardPaths(sessions, options.claudeHome, options.workspaceDir);
-  for (const asset of allAssets(sessions)) {
-    const state = assertPathState(asset);
-    if (state !== "after" && asset.beforeSha256 != null && !options.allowOverwrite) {
-      throw new Error(`existing target requires --allow-overwrite: ${asset.path}`);
+  for (const session of sessions) {
+    // One verdict covers the session: the wrapper is a pointer at the transcript,
+    // and there is nothing to preserve in it that the transcript does not decide.
+    const held = options.targetContent?.get(session.sessionId) ?? "undecidable";
+    for (const asset of allAssets([session])) {
+      const state = assertPathState(asset);
+      if (state === "after" || asset.beforeSha256 == null) continue;
+      if (held === "modified") {
+        throw new Error(
+          `existing target holds messages sent after the import and will not be overwritten: ` +
+          `${session.transcript.path}`,
+        );
+      }
+      if (held !== "unchanged" && held !== "trivial" && !options.allowOverwrite) {
+        throw new Error(`existing target requires --allow-overwrite: ${asset.path}`);
+      }
     }
   }
   let journal: ForwardApplyJournal;

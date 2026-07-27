@@ -326,3 +326,61 @@ export function lastRecordFor(
   }
   return found;
 }
+
+/**
+ * What a previous import recorded about one session, reduced to what deciding an
+ * overwrite needs: when the importer wrote the transcript, and the bytes it left.
+ */
+export interface PriorImport {
+  /** The line between the import's own content and anything written later. */
+  importedAtMs: number;
+  /** What the importer recorded. Corroboration only; it decides nothing. */
+  targetSha256: string | null;
+}
+
+/**
+ * Prior imports by Claude session id. No entry means nothing is recorded for that
+ * session, which is not the same as "nothing happened to it" — see
+ * `classifyTargetContent`, where a missing import time yields `undecidable`.
+ */
+export type PriorImports = ReadonlyMap<string, PriorImport>;
+
+/** What a caller that has no history to offer passes. Every session undecidable. */
+export const NO_PRIOR_IMPORTS: PriorImports = new Map();
+
+/**
+ * The one place the import history is read on behalf of a plan.
+ *
+ * Plan building must stay a function of its inputs, so the history is read here —
+ * at the command boundary, once per invocation — and threaded onward as data. A
+ * plan builder that opened this file itself would take a hidden input, and two
+ * runs over the same sessions could then disagree for reasons the plan does not
+ * record.
+ *
+ * A history that is missing, unreadable or malformed yields no entries, which
+ * leaves every session exactly where it stands today: `undecidable`, and behind
+ * `--allow-overwrite`. Degrading to "safe" is the one thing this must never do.
+ */
+export function readPriorImports(claudeHome: string): PriorImports {
+  return priorImportsFrom(loadImportHistory(claudeHome));
+}
+
+/** As `readPriorImports`, for a history already in hand. */
+export function priorImportsFrom(history: ImportHistory): PriorImports {
+  const byId = new Map<string, PriorImport>();
+  for (const record of history.records ?? []) {
+    const sessionId = (record as ImportHistoryRecord | null)?.importedSessionId;
+    const importedAtMs = (record as ImportHistoryRecord | null)?.importedAtMs;
+    // A record that cannot say which session it is, or when, is not evidence.
+    if (typeof sessionId !== "string" || sessionId === "") continue;
+    if (typeof importedAtMs !== "number" || !Number.isFinite(importedAtMs)) continue;
+    const held = byId.get(sessionId);
+    if (held != null && held.importedAtMs > importedAtMs) continue;
+    const targetSha256 = record.targetSha256;
+    byId.set(sessionId, {
+      importedAtMs,
+      targetSha256: typeof targetSha256 === "string" ? targetSha256 : null,
+    });
+  }
+  return byId;
+}

@@ -65,7 +65,14 @@ import type {
   CodexTargetEvidence,
 } from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
-import { locateTranscriptFrom, transcriptPathFor } from "./claude-target.ts";
+import {
+  locateTranscriptFrom,
+  NO_PRIOR_IMPORTS,
+  readPriorImports,
+  transcriptPathFor,
+  type PriorImports,
+} from "./claude-target.ts";
+import { classifyTargetContent, type TargetContentClass } from "./continued.ts";
 import {
   applyForwardSessions,
   CLAUDE_FORWARD_RENDERER_FINGERPRINT,
@@ -180,6 +187,16 @@ export interface MatrixForwardTargetSessionPlan {
   targetConversationState: "absent" | "exact-existing" | "collision" | "relocated";
   /** Present only when a transcript turned up outside the derived project directory. */
   relocatedTranscriptPaths?: string[];
+  /**
+   * What the existing transcript was found to hold, relative to the import the
+   * history records for this session.
+   *
+   * Absent means `undecidable` — no import is recorded, or the file could not be
+   * placed against one — and absent is also what every session looked like before
+   * the plan could consult the history at all, so a plan over sessions with no
+   * recorded import digests exactly as it always has.
+   */
+  targetContentClass?: Exclude<TargetContentClass, "undecidable">;
   targetSha256: string | null;
   renderedSha256: string;
   wrapperPath: string | null;
@@ -228,6 +245,8 @@ interface ForwardLoadedSource {
   targetPath: string;
   targetProjectExists: boolean;
   targetConversationExists: boolean;
+  /** What the transcript at `targetPath` holds, against this session's recorded import. */
+  targetContentClass: TargetContentClass;
 }
 
 type ForwardCodexSession = CodexSession & { archiveProvenance?: string };
@@ -251,6 +270,12 @@ export interface BuildForwardMatrixPlanOptions {
   goalMode?: GoalMigrationMode;
   workspaceDir?: string | null;
   expectedTargets?: readonly MatrixForwardTargetSessionPlan[];
+  /**
+   * What earlier imports recorded, read once by the caller — see `readPriorImports`.
+   * Omitted, every existing target is `undecidable` and stays behind
+   * `--allow-overwrite`, which is what this pipeline did before it could be told.
+   */
+  priorImports?: PriorImports;
 }
 
 export interface BuiltForwardMatrixPlan {
@@ -966,6 +991,7 @@ function loadForwardSource(
   claudeHome: string,
   renderMode: RenderMode,
   goalMode: GoalMigrationMode,
+  priorImports: PriorImports,
 ): ForwardLoadedSource {
   const canonicalSession = { ...session, rolloutPath: canonicalExistingPath(session.rolloutPath) };
   const bundle = codexHome == null
@@ -982,12 +1008,25 @@ function loadForwardSource(
   // keeps a conversation under its own project directory, which need not be the
   // one this session's cwd derives. Resolve by session id before calling it absent.
   const location = locateTranscriptFrom(claudeHome, targetPath, session.sessionId);
+  // What an existing transcript holds, judged against the import the history
+  // records. The evidence arrives as an argument rather than being read here, so
+  // that two plans over the same sessions and the same evidence stay identical.
+  // A relocated conversation is not classified at all: whatever sits at the
+  // derived path says nothing about the file Claude actually kept, and the write
+  // is refused outright either way.
+  const prior = priorImports.get(session.sessionId);
+  const targetContentClass: TargetContentClass = location.state === "relocated"
+    ? "undecidable"
+    : classifyTargetContent(targetPath, prior?.importedAtMs, {
+      expectedSha256: prior?.targetSha256 ?? null,
+    }).classification;
   return {
     session: boundSession,
     bundle,
     targetPath,
     targetProjectExists,
     targetConversationExists,
+    targetContentClass,
     summary: {
       sessionId: session.sessionId,
       cwd: projectRoot,
@@ -1077,8 +1116,14 @@ function buildForwardApplyPlan(
 
 /**
  * Build a deterministic, read-only Codex-to-Claude matrix plan from an isolated
- * inventory. The only filesystem operations are source reads and target
- * existence checks; neither the bridge store nor Claude home is created.
+ * inventory. The only filesystem operations are source reads and reads of the
+ * targets themselves — existence, bytes, and what an existing transcript holds;
+ * neither the bridge store nor Claude home is created.
+ *
+ * Everything outside those targets arrives as an argument. In particular the
+ * import history is not opened here: `options.priorImports` carries it, read once
+ * by the caller, so that the same inventory and the same evidence always build
+ * the same plan.
  */
 export function buildForwardMatrixPlan(
   sessions: readonly CodexSession[],
@@ -1091,8 +1136,9 @@ export function buildForwardMatrixPlan(
   const claudeHome = path.resolve(options.claudeHome);
   const bridgeRoot = path.resolve(options.bridgeRoot);
   const workspaceDir = options.workspaceDir == null ? null : path.resolve(options.workspaceDir);
+  const priorImports = options.priorImports ?? NO_PRIOR_IMPORTS;
   const sources = sessions.map((session) => loadForwardSource(
-    session, options.codexHome, claudeHome, renderMode, goalMode,
+    session, options.codexHome, claudeHome, renderMode, goalMode, priorImports,
   ));
   const expectedById = new Map((options.expectedTargets ?? []).map((target) => [target.sourceCodexRolloutId, target]));
   for (const source of sources) {
@@ -1196,6 +1242,13 @@ export function buildForwardMatrixPlan(
           ...(selected.relocatedTranscriptPaths == null
             ? {}
             : { relocatedTranscriptPaths: selected.relocatedTranscriptPaths }),
+          // Undecidable is the absence of a verdict, and it is written as the
+          // absence of the key: a plan over sessions with no recorded import is
+          // then byte-for-byte the plan this pipeline produced before it could
+          // consult the history at all.
+          ...(source.targetContentClass === "undecidable"
+            ? {}
+            : { targetContentClass: source.targetContentClass }),
           targetSha256: applyPlan.transcript.beforeSha256,
           renderedSha256: applyPlan.transcript.afterSha256,
           wrapperPath: applyPlan.wrapper?.path ?? null,
@@ -1556,8 +1609,9 @@ export function main(argv = process.argv.slice(2)): void {
       const renderMode = parseRenderMode(option(argv, "--render-mode"));
       const goalMode = goalMigrationModeOption(argv);
       const claudeHome = canonicalExistingPath(resolveClaudeHome(option(argv, "--claude-home")));
+      const priorImports = readPriorImports(claudeHome);
       const sources = inventory.sessions.map((session) => loadForwardSource(
-        session, codexHome, claudeHome, renderMode, goalMode,
+        session, codexHome, claudeHome, renderMode, goalMode, priorImports,
       ));
       const built = buildImportPlan(sources.map((source) => source.summary), { selection });
       writeJson(option(argv, "--out"), {
@@ -1618,6 +1672,7 @@ export function main(argv = process.argv.slice(2)): void {
         renderMode: parseRenderMode(option(argv, "--render-mode")),
         goalMode: goalMigrationModeOption(argv),
         workspaceDir: forwardWorkspace(argv, claudeHome),
+        priorImports: readPriorImports(claudeHome),
       });
       writeJson(option(argv, "--out"), matrix.file);
       return;
@@ -1732,6 +1787,10 @@ export function main(argv = process.argv.slice(2)): void {
         renderMode: stored.renderMode,
         goalMode: stored.goalMode,
         expectedTargets: stored.target.sessions,
+        // Re-read rather than trusting the stored verdict: a message sent between
+        // plan and apply must change the rebuilt plan, and the digest comparison
+        // below is what refuses the write when it does.
+        priorImports: readPriorImports(stored.target.claudeHome),
       });
       if (rebuilt.file.digest !== stored.digest) {
         throw new Error("source inventory, render output, Goal state/policy, or target binding changed after the plan was created");
@@ -1742,11 +1801,19 @@ export function main(argv = process.argv.slice(2)): void {
       assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CLAUDE_GOAL_TARGET_CAPABILITY_ID);
       if (flag(argv, "--dry-run")) {
         if (option(argv, "--out")) throw new Error("forward --dry-run refuses --out because dry-run is zero-mutation");
+        const heldBySession = new Map(rebuilt.file.target.sessions.map(
+          (session) => [session.sourceCodexRolloutId, session.targetContentClass ?? "undecidable"] as const,
+        ));
         process.stdout.write(`${JSON.stringify({
           dryRun: true, digest: stored.digest, renderMode: stored.renderMode, goalMode: stored.goalMode,
           sessions: rebuilt.applyPlans.map((plan) => ({
             sessionId: plan.sessionId, transcript: plan.transcript.path,
             transcriptAction: plan.transcript.beforeSha256 == null ? "create" : "overwrite",
+            // What the existing transcript holds, and therefore whether the
+            // overwrite needs authorizing at all — or cannot be authorized.
+            ...(plan.transcript.beforeSha256 == null
+              ? {}
+              : { transcriptHolds: heldBySession.get(plan.sessionId) ?? "undecidable" }),
             wrapper: plan.wrapper?.path ?? null,
             wrapperAction: plan.wrapper == null ? "not-registered" : plan.wrapper.beforeSha256 == null ? "create" : "overwrite",
           })),
@@ -1762,6 +1829,12 @@ export function main(argv = process.argv.slice(2)): void {
         workspaceDir: stored.target.workspaceDir,
         planDigest: stored.digest,
         allowOverwrite: flag(argv, "--allow-overwrite"),
+        // From the rebuilt plan, whose digest was just proved equal to the one
+        // the user confirmed. A transcript shown to hold nothing but the import
+        // needs no flag; one holding a continuation is refused whatever was passed.
+        targetContent: new Map(rebuilt.file.target.sessions.map(
+          (session) => [session.sourceCodexRolloutId, session.targetContentClass ?? "undecidable"],
+        )),
       });
       writeJson(option(argv, "--out"), {
         direction: stored.direction, renderMode: stored.renderMode, goalMode: stored.goalMode,
