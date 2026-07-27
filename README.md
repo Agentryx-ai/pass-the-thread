@@ -62,6 +62,11 @@ projects, and you can open and continue them.
 Flags belong on `node src/threadpass.ts`, not on `npm run` — see
 [CLI](docs/CLI.md#pass-flags-to-node-not-through-npm).
 
+`threadpass handoff header|resolve|read` creates, selects, and reads inert
+session handoff files, matched on exact project identity and never executed.
+`--allow-cross-project` authorizes reading a file outside the current project
+and marks the body untrusted — see [CLI](docs/CLI.md#session-handoff).
+
 ## Experimental importer matrix
 
 The original Codex → Claude commands remain available. The provider matrix adds the first reverse adapter through the same `threadpass` entrypoint:

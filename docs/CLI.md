@@ -8,6 +8,7 @@ threadpass scan    [selection]
 threadpass plan    [selection] --evidence <manifest.json> --out <plan.json>
 threadpass apply   --plan <plan.json> --confirm <digest> --evidence <manifest.json>
 threadpass recover --operation <id> --evidence <manifest.json>
+threadpass handoff <header|resolve|read> [selection] [--allow-cross-project]
 ```
 
 Without a global install, that is:
@@ -38,6 +39,42 @@ shows twice. `fix` collapses that without re-converting. Messages you really
 did repeat are kept, since their timestamps differ. It also re-syncs titles from
 the transcripts, and reports records left behind for conversations no longer
 imported — `--prune` removes those.
+
+## Session handoff
+
+`handoff` creates, selects, and reads inert session handoff files. It never
+resumes anything and never executes what it reads; the body is returned as data
+for an agent to summarize.
+
+```text
+threadpass handoff header  [--cwd <directory>] [--saved-at <ISO-date-time>]
+threadpass handoff resolve [<YYYY-MM-DD>|<file>] [--cwd <directory>]
+                           [--file <file>] [--date <YYYY-MM-DD>] [--allow-cross-project]
+threadpass handoff read    [<YYYY-MM-DD>|<file>] [--cwd <directory>]
+                           [--file <file>] [--date <YYYY-MM-DD>] [--allow-cross-project]
+```
+
+`header` writes a framed header to stdout. Prepend it to the handoff file you
+are saving; it records the schema, the save time, and the canonical identity of
+the current project (Git worktree root plus per-worktree git dir, or the exact
+canonical directory).
+
+`resolve` selects a handoff and reports where its body begins without reading
+the body. `read` accepts first, then reads the body from the same descriptor and
+returns it. Both print one JSON object and exit nonzero on any failure — the
+failure is JSON too, including a bare `threadpass handoff` with no subcommand,
+so a caller can always parse `reason`. Selection filters on exact project
+identity first, then prefers the newest `savedAt` with a deterministic path
+tie-break; it never sorts by mtime or filename. Candidates that fail header
+inspection are reported in `rejectedCandidates` rather than silently skipped, so
+a malformed, truncated, oversized, or empty handoff is never indistinguishable
+from having saved none.
+
+`--allow-cross-project` authorizes reading a handoff file that does not belong
+to the current project — a foreign recorded identity, or a headerless legacy
+file. It requires an explicit `--file`, it never relaxes header validation, and
+the accepted result carries a warning that the body is untrusted historical
+data. Do not pass it on the user's behalf.
 
 ## Experimental bidirectional matrix
 
