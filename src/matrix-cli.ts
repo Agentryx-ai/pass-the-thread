@@ -65,7 +65,7 @@ import type {
   CodexTargetEvidence,
 } from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
-import { transcriptPathFor } from "./claude-target.ts";
+import { locateTranscriptFrom, transcriptPathFor } from "./claude-target.ts";
 import {
   applyForwardSessions,
   CLAUDE_FORWARD_RENDERER_FINGERPRINT,
@@ -177,7 +177,9 @@ export interface MatrixForwardTargetSessionPlan {
   targetPath: string;
   targetProjectExists: boolean;
   targetConversationExists: boolean;
-  targetConversationState: "absent" | "exact-existing" | "collision";
+  targetConversationState: "absent" | "exact-existing" | "collision" | "relocated";
+  /** Present only when a transcript turned up outside the derived project directory. */
+  relocatedTranscriptPaths?: string[];
   targetSha256: string | null;
   renderedSha256: string;
   wrapperPath: string | null;
@@ -976,6 +978,10 @@ function loadForwardSource(
   const projectRoot = session.cwdOriginal || session.cwd;
   const targetConversationExists = fs.existsSync(targetPath);
   const targetProjectExists = fs.existsSync(path.dirname(targetPath));
+  // Nothing at the derived path is not the same as nothing anywhere: Claude
+  // keeps a conversation under its own project directory, which need not be the
+  // one this session's cwd derives. Resolve by session id before calling it absent.
+  const location = locateTranscriptFrom(claudeHome, targetPath, session.sessionId);
   return {
     session: boundSession,
     bundle,
@@ -999,7 +1005,12 @@ function loadForwardSource(
       archiveProvenance: session.archiveProvenance ?? "codex-archive-unavailable",
       targetProjectExists,
       targetConversationExists,
-      targetConversationState: targetConversationExists ? "collision" : "absent",
+      targetConversationState: location.state === "relocated"
+        ? "relocated"
+        : targetConversationExists ? "collision" : "absent",
+      ...(location.relocatedPaths.length > 0
+        ? { relocatedTranscriptPaths: location.relocatedPaths }
+        : {}),
       firstTsMs: session.firstTsMs,
       lastTsMs: session.lastTsMs,
       sourcePath: canonicalExistingPath(session.rolloutPath),
@@ -1136,10 +1147,15 @@ export function buildForwardMatrixPlan(
     const applyPlan = selectedApplyPlans.get(selected.sessionId)!;
     selected.targetProjectExists = source.summary.targetProjectExists ?? null;
     selected.targetConversationExists = applyPlan.transcript.beforeSha256 != null;
-    selected.targetConversationState = applyPlan.transcript.beforeSha256 == null
-      ? "absent"
-      : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
-        ? "exact-existing" : "collision";
+    // A relocated transcript survives the hash-derived restatement below: there
+    // are no bytes at the derived path to hash, and "absent" is the one verdict
+    // it must not collapse into.
+    selected.targetConversationState = source.summary.targetConversationState === "relocated"
+      ? "relocated"
+      : applyPlan.transcript.beforeSha256 == null
+        ? "absent"
+        : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
+          ? "exact-existing" : "collision";
   }
   const withoutDigest: Omit<MatrixForwardPlanFile, "digest"> = {
     schema: "agentryx.import-plan/v4",
@@ -1171,10 +1187,15 @@ export function buildForwardMatrixPlan(
           targetPath: source.targetPath,
           targetProjectExists: source.summary.targetProjectExists === true,
           targetConversationExists: applyPlan.transcript.beforeSha256 != null,
-          targetConversationState: applyPlan.transcript.beforeSha256 == null
-            ? "absent"
-            : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
-              ? "exact-existing" : "collision",
+          targetConversationState: selected.targetConversationState === "relocated"
+            ? "relocated" as const
+            : applyPlan.transcript.beforeSha256 == null
+              ? "absent" as const
+              : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
+                ? "exact-existing" as const : "collision" as const,
+          ...(selected.relocatedTranscriptPaths == null
+            ? {}
+            : { relocatedTranscriptPaths: selected.relocatedTranscriptPaths }),
           targetSha256: applyPlan.transcript.beforeSha256,
           renderedSha256: applyPlan.transcript.afterSha256,
           wrapperPath: applyPlan.wrapper?.path ?? null,

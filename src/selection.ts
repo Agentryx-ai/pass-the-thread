@@ -22,7 +22,14 @@ export interface SelectionSession {
   targetProjectExists?: boolean | null;
   /** Exact planned target conversation artifact/registration status. */
   targetConversationExists?: boolean;
-  targetConversationState?: "absent" | "exact-existing" | "collision" | "unknown";
+  /**
+   * `relocated` means a transcript with this session id exists somewhere other
+   * than the path the project root derives. It is neither absent nor a plain
+   * collision, and never an invitation to create.
+   */
+  targetConversationState?: "absent" | "exact-existing" | "collision" | "relocated" | "unknown";
+  /** Transcripts carrying this session id outside the derived project directory. */
+  relocatedTranscriptPaths?: readonly string[];
   firstTsMs?: number | null;
   lastTsMs?: number | null;
 }

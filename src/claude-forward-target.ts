@@ -10,7 +10,7 @@ import { splitCitations } from "./citation.ts";
 import { splitUserMessage } from "./preamble.ts";
 import { validateTranscript } from "./validate.ts";
 import { DEFAULT_MAX_TRANSCRIPT_CHARS } from "./repair.ts";
-import { serializeLines, sha256File, sha256Text } from "./claude-target.ts";
+import { locateTranscriptFrom, serializeLines, sha256File, sha256Text } from "./claude-target.ts";
 import { buildWrapperRecord, type WrapperRecord } from "./claude-desktop-target.ts";
 import type { AnthropicBlock, ClaudeTranscriptLine, ClaudeTranscriptRecord, CodexSession } from "./types.ts";
 
@@ -439,6 +439,18 @@ function assertForwardPaths(
       throw new Error(`forward transcript escapes Claude projects: ${session.transcript.path}`);
     }
     assertNoSymlinkComponents(session.transcript.path);
+    // Claude keeps a conversation under its own project directory, which need
+    // not be the one this session's cwd derives. Writing at the derived path
+    // while the conversation lives elsewhere orphans it, and no authorization
+    // covers that — `--allow-overwrite` speaks for the path it was shown.
+    const location = locateTranscriptFrom(claudeHome, session.transcript.path, session.sessionId);
+    if (location.state === "relocated") {
+      throw new Error(
+        `Claude session ${session.sessionId} already exists outside the planned project ` +
+        `directory (${location.relocatedPaths.join(", ")}); refusing to write ` +
+        `${session.transcript.path}`,
+      );
+    }
     if (session.wrapper != null && (workspaceDir == null || !isStrictlyInside(session.wrapper.path, workspaceDir))) {
       throw new Error(`forward wrapper escapes Claude workspace: ${session.wrapper.path}`);
     }

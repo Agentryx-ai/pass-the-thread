@@ -119,6 +119,98 @@ export function transcriptPathFor(
   return path.join(claudeHome, "projects", encodeProjectDir(cwd), `${cliSessionId}.jsonl`);
 }
 
+/**
+ * Where a session's transcript actually is.
+ *
+ *  - `absent`      no transcript anywhere carries this session id
+ *  - `at-expected` it is where the project root says it should be
+ *  - `relocated`   it is somewhere else, or in more than one place
+ *
+ * Claude does not keep a conversation where the import put it. A session whose
+ * cwd changed — or whose project directory Claude spelled differently — moves to
+ * another project directory under the same id, and deriving a path from the
+ * recorded project root then reports "absent" for a conversation that is very
+ * much alive. Writing a fresh transcript at the derived path would orphan it,
+ * so `relocated` is a verdict of its own and never a licence to create.
+ */
+export interface TranscriptLocation {
+  state: "absent" | "at-expected" | "relocated";
+  /** The path the project root implies. */
+  expectedPath: string;
+  /** Every transcript on disk carrying this session id, in directory order. */
+  foundPaths: string[];
+  /** Those of them that are not the expected path. */
+  relocatedPaths: string[];
+}
+
+/**
+ * Find a session's transcript by id across every Claude project directory,
+ * rather than trusting the path its recorded project root derives.
+ */
+export function locateTranscript(
+  claudeHome: string,
+  cwd: string,
+  cliSessionId: string,
+): TranscriptLocation {
+  const expectedPath = transcriptPathFor(claudeHome, cwd, cliSessionId);
+  return locateTranscriptFrom(claudeHome, expectedPath, cliSessionId);
+}
+
+/** As `locateTranscript`, for callers that already resolved the expected path. */
+export function locateTranscriptFrom(
+  claudeHome: string,
+  expectedPath: string,
+  cliSessionId: string,
+): TranscriptLocation {
+  const projects = path.join(claudeHome, "projects");
+  let dirs: string[];
+  try {
+    dirs = fs.readdirSync(projects);
+  } catch {
+    dirs = [];
+  }
+  const foundPaths: string[] = [];
+  for (const dir of dirs.sort()) {
+    const candidate = path.join(projects, dir, `${cliSessionId}.jsonl`);
+    try {
+      if (fs.statSync(candidate).isFile()) foundPaths.push(candidate);
+    } catch { /* not a transcript of this session */ }
+  }
+  const relocatedPaths = foundPaths.filter((found) => !samePath(found, expectedPath));
+  const state = foundPaths.length === 0
+    ? "absent"
+    : relocatedPaths.length > 0 ? "relocated" : "at-expected";
+  return { state, expectedPath, foundPaths, relocatedPaths };
+}
+
+/**
+ * Whether two paths denote the one file. Callers hand us paths in whatever
+ * spelling they hold — canonicalized, short-name, or as typed — and a project
+ * directory that differs only by case is still the same directory on Windows.
+ * Getting this wrong reports a file as relocated from itself.
+ */
+function samePath(left: string, right: string): boolean {
+  const a = resolveRealPath(left);
+  const b = resolveRealPath(right);
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+function resolveRealPath(input: string): string {
+  const resolved = path.resolve(input);
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    // A path that does not exist cannot be realpathed; its own directory still
+    // can, and that is where the spellings diverge.
+    const dir = path.dirname(resolved);
+    try {
+      return path.join(fs.realpathSync.native(dir), path.basename(resolved));
+    } catch {
+      return resolved;
+    }
+  }
+}
+
 /** Serialize transcript lines to newline-delimited JSON. */
 export function serializeLines(lines: ClaudeTranscriptRecord[]): string {
   return lines.map((l) => JSON.stringify(l)).join("\n") + (lines.length ? "\n" : "");

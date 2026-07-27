@@ -32,7 +32,9 @@ export interface ImportPlanSession {
   archiveProvenance: string;
   targetProjectExists: boolean | null;
   targetConversationExists: boolean | null;
-  targetConversationState: "absent" | "exact-existing" | "collision" | "unknown";
+  targetConversationState: "absent" | "exact-existing" | "collision" | "relocated" | "unknown";
+  /** Present only when a transcript turned up outside the derived project directory. */
+  relocatedTranscriptPaths?: string[];
   activityAtMs: number | null;
   sourcePath: string | null;
   sourceSha256: string | null;
@@ -165,6 +167,11 @@ function toPlanSession(session: ImportPlanSessionSummary): ImportPlanSession {
     targetConversationState: session.targetConversationState ??
       (session.targetConversationExists === true ? "collision" :
         session.targetConversationExists === false ? "absent" : "unknown"),
+    // The key itself is absent unless a transcript turned up out of place, so an
+    // unaffected plan reads and digests exactly as it did before.
+    ...(session.relocatedTranscriptPaths != null && session.relocatedTranscriptPaths.length > 0
+      ? { relocatedTranscriptPaths: [...session.relocatedTranscriptPaths] }
+      : {}),
     activityAtMs: session.lastTsMs ?? session.firstTsMs ?? null,
     sourcePath: session.sourcePath ?? null,
     sourceSha256: session.sourceSha256 ?? null,

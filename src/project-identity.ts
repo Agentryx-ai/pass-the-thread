@@ -42,6 +42,11 @@ export function canonicalProjectIdentity(input: string): ProjectIdentity {
   let canonical = exists ? fs.realpathSync.native(candidate) : candidate;
   canonical = stripWindowsExtendedPrefix(pathApi.normalize(canonical));
   canonical = removeTrailingSeparators(canonical, pathApi);
+  // A drive letter has no case of its own: `c:\p` and `C:\p` are one directory,
+  // and Codex and Claude disagree on which to write. `realpath` already reports
+  // the upper-case form for a directory that exists; match it for one that does
+  // not, so the same project cannot present two identities — and two plans.
+  if (usesWindowsPaths) canonical = upperCaseDriveLetter(canonical);
 
   return { path: canonical, key: canonical.toLowerCase(), exists };
 }
@@ -69,6 +74,10 @@ function isWindowsAbsolutePath(input: string, withoutExtendedPrefix: string): bo
   // slashes. Preserve an existing host path; when it is absent, there is no
   // lexical distinction, so prefer cross-host comparison as a Windows UNC path.
   return !fs.existsSync(withoutExtendedPrefix);
+}
+
+function upperCaseDriveLetter(input: string): string {
+  return /^[a-z]:/.test(input) ? input[0]!.toUpperCase() + input.slice(1) : input;
 }
 
 function removeTrailingSeparators(input: string, pathApi: typeof path.win32): string {

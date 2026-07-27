@@ -13,6 +13,7 @@ import {
   inspectTarget,
   lastRecordFor,
   loadImportHistory,
+  locateTranscriptFrom,
   mapVerbatimRolloutToClaudeLines,
   makeHistoryRecord,
   saveImportHistory,
@@ -37,7 +38,7 @@ import {
   writeWrapperRecord,
 } from "./claude-desktop-target.ts";
 import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
-import { findContinuation } from "./continued.ts";
+import { classifyTargetContent, overwriteEligible, type TargetContentVerdict } from "./continued.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
@@ -455,73 +456,117 @@ export function main(argv: string[]): number {
       }
       const { targetPath } = targetPathFor(claudeHome, s);
 
-      // Claude appends to a transcript when the conversation is opened or
-      // continued. Overwriting then destroys messages sent after the import,
-      // so a transcript that changed since we wrote it is left alone.
+      // Claude rewrites a transcript byte-for-byte whenever the conversation is
+      // opened, so the stored hash mismatches for practically every imported
+      // session and says nothing about whether anything of the user's is in it.
+      // What decides is the content: a turn somebody typed after the import, or
+      // an answer Claude gave to one. The hash is kept as corroboration only.
       const prior = lastRecordFor(history, s.sessionId);
       const state = inspectTarget(targetPath, prior?.targetSha256);
 
-      // "Changed since we wrote it" covers both a history Claude replayed into
-      // the file — which --force exists to get past — and messages the user sent
-      // afterwards, which nothing can bring back. Only the second is refused,
-      // and --force does not override it: the flag is for replay duplicates, not
-      // for discarding conversation.
-      // Claude does not always continue in place: it can fork an imported
-      // conversation into a session of its own and repoint the record we wrote
-      // at the fork. The messages are then in a file no Codex session names, so
-      // looking only at our own target would call the conversation untouched.
+      // Claude does not always keep a conversation where the import put it: a
+      // changed cwd, or a project directory Claude spelled its own way, moves
+      // the transcript under the same session id. Deriving a path from the
+      // recorded project root then reports nothing there, and writing a fresh
+      // transcript would orphan a live conversation.
+      const location = locateTranscriptFrom(claudeHome, targetPath, s.sessionId);
+      if (location.state === "relocated") {
+        conflicts += 1;
+        skipped += 1;
+        process.stdout.write(
+          `skip  ${s.sessionId}  (RELOCATED — Claude keeps this conversation elsewhere)\n` +
+            `      ${location.relocatedPaths.join("\n      ")}\n` +
+            `      nothing is at ${targetPath}, but writing there would orphan it.\n` +
+            `      Move that file aside first; --force does not cover this.\n`,
+        );
+        continue;
+      }
+
+      // Claude can also fork an imported conversation into a session of its own
+      // and repoint the record we wrote at the fork. The messages are then in a
+      // file no Codex session names, so looking only at our own target would
+      // call the conversation untouched.
       const owned =
         workspaceDir != null
           ? ourRecords(workspaceDir, prior?.recordSessionIds ?? [], s.sessionId)
           : { current: null, repointed: [] };
-      let continued =
-        state === "modified" || state === "foreign"
-          ? findContinuation(targetPath, prior?.importedAtMs)
-          : null;
-      let continuedIn = targetPath;
+      let verdict: TargetContentVerdict = location.state === "absent"
+        ? {
+          classification: "unchanged",
+          continuation: null,
+          assistantLines: 0,
+          incidentalLines: 0,
+          undecidable: null,
+          sha256Matches: null,
+        }
+        : classifyTargetContent(targetPath, prior?.importedAtMs, {
+          expectedSha256: prior?.targetSha256 ?? null,
+        });
+      let verdictIn = targetPath;
       for (const fork of owned.repointed) {
-        if (continued != null) break;
+        if (verdict.classification === "modified") break;
         const forkPath = transcriptPathFor(claudeHome, fork.record.cwd, fork.record.cliSessionId);
-        continued = findContinuation(forkPath, prior?.importedAtMs);
-        if (continued != null) continuedIn = forkPath;
+        const forked = classifyTargetContent(forkPath, prior?.importedAtMs);
+        if (forked.classification === "modified") {
+          verdict = forked;
+          verdictIn = forkPath;
+        }
       }
-      if (continued != null) {
+
+      const continued = verdict.continuation;
+      if (verdict.classification === "modified") {
         conflicts += 1;
         skipped += 1;
-        const when =
-          continued.firstAtMs != null
+        if (continued != null) {
+          const when = continued.firstAtMs != null
             ? new Date(continued.firstAtMs).toISOString().replace("T", " ").slice(0, 16)
             : "after the import";
-        process.stdout.write(
-          `skip  ${s.sessionId}  (${continued.turns} message(s) sent in Claude after the import)\n` +
-            `      first was ${when}: ${JSON.stringify(continued.firstText)}\n` +
-            `      they are in ${continuedIn}\n` +
-            `      re-importing would leave them behind. Move that file aside first.\n`,
-        );
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — ${continued.turns} message(s) sent in Claude after the import)\n` +
+              `      first was ${when}: ${JSON.stringify(continued.firstText)}\n` +
+              `      they are in ${verdictIn}\n` +
+              `      re-importing would leave them behind. Move that file aside first.\n`,
+          );
+        } else {
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — ${verdict.assistantLines} reply line(s) written after the import)\n` +
+              `      they are in ${verdictIn}\n` +
+              `      re-importing would leave them behind. Move that file aside first.\n`,
+          );
+        }
         continue;
       }
 
-      if (force && (state === "modified" || state === "foreign")) {
+      // Nothing was decided about the file — an unreadable or unparseable
+      // transcript, or one this tool never recorded importing. It may hold a
+      // conversation, so it is not overwritten unattended.
+      if (verdict.classification === "undecidable") {
         conflicts += 1;
+        if (!force) {
+          skipped += 1;
+          process.stdout.write(
+            `skip  ${s.sessionId}  (UNDECIDABLE — ${verdict.undecidable}; use --force to overwrite)\n`,
+          );
+          continue;
+        }
         process.stdout.write(
-          state === "modified"
-            ? `WARN  ${s.sessionId}  overwriting a transcript Claude rewrote (no messages of yours in it)
-`
-            : `WARN  ${s.sessionId}  overwriting a transcript this tool did not write
-`,
+          `WARN  ${s.sessionId}  overwriting a transcript nothing could be decided about ` +
+            `(${verdict.undecidable})\n`,
         );
-      }
-      if (!force && (state === "modified" || state === "foreign")) {
+      } else if (location.state !== "absent" && !overwriteEligible(verdict)) {
+        // Unreachable today; kept so a new class cannot silently become writable.
         conflicts += 1;
         skipped += 1;
-        process.stdout.write(
-          state === "modified"
-            ? `skip  ${s.sessionId}  (continued in Claude since import — use --force to overwrite)
-`
-            : `skip  ${s.sessionId}  (a transcript this tool did not write is already there)
-`,
-        );
+        process.stdout.write(`skip  ${s.sessionId}  (${verdict.classification} — not overwrite-eligible)\n`);
         continue;
+      } else if (location.state !== "absent" && state !== "ours") {
+        // Overwrite-eligible: the bytes differ from what was recorded, but the
+        // file holds nothing anybody wrote. Say so rather than demanding --force.
+        process.stdout.write(
+          `note  ${s.sessionId}  ${verdict.classification.toUpperCase()} since import` +
+            `${verdict.incidentalLines > 0 ? ` (${verdict.incidentalLines} line(s) nobody authored)` : ""}` +
+            `; safe to rewrite\n`,
+        );
       }
 
       if (dryRun) {
