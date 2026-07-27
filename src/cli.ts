@@ -497,6 +497,7 @@ export function main(argv: string[]): number {
           assistantLines: 0,
           incidentalLines: 0,
           undecidable: null,
+          markerLines: 0,
           sha256Matches: null,
         }
         : classifyTargetContent(targetPath, prior?.importedAtMs, {

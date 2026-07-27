@@ -134,6 +134,53 @@ test("lines nobody authored are trivial, not modification", (t) => {
   assert.ok(overwriteEligible(verdict));
 });
 
+// Measured over the 42 real imported transcripts: 1196 `last-prompt`, 921
+// `custom-title` and 56 `relocated` lines, all of them in a session that had been
+// continued and none in the 22 that had not. They carry no timestamp, so nothing
+// datable places them, but the importer never writes one.
+for (const type of ["last-prompt", "custom-title", "relocated"] as const) {
+  test(`an unstamped ${type} line is evidence the session was worked in`, (t) => {
+    const root = scratch(t);
+    const target = path.join(root, "session.jsonl");
+    writeTranscriptFile(target, [importedLine(), { type, value: "whatever the user did" }]);
+
+    const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+    assert.equal(verdict.classification, "modified");
+    assert.equal(verdict.markerLines, 1);
+    assert.equal(overwriteEligible(verdict), false);
+  });
+}
+
+test("an unstamped mode line still leaves a transcript unchanged", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  // Claude writes this merely on opening a session; 16 of the 22 untouched
+  // transcripts differ from their recorded hash by exactly this and nothing else.
+  writeTranscriptFile(target, [importedLine(), { type: "mode", mode: "default" }]);
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "unchanged");
+  assert.equal(verdict.markerLines, 0);
+  assert.ok(overwriteEligible(verdict));
+});
+
+test("a marker outweighs an otherwise undecidable transcript", (t) => {
+  const root = scratch(t);
+  const target = path.join(root, "session.jsonl");
+  fs.writeFileSync(
+    target,
+    `${JSON.stringify(importedLine())}\n{ not json\n${JSON.stringify({ type: "last-prompt", value: "x" })}\n`,
+    "utf8",
+  );
+
+  const verdict = classifyTargetContent(target, IMPORTED_AT_MS);
+
+  assert.equal(verdict.classification, "modified");
+  assert.equal(overwriteEligible(verdict), false);
+});
+
 test("replayed history keeps its Codex stamps and stays unchanged", (t) => {
   const root = scratch(t);
   const target = path.join(root, "session.jsonl");

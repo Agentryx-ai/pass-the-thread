@@ -42,6 +42,15 @@ export interface Continuation {
  */
 export type TargetContentClass = "unchanged" | "modified" | "trivial" | "undecidable";
 
+/**
+ * Line types Claude writes without a timestamp, and only for a session somebody
+ * has worked in. Measured over the 42 imported transcripts: 1196 `last-prompt`,
+ * 921 `custom-title` and 56 `relocated` lines, every one of them in a session
+ * that had been continued and none in the 22 that had not. `mode` is deliberately
+ * absent: Claude writes it merely on opening a session, so it proves nothing.
+ */
+const MARKER_TYPES = new Set(["last-prompt", "custom-title", "relocated"]);
+
 export interface TargetContentVerdict {
   classification: TargetContentClass;
   /** Post-import turns somebody typed, when there are any. */
@@ -52,6 +61,12 @@ export interface TargetContentVerdict {
   incidentalLines: number;
   /** Why nothing could be decided; null unless `undecidable`. */
   undecidable: string | null;
+  /**
+   * Unstamped lines only Claude writes, and only once a session has been worked
+   * in: `last-prompt`, `custom-title`, `relocated`. The importer emits none of
+   * them, so one is evidence of its own.
+   */
+  markerLines: number;
   /**
    * Whether the bytes still match what the importer recorded. Reported as
    * corroboration and never consulted by the classification.
@@ -88,12 +103,14 @@ export function classifyTargetContent(
     ? null
     : createHash("sha256").update(raw, "utf8").digest("hex") === expected;
 
+  let markerLines = 0;
   const undecided = (reason: string): TargetContentVerdict => ({
     classification: "undecidable",
     continuation: null,
     assistantLines: 0,
     incidentalLines: 0,
     undecidable: reason,
+    markerLines,
     sha256Matches,
   });
 
@@ -119,6 +136,15 @@ export function classifyTargetContent(
       // A transcript that cannot be parsed cannot be shown to be free of the
       // user's messages, so it is not something to overwrite unattended.
       unplaceable ??= `line ${index + 1} of ${targetPath} is not JSON`;
+      continue;
+    }
+    // Some of Claude's own lines carry no timestamp and so cannot be placed
+    // against the import, but they are written only once a session has been
+    // worked in: the prompt last typed into it, a title the user gave it, the
+    // note that Claude moved it. The importer writes none of them, so finding
+    // one says the session was touched even though nothing datable was added.
+    if (typeof rec.type === "string" && MARKER_TYPES.has(rec.type)) {
+      markerLines += 1;
       continue;
     }
     // Only conversation lines can carry a message. Summaries, system notices and
@@ -152,13 +178,15 @@ export function classifyTargetContent(
   }
 
   const continuation = turns > 0 ? { turns, firstText, firstAtMs } : null;
-  if (turns === 0 && assistantLines === 0 && unplaceable != null) {
+  if (turns === 0 && assistantLines === 0 && markerLines === 0 && unplaceable != null) {
     return { ...undecided(unplaceable), incidentalLines };
   }
-  const classification: TargetContentClass = turns > 0 || assistantLines > 0
+  // A marker cannot say what was done, only that something was, so it settles
+  // the question the same way a turn does: this is not a transcript to write over.
+  const classification: TargetContentClass = turns > 0 || assistantLines > 0 || markerLines > 0
     ? "modified"
     : incidentalLines > 0 ? "trivial" : "unchanged";
-  return { classification, continuation, assistantLines, incidentalLines, undecidable: null, sha256Matches };
+  return { classification, continuation, assistantLines, incidentalLines, undecidable: null, markerLines, sha256Matches };
 }
 
 /** Only a transcript shown to hold nothing of the user's may be written over. */
