@@ -21,6 +21,7 @@ import {
   buildImportPlan,
   canonicalStringify,
   digestImportPlan,
+  preselectSessions,
   REGENERATE_PLAN_MESSAGE,
   type ImportPlan,
   type ImportPlanSessionSummary,
@@ -286,12 +287,22 @@ export interface BuiltForwardMatrixPlan {
   applyPlans: ForwardSessionApplyPlan[];
 }
 
+/**
+ * Inventory every Codex rollout, without keeping any of them in memory.
+ *
+ * The inventory exists to be counted and selected from, and neither needs the
+ * transcript items: the forward pipeline reads the rollout file itself when it
+ * builds a bundle for a session the selection kept. Parsing with `retainItems`
+ * off leaves every field below exactly what it was and bounds the cost of this
+ * pass at one rollout at a time instead of the whole corpus at once.
+ */
 function loadForwardCodexInventory(codexHome: string): ForwardCodexInventory {
+  const parseOptions = { useCodexCompaction: false, retainItems: false } as const;
   let inventory: ReturnType<typeof loadDesktopSessions>;
   try {
     inventory = loadDesktopSessions(codexHome, {
       includeArchived: true,
-      useCodexCompaction: false,
+      ...parseOptions,
     });
   } catch {
     // Legacy parsing may reject a future/non-object line. The typed pass below
@@ -320,7 +331,7 @@ function loadForwardCodexInventory(codexHome: string): ForwardCodexInventory {
         if (seen.has(key)) continue;
         seen.add(key);
         let parsed: CodexSession | null = null;
-        try { parsed = parseRollout(candidate, { useCodexCompaction: false }); } catch { /* typed IR handles it */ }
+        try { parsed = parseRollout(candidate, parseOptions); } catch { /* typed IR handles it */ }
         const session = enrichForwardSession(
           byPath.get(key) ?? parsed ?? minimalCodexSession(candidate),
           dbByPath.get(key),
@@ -1069,6 +1080,68 @@ function loadForwardSource(
   };
 }
 
+/**
+ * What selection reads about one inventoried session, without opening its rollout.
+ *
+ * Every field here is the one `loadForwardSource` puts on the full summary, and
+ * they are the only fields `selectSessions` consults. The rest of that summary —
+ * the source hash, the title, the message count, the losses, the Goal decision —
+ * costs a bundle per session and is therefore built after the selection, for the
+ * sessions the selection kept.
+ */
+function forwardSelectionSummary(
+  session: CodexSession,
+  claudeHome: string,
+): ImportPlanSessionSummary {
+  const projectRoot = session.cwdOriginal || session.cwd;
+  const targetPath = canonicalExistingPath(transcriptPathFor(claudeHome, projectRoot, session.sessionId));
+  return {
+    sessionId: session.sessionId,
+    cwd: projectRoot,
+    projectRoot,
+    projectName: session.projectName,
+    hasProject: session.hasProject,
+    projectMembership: session.hasProject === true
+      ? "project"
+      : session.hasProject === false ? "projectless" : "unknown",
+    isArchived: session.isArchived,
+    archiveState: session.isArchived === true ? "archived" : session.isArchived === false ? "active" : "unknown",
+    targetProjectExists: fs.existsSync(path.dirname(targetPath)),
+    firstTsMs: session.firstTsMs,
+    lastTsMs: session.lastTsMs,
+  };
+}
+
+/**
+ * Narrow the inventory before anything is loaded from it.
+ *
+ * Selection order, the fail-closed unknowns, and the newest-first `--limit` are
+ * the plan builder's own, applied to the same values it would have seen; running
+ * them again over the survivors changes nothing, so the plan and its digest are
+ * exactly what an unpruned build produced.
+ */
+function selectForwardSessions<T extends CodexSession>(
+  sessions: readonly T[],
+  claudeHome: string,
+  selection: SelectionOptions,
+  expectedById?: ReadonlyMap<string, MatrixForwardTargetSessionPlan>,
+): T[] {
+  const summaries = sessions.map((session) => {
+    const summary = forwardSelectionSummary(session, claudeHome);
+    const expected = expectedById?.get(session.sessionId);
+    if (expected != null) {
+      if (selection.projectScope === "existing-targets" && summary.targetProjectExists !== true) {
+        throw new Error(`confirmed target project ceased to exist for ${session.sessionId}`);
+      }
+      // A rebuild judges the target the confirmed plan bound, as it did before.
+      summary.targetProjectExists = expected.targetProjectExists;
+    }
+    return summary;
+  });
+  const kept = new Set(preselectSessions(summaries, { selection }).map((summary) => summary.sessionId));
+  return sessions.filter((session) => kept.has(session.sessionId));
+}
+
 function buildForwardApplyPlan(
   source: ForwardLoadedSource,
   workspaceDir: string | null,
@@ -1137,10 +1210,13 @@ export function buildForwardMatrixPlan(
   const bridgeRoot = path.resolve(options.bridgeRoot);
   const workspaceDir = options.workspaceDir == null ? null : path.resolve(options.workspaceDir);
   const priorImports = options.priorImports ?? NO_PRIOR_IMPORTS;
-  const sources = sessions.map((session) => loadForwardSource(
-    session, options.codexHome, claudeHome, renderMode, goalMode, priorImports,
-  ));
   const expectedById = new Map((options.expectedTargets ?? []).map((target) => [target.sourceCodexRolloutId, target]));
+  // Selection first: what it excludes costs no bundle, no render, and no scan
+  // of the target home.
+  const sources = selectForwardSessions(sessions, claudeHome, selection, expectedById)
+    .map((session) => loadForwardSource(
+      session, options.codexHome, claudeHome, renderMode, goalMode, priorImports,
+    ));
   for (const source of sources) {
     const expected = expectedById.get(source.session.sessionId);
     if (expected) {
@@ -1610,9 +1686,12 @@ export function main(argv = process.argv.slice(2)): void {
       const goalMode = goalMigrationModeOption(argv);
       const claudeHome = canonicalExistingPath(resolveClaudeHome(option(argv, "--claude-home")));
       const priorImports = readPriorImports(claudeHome);
-      const sources = inventory.sessions.map((session) => loadForwardSource(
-        session, codexHome, claudeHome, renderMode, goalMode, priorImports,
-      ));
+      // The inventory is counted in full below, but only what the selection
+      // keeps is loaded.
+      const sources = selectForwardSessions(inventory.sessions, claudeHome, selection)
+        .map((session) => loadForwardSource(
+          session, codexHome, claudeHome, renderMode, goalMode, priorImports,
+        ));
       const built = buildImportPlan(sources.map((source) => source.summary), { selection });
       writeJson(option(argv, "--out"), {
         codexHome: canonicalExistingPath(codexHome),

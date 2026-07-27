@@ -673,3 +673,24 @@ test("a record already showing the Codex name is not re-synced from an older tra
   assert.equal(titleShowsCodexName("anything", "   "), false);
   assert.equal(titleShowsCodexName(undefined, "최신화하고 문서 읽기"), false);
 });
+
+test("inventory parsing derives every field without keeping the transcript body", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-retain-items-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rolloutPath = path.join(root, "rollout-2026-07-25T10-00-00-11111111-2222-4333-8444-555555555555.jsonl");
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({ timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id: "thread-1", cwd: root, source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:01.000Z", type: "turn_context", payload: { model: "gpt-5" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:02.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "first ask" }] } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:03.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] } }),
+  ].join("\n") + "\n", "utf8");
+
+  const retained = parseRollout(rolloutPath, { useCodexCompaction: false })!;
+  const released = parseRollout(rolloutPath, { useCodexCompaction: false, retainItems: false })!;
+
+  assert.equal(retained.items.length, 2);
+  assert.deepEqual(released.items, []);
+  // Title, counts, timestamps and the source hash are derived identically; only
+  // the bodies they were derived from are let go.
+  assert.deepEqual({ ...released, items: null }, { ...retained, items: null });
+});

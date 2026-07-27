@@ -12,7 +12,7 @@ import {
 } from "../src/project-identity.ts";
 import { selectSessions, type SelectionSession } from "../src/selection.ts";
 import { summarizeLosses } from "../src/loss-report.ts";
-import { buildImportPlan, digestImportPlan } from "../src/import-plan.ts";
+import { buildImportPlan, digestImportPlan, preselectSessions } from "../src/import-plan.ts";
 import { loadDesktopSelectionResult, projectForCwd } from "../src/codex-desktop-state.ts";
 
 function session(
@@ -314,3 +314,42 @@ test("changing a stored plan session changes its confirmation digest", () => {
   assert.notEqual(digestImportPlan(changed).digest, built.digest);
 });
 
+
+test("pruning the inventory before load leaves the plan and its digest unchanged", () => {
+  const inventory = [
+    session("newest", { lastTsMs: 300, projectName: "alpha" }),
+    session("middle", { lastTsMs: 200, projectName: "alpha" }),
+    session("oldest", { lastTsMs: 100, projectName: "beta", isArchived: true }),
+  ];
+  for (const selection of [
+    { archive: "all" as const },
+    { archive: "all" as const, limit: 2 },
+    { archive: "all" as const, sessionIds: ["middle"] },
+    { archive: "active" as const, projects: ["alpha"] },
+    { archive: "all" as const, fromMs: 150, toMs: 250 },
+  ]) {
+    // What a source reader that decides selection from metadata hands the plan
+    // builder, against what it used to hand it: the whole inventory.
+    const pruned = buildImportPlan(preselectSessions(inventory, { selection }), { selection });
+    const whole = buildImportPlan(inventory, { selection });
+    assert.equal(pruned.canonicalJson, whole.canonicalJson);
+    assert.equal(pruned.digest, whole.digest);
+  }
+});
+
+test("selection that fails closed on an unknown still fails when it is decided early", () => {
+  const inventory = [session("known"), session("unknown", { isArchived: undefined })];
+  assert.throws(() => preselectSessions(inventory, { selection: { archive: "active" } }),
+    /archive state is unknown for unknown/);
+  const undated = [session("known"), session("undated", { lastTsMs: null, firstTsMs: null })];
+  assert.throws(() => preselectSessions(undated, { selection: { fromMs: 150, toMs: 250 } }),
+    /source activity timestamp is unknown for undated/);
+  assert.throws(() => buildImportPlan(undated, { selection: { fromMs: 150, toMs: 250 } }),
+    /source activity timestamp is unknown for undated/);
+  // A selector that excludes the unknown session never judges it, before or after.
+  assert.deepEqual(
+    preselectSessions(inventory, { selection: { archive: "active", sessionIds: ["known"] } })
+      .map((entry) => entry.sessionId),
+    ["known"],
+  );
+});

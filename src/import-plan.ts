@@ -93,12 +93,8 @@ export function buildImportPlan(
   sessions: readonly ImportPlanSessionSummary[],
   options: BuildImportPlanOptions = {},
 ): BuiltImportPlan {
-  ensureUniqueSessionIds(sessions);
   const selection = options.selection ?? {};
-  // Source readers commonly return newest-first, but a plan digest must not
-  // depend on that caller detail. Stabilize before applying an explicit limit.
-  const ordered = [...sessions].sort(compareSourceSessions);
-  const selected = selectSessions(ordered, selection);
+  const selected = preselectSessions(sessions, options);
   const rows = selected.map(toPlanSession).sort((left, right) => compareText(
     left.sessionId,
     right.sessionId,
@@ -115,6 +111,28 @@ export function buildImportPlan(
   };
   const { canonicalJson, digest } = digestImportPlan(plan);
   return { plan, canonicalJson, digest };
+}
+
+/**
+ * The selection `buildImportPlan` would apply, decided before anything is loaded.
+ *
+ * Selection reads nothing but the `SelectionSession` fields, so a source reader
+ * can settle it from inventory metadata and then load bodies for the survivors
+ * alone. Building the plan from those survivors is byte-identical to building it
+ * from the whole inventory: this same ordering and filter run again over an
+ * already-selected list keeps every one of them, and the plan is derived from
+ * the selected sessions only. The unique-id guard still sees the whole
+ * inventory, which is why it lives here rather than after the filter.
+ */
+export function preselectSessions<T extends ImportPlanSessionSummary>(
+  sessions: readonly T[],
+  options: BuildImportPlanOptions = {},
+): T[] {
+  ensureUniqueSessionIds(sessions);
+  // Source readers commonly return newest-first, but a plan digest must not
+  // depend on that caller detail. Stabilize before applying an explicit limit.
+  const ordered = [...sessions].sort(compareSourceSessions);
+  return selectSessions(ordered, options.selection ?? {});
 }
 
 export function digestImportPlan(plan: ImportPlan): Pick<BuiltImportPlan, "canonicalJson" | "digest"> {

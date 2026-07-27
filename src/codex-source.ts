@@ -184,7 +184,9 @@ export function parseRollout(
     meta,
     firstTsMs: firstTsMs ?? tsToMs(meta.timestamp),
     lastTsMs: lastTsMs ?? tsToMs(meta.timestamp),
-    items,
+    // Everything above is derived from the item list; a caller that only needs
+    // that derivation keeps none of the bodies it was derived from.
+    items: opts.retainItems === false ? [] : items,
     model,
     messageCount,
     title,
@@ -232,6 +234,17 @@ export interface ParseOptions {
    * on the next turn, which Claude cannot do because it fails first.
    */
   useCodexCompaction?: boolean;
+  /**
+   * Keep the parsed transcript items on the returned session. Default true.
+   *
+   * Set false to inventory a whole corpus: every derived field — timestamps,
+   * title, message counts, the source hash, how much Codex compacted away — is
+   * computed exactly as it is with items retained, but the bodies themselves are
+   * released per file instead of accumulating across the corpus. Only the legacy
+   * Codex→Claude mapper replays `items`; a caller that needs them re-parses the
+   * one rollout it selected.
+   */
+  retainItems?: boolean;
 }
 
 export interface DesktopSelectOptions {

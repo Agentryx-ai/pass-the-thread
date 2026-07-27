@@ -489,6 +489,52 @@ test("forward CLI plan includes protocol-only active and archived rollouts witho
   assert.equal(fs.existsSync(bridgeRoot), false);
 });
 
+test("forward scan opens only the rollouts the selection kept", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-prune-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex");
+  const claudeHome = path.join(root, "claude");
+  const cwd = path.join(root, "repo");
+  const keptId = "77777777-aaaa-4bbb-8ccc-888888888888";
+  const excludedId = "99999999-aaaa-4bbb-8ccc-000000000000";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "07", "25");
+  writeIndexedRollout(sessionsDir, keptId, cwd);
+  // A rollout the inventory can describe but no bundle can be built from: its
+  // metadata line is intact, its body is not decodable. Selecting around it is
+  // only possible if selection is decided before the body is read.
+  fs.writeFileSync(path.join(sessionsDir, `rollout-2026-07-25T09-00-00-${excludedId}.jsonl`), Buffer.concat([
+    Buffer.from(`${JSON.stringify({
+      timestamp: "2026-07-25T09:00:00.000Z",
+      type: "session_meta",
+      payload: { id: excludedId, cwd, source: "vscode" },
+    })}\n`, "utf8"),
+    Buffer.from(
+      '{"timestamp":"2026-07-25T09:00:01.000Z","type":"response_item","payload":' +
+      '{"type":"message","role":"user","content":[{"type":"input_text","text":"',
+      "utf8",
+    ),
+    Buffer.from([0x80]),
+    Buffer.from('"}]}}\n', "utf8"),
+  ]));
+
+  const out = path.join(root, "scan.json");
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", claudeHome, "--archive", "all", "--session", keptId, "--out", out]);
+
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { total: number; selected: number };
+    selected: Array<{ sessionId: string }>;
+  };
+  // Counted in full, loaded not at all.
+  assert.equal(scan.inventory.total, 2);
+  assert.equal(scan.inventory.selected, 1);
+  assert.deepEqual(scan.selected.map((session) => session.sessionId), [keptId]);
+  // And the body really is unloadable: select it and the same scan refuses.
+  assert.throws(() => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", claudeHome, "--archive", "all", "--out", path.join(root, "all.json")]),
+  /not valid UTF-8/);
+});
+
 test("forward scan preserves malformed indexed archive columns as unknown", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-archive-malformed-"));
   const codexHome = path.join(root, "codex");
