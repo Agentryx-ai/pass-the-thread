@@ -166,17 +166,17 @@ function convergeApply(operation, sources, hook) {
     { hook, hookLabel: "complete", allowPartialRecovery: false },
   );
   assertAllTargets(operation, "afterSha256", "completed apply target mismatch");
-  discardApplyJournalArtifacts(operation);
+  discardJournalArtifacts(operation, "apply");
 }
 
-function discardApplyJournalArtifacts(operation) {
+function discardJournalArtifacts(operation, direction) {
   for (const mapping of operation.manifest.mappings) {
     if (mapping.beforeSha256 === mapping.afterSha256) continue;
-    const paths = mappingPaths(operation.targetRoot, operation.manifest.operationId, mapping.relativePath, "apply");
+    const paths = mappingPaths(operation.targetRoot, operation.manifest.operationId, mapping.relativePath, direction);
     for (const artifact of [paths.stage, paths.publication, paths.moved]) {
-      try { fs.unlinkSync(artifact); } catch { /* a verified apply never fails on journal cleanup */ }
+      try { fs.unlinkSync(artifact); } catch { /* a verified convergence never fails on journal cleanup */ }
     }
-    try { fsyncDirectory(path.dirname(paths.target)); } catch { /* durability is best effort once the apply is verified */ }
+    try { fsyncDirectory(path.dirname(paths.target)); } catch { /* durability is best effort once the convergence is verified */ }
   }
 }
 
@@ -241,6 +241,7 @@ function convergeRollback(operation, hook) {
     { hook, hookLabel: "rollback-complete", allowPartialRecovery: false },
   );
   assertAllTargets(operation, "beforeSha256", "completed rollback target mismatch");
+  discardJournalArtifacts(operation, "rollback");
 }
 
 function prepareOperation(targetRoot, state, hook) {

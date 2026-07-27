@@ -295,9 +295,18 @@ test("a verified apply discards its journal artifacts and keeps the durable prei
   mappings.forEach((relative, index) => {
     assert.deepEqual(fs.readFileSync(path.join(root, relative)), originals[index]);
     const paths = publicationPaths(root, operationId, relative, "rollback");
-    assert.deepEqual(fs.readFileSync(paths.stage), originals[index]);
-    assert.deepEqual(fs.readFileSync(paths.moved), fs.readFileSync(path.join(assetRoot, relative)));
+    for (const artifact of [paths.stage, paths.publication, paths.moved]) {
+      assert.equal(fs.existsSync(artifact), false, artifact);
+    }
+    assert.deepEqual(fs.readFileSync(path.join(operationRoot, "preimages", relative)), originals[index]);
   });
+  assert.deepEqual(
+    fs.readdirSync(path.join(root, path.dirname(mappings[0]))).sort(),
+    [path.basename(mappings[0])],
+  );
+  const rolledBackAgain = run(["--rollback", operationId, "--target-root", root]);
+  assert.equal(rolledBackAgain.status, 0, rolledBackAgain.stderr);
+  assert.equal(parse(rolledBackAgain).status, "already-rolled-back");
 });
 
 for (const direction of ["apply", "rollback"] as const) {
@@ -718,9 +727,11 @@ test("production cleanup never unlinks preimage, quarantine, or lock evidence", 
   assert.doesNotMatch(source, /unlinkSync\(movedPath\)|unlinkSync\(claimedPath\)/);
   assert.doesNotMatch(source, /unlinkSync\(path\.join\(lockRoot, "owner\.json"\)\)|rmdirSync\(lockRoot\)/);
   assert.doesNotMatch(source, /(?:unlink|rm)Sync\([^)]*(?:backup|preimage|quarantine|claim)/i);
-  const discard = source.slice(source.indexOf("function discardApplyJournalArtifacts"), source.indexOf("function convergeRollback"));
+  const discard = source.slice(source.indexOf("function discardJournalArtifacts"), source.indexOf("function convergeRollback"));
   assert.match(discard, /paths\.stage, paths\.publication, paths\.moved/);
   assert.doesNotMatch(discard, /backupRelativePath|operationFile|operation\.root/);
+  assert.match(source, /discardJournalArtifacts\(operation, "apply"\)/);
+  assert.match(source, /discardJournalArtifacts\(operation, "rollback"\)/);
 });
 
 test("lock acquisition uses one direct canonical mkdir without private publication", () => {
