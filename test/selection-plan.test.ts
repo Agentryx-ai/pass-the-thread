@@ -10,7 +10,7 @@ import {
   sameProject,
   stripWindowsExtendedPrefix,
 } from "../src/project-identity.ts";
-import { selectSessions, type SelectionSession } from "../src/selection.ts";
+import { assertSelectorsResolve, selectSessions, type SelectionSession } from "../src/selection.ts";
 import { summarizeLosses } from "../src/loss-report.ts";
 import { buildImportPlan, digestImportPlan, preselectSessions } from "../src/import-plan.ts";
 import { loadDesktopSelectionResult, projectForCwd } from "../src/codex-desktop-state.ts";
@@ -231,6 +231,45 @@ test("repeated session/project selectors, inclusive time bounds, and explicit li
   assert.deepEqual(selectSessions(sessions, { limit: 0 }), []);
   assert.throws(() => selectSessions(sessions, { limit: -1 }), /limit/);
   assert.throws(() => selectSessions(sessions, { fromMs: 30, toMs: 20 }), /fromMs/);
+});
+
+test("an explicit selector that matches nothing in the inventory is reported, not silently dropped", () => {
+  const sessions = [
+    session("a", { projectName: "Alpha" }),
+    session("b", { projectName: "Beta" }),
+  ];
+
+  // One good id and one that matches nothing: the bad one is named.
+  assert.throws(
+    () => assertSelectorsResolve(sessions, { sessionIds: ["a", "no-such-id"] }),
+    /--session matched no session in the inventory: no-such-id/,
+  );
+  // A typo'd project name is reported the same way.
+  assert.throws(
+    () => assertSelectorsResolve(sessions, { projects: ["Alpha", "Gemma"] }),
+    /--project matched no project in the inventory: Gemma/,
+  );
+  // A CRLF-fed id list is the observed real-world shape: trim before matching,
+  // rather than reporting a trimmed id as unmatched.
+  assert.doesNotThrow(() => assertSelectorsResolve(sessions, { sessionIds: ["a\r\n", " b "] }));
+  // Every selector matching is silent, as before.
+  assert.doesNotThrow(() => assertSelectorsResolve(sessions, { sessionIds: ["a", "b"], projects: ["Alpha", "Beta"] }));
+});
+
+test("running the unmatched-selector check ahead of a plan build changes nothing when every selector matches", () => {
+  const inventory = [
+    session("a", { projectName: "Alpha", lastTsMs: 10 }),
+    session("b", { projectName: "Beta", lastTsMs: 20 }),
+  ];
+  const selection = { archive: "all" as const, sessionIds: ["a"], projects: ["Alpha"] };
+
+  const withoutCheck = buildImportPlan(inventory, { selection });
+  // What every selection CLI chokepoint now does before building the plan.
+  assert.doesNotThrow(() => assertSelectorsResolve(inventory, selection));
+  const withCheck = buildImportPlan(inventory, { selection });
+
+  assert.equal(withCheck.digest, withoutCheck.digest);
+  assert.equal(withCheck.canonicalJson, withoutCheck.canonicalJson);
 });
 
 test("loss summaries aggregate explicit adapter observations deterministically", () => {

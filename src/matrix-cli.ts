@@ -26,7 +26,7 @@ import {
   type ImportPlan,
   type ImportPlanSessionSummary,
 } from "./import-plan.ts";
-import { selectSessions, type SelectionOptions } from "./selection.ts";
+import { assertSelectorsResolve, selectSessions, type SelectionOptions, type SelectionSession } from "./selection.ts";
 import { loadDesktopSelection, loadDesktopSelectionResult, projectForCwd } from "./codex-desktop-state.ts";
 import { canonicalProjectIdentity } from "./project-identity.ts";
 import { findStateDb, loadDesktopThreads, reconcileCodexArchive, type DbThreadRow } from "./codex-db.ts";
@@ -724,7 +724,7 @@ function loadSources(
     resolveClaudeDesktopWorkspace(claudeHome, sessionsRoot);
   const inventory = inventoryClaudeDesktop(claudeHome, workspaceDir);
   const targets = new Map(inventory.sessions.map((desktop) => [desktop.sessionId, targetProject(codexHome, desktop.cwd)]));
-  const selectedIds = new Set(selectSessions(inventory.sessions.map((desktop) => {
+  const selectionSessions: SelectionSession[] = inventory.sessions.map((desktop) => {
     const target = targets.get(desktop.sessionId)!;
     return {
       sessionId: desktop.sessionId,
@@ -741,7 +741,12 @@ function loadSources(
       firstTsMs: desktop.createdAtMs,
       lastTsMs: desktop.lastActivityAtMs,
     };
-  }), selection).map((session) => session.sessionId));
+  });
+  // Checked once, against the whole freshly loaded inventory, before selection
+  // narrows it: an explicit --session/--project value that matches nothing here
+  // means the request was not honored, not that it selected fewer sessions.
+  assertSelectorsResolve(selectionSessions, selection);
+  const selectedIds = new Set(selectSessions(selectionSessions, selection).map((session) => session.sessionId));
   const sources: LoadedSource[] = inventory.sessions.filter((desktop) => selectedIds.has(desktop.sessionId)).map((desktop) => {
     const target = targets.get(desktop.sessionId)!;
     if (!desktop.transcriptExists || desktop.transcriptPath == null) {
@@ -1138,6 +1143,10 @@ function selectForwardSessions<T extends CodexSession>(
     }
     return summary;
   });
+  // Checked once, against the whole freshly loaded inventory, before selection
+  // narrows it: an explicit --session/--project value that matches nothing here
+  // means the request was not honored, not that it selected fewer sessions.
+  assertSelectorsResolve(summaries, selection);
   const kept = new Set(preselectSessions(summaries, { selection }).map((summary) => summary.sessionId));
   return sessions.filter((session) => kept.has(session.sessionId));
 }

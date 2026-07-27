@@ -535,6 +535,94 @@ test("forward scan opens only the rollouts the selection kept", (t) => {
   /not valid UTF-8/);
 });
 
+test("--session names every id that matched nothing and refuses to run", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-session-unmatched-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex");
+  const claudeHome = path.join(root, "claude");
+  const cwd = path.join(root, "repo");
+  const goodId = "77777777-aaaa-4bbb-8ccc-888888888888";
+  const badId = "11111111-1111-4111-8111-111111111111";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "07", "25");
+  writeIndexedRollout(sessionsDir, goodId, cwd);
+
+  // 14 requested, one silently vanishing must never exit 0 with no warning: an
+  // explicit id that matches nothing in the inventory is an error, naming it.
+  assert.throws(
+    () => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+      "--claude-home", claudeHome, "--archive", "all",
+      "--session", goodId, "--session", badId, "--out", path.join(root, "scan.json")]),
+    new RegExp(`--session matched no session in the inventory: ${badId}`),
+  );
+  assert.equal(fs.existsSync(path.join(root, "scan.json")), false, "nothing is written when a selector is unmatched");
+});
+
+test("a --session id carrying a trailing CRLF is trimmed and matches normally", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-session-crlf-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex");
+  const claudeHome = path.join(root, "claude");
+  const cwd = path.join(root, "repo");
+  const sessionId = "22222222-3333-4444-8555-666666666666";
+  const sessionsDir = path.join(codexHome, "sessions", "2026", "07", "25");
+  writeIndexedRollout(sessionsDir, sessionId, cwd);
+
+  // The observed real failure: a CRLF-fed id list carries a trailing \r on
+  // every line but the first. It must select normally, not vanish silently.
+  const out = path.join(root, "scan.json");
+  main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+    "--claude-home", claudeHome, "--archive", "all", "--session", `${sessionId}\r`, "--out", out]);
+
+  const scan = JSON.parse(fs.readFileSync(out, "utf8")) as {
+    inventory: { total: number; selected: number };
+    selected: Array<{ sessionId: string }>;
+  };
+  assert.equal(scan.inventory.selected, 1);
+  assert.deepEqual(scan.selected.map((session) => session.sessionId), [sessionId]);
+});
+
+test("--project names a value that matched no project and refuses to run", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-project-unmatched-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const codexHome = path.join(root, "codex");
+  const claudeHome = path.join(root, "claude");
+  const sourceDir = path.join(codexHome, "sessions", "2026", "07", "25");
+  fs.mkdirSync(sourceDir, { recursive: true });
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": {
+      fixture: { id: "fixture", name: "FixtureProject", rootPaths: [path.join(root, "repo")] },
+    },
+    "project-order": ["fixture"],
+  }));
+  const sessionId = "33333333-4444-4555-8666-777777777777";
+  writeIndexedRollout(sourceDir, sessionId, path.join(root, "repo"));
+
+  assert.throws(
+    () => main(["scan", "--direction", "codex-to-claude", "--codex-home", codexHome,
+      "--claude-home", claudeHome, "--archive", "all",
+      "--project", "TypoProject", "--out", path.join(root, "scan.json")]),
+    /--project matched no project in the inventory: TypoProject/,
+  );
+});
+
+test("a fully matching --session/--project selection still selects and builds normally", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-selection-matched-"));
+  const claudeHome = path.join(root, "claude");
+  const bridgeRoot = path.join(root, "bridge");
+  const session = codexSession(root, "digest-unaffected", [
+    { timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id: "digest-unaffected", cwd: path.join(root, "repo") } },
+    { timestamp: "2026-07-25T10:00:01.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] } },
+  ]);
+  const selection = { archive: "all" as const, sessionIds: [session.sessionId], projects: [session.projectName!] };
+
+  const built = buildForwardMatrixPlan([session], { claudeHome, bridgeRoot, selection });
+  assert.deepEqual(built.file.plan.sessions.map((s) => s.sessionId), [session.sessionId]);
+  // Plan-digest invariance for the matching case (byte-identical to a build
+  // that never ran the unmatched-selector check) is proven directly against
+  // `buildImportPlan` in test/selection-plan.test.ts, where that check is
+  // provably a pure, non-mutating no-op when every selector resolves.
+});
+
 test("forward scan preserves malformed indexed archive columns as unknown", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "matrix-forward-archive-malformed-"));
   const codexHome = path.join(root, "codex");

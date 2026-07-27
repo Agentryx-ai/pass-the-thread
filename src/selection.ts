@@ -59,11 +59,19 @@ export function selectSessions<T extends SelectionSession>(
   sessions: readonly T[],
   options: SelectionOptions = {},
 ): T[] {
-  validateOptions(options);
-  const archive = options.archive ?? "active";
-  const projectScope = options.projectScope ?? "all";
-  const sessionIds = options.sessionIds == null ? null : new Set(options.sessionIds);
-  const projects = options.projects == null ? null : [...options.projects];
+  // A CRLF-fed id/name list is the common real-world shape (a file of ids with
+  // Windows line endings); trim before anything else touches these selectors
+  // so that shape matches like any other, rather than silently matching nothing.
+  const normalized: SelectionOptions = {
+    ...options,
+    sessionIds: options.sessionIds?.map((id) => id.trim()),
+    projects: options.projects?.map((project) => project.trim()),
+  };
+  validateOptions(normalized);
+  const archive = normalized.archive ?? "active";
+  const projectScope = normalized.projectScope ?? "all";
+  const sessionIds = normalized.sessionIds == null ? null : new Set(normalized.sessionIds);
+  const projects = normalized.projects == null ? null : [...normalized.projects];
 
   const selected = sessions.filter((session) => {
     if (sessionIds != null && !sessionIds.has(session.sessionId)) return false;
@@ -103,6 +111,50 @@ export function selectSessions<T extends SelectionSession>(
   });
 
   return options.limit == null ? selected : selected.slice(0, options.limit);
+}
+
+/**
+ * Fail loudly when an explicit `--session`/`--project` selector matches nothing
+ * in the true inventory, naming every unmatched value.
+ *
+ * A selector that matches nothing is not a smaller selection; against a
+ * destructive operation, it means the request was not honored as stated, and
+ * that must surface before anything runs — not as a quieter `selected` count.
+ * Values are trimmed first (a CRLF-fed id list is the common real-world shape),
+ * so the check and `selectSessions` agree on what "matches" means.
+ *
+ * Callers own *when* this runs: it must see the whole inventory a selection
+ * starts from, not a set already narrowed by an earlier pass over the same
+ * selection (`selectSessions`/`preselectSessions`/`buildImportPlan` are applied
+ * more than once, deliberately, over their own survivors — re-running this
+ * check there would misreport a value that only time/limit narrowed away as
+ * unmatched). Call it once, at the point a selection is first applied to a
+ * freshly loaded inventory.
+ */
+export function assertSelectorsResolve<T extends SelectionSession>(
+  sessions: readonly T[],
+  options: Pick<SelectionOptions, "sessionIds" | "projects">,
+): void {
+  const sessionIds = options.sessionIds == null ? null : [...new Set(options.sessionIds.map((id) => id.trim()))];
+  if (sessionIds != null) {
+    const unmatched = sessionIds.filter((id) => !sessions.some((session) => session.sessionId === id));
+    if (unmatched.length > 0) {
+      throw new Error(
+        `--session matched no session in the inventory: ${unmatched.join(", ")}; ` +
+        `nothing was selected for ${unmatched.length === 1 ? "it" : "them"}`,
+      );
+    }
+  }
+  const projects = options.projects == null ? null : options.projects.map((project) => project.trim());
+  if (projects != null) {
+    const unmatched = projects.filter((selector) => !sessions.some((session) => matchesProject(session, selector)));
+    if (unmatched.length > 0) {
+      throw new Error(
+        `--project matched no project in the inventory: ${unmatched.join(", ")}; ` +
+        `nothing was selected for ${unmatched.length === 1 ? "it" : "them"}`,
+      );
+    }
+  }
 }
 
 export function projectMembership(session: SelectionSession): "project" | "projectless" | "unknown" {
