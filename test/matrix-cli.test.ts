@@ -6,9 +6,11 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
+  activeContextPolicyOption,
   matrixPlanDigest,
   buildForwardMatrixPlan,
   bridgeToLogical,
+  compactLogicalForTarget,
   beginReverseApply,
   assertGoalMigrationReady,
   assertCodexTargetSnapshot,
@@ -22,6 +24,9 @@ import {
   selectionFromPlan,
   selectionOptions,
   transcriptIdentityError,
+  titleTransformPolicyOption,
+  transformTitle,
+  wrapperCwdRelocationAllowed,
   type MatrixForwardPlanFile,
   type MatrixPlanFile,
 } from "../src/matrix-cli.ts";
@@ -76,6 +81,9 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
     direction: "claude-to-codex",
     renderMode: "semantic",
     goalMode: "migrate",
+    titlePolicy: null,
+    activeContextPolicy: null,
+    allowWrapperCwdRelocation: false,
     plan: {
       version: 3,
       selection: { archive: "active", projectScope: "all", sessionIds: [], projects: [], fromMs: null, toMs: null, limit: null },
@@ -103,6 +111,10 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
   assert.notEqual(matrixPlanDigest({ ...base, goalMode: "skip" }), semantic);
   assert.notEqual(matrixPlanDigest({
     ...base,
+    titlePolicy: { prefix: "[Claude] ", replacePrefixes: ["[Codex] "] },
+  }), semantic);
+  assert.notEqual(matrixPlanDigest({
+    ...base,
     target: { ...base.target, goalCapabilityFingerprint: "d".repeat(64) },
   }), semantic);
   assert.notEqual(matrixPlanDigest({
@@ -120,6 +132,43 @@ test("the confirmed matrix digest binds render mode and target identity", () => 
     ...base,
     target: { ...base.target, evidence: { ...base.target.evidence, appAsarSha256: "changed" } },
   }), semantic);
+});
+
+test("reverse title policy replaces an origin prefix and stays idempotent", () => {
+  const policy = titleTransformPolicyOption([
+    "plan", "--title-prefix", "[Claude] ", "--replace-title-prefix", "[Codex] ",
+  ]);
+  assert.deepEqual(policy, { prefix: "[Claude] ", replacePrefixes: ["[Codex] "] });
+  assert.equal(transformTitle("[Codex] migrated", policy), "[Claude] migrated");
+  assert.equal(transformTitle("native Claude", policy), "[Claude] native Claude");
+  assert.equal(transformTitle("[Claude] already labelled", policy), "[Claude] already labelled");
+  assert.throws(
+    () => titleTransformPolicyOption(["plan", "--replace-title-prefix", "[Codex] "]),
+    /requires --title-prefix/,
+  );
+});
+
+test("reverse synthetic compaction preserves history and keeps a tool-safe active tail", () => {
+  const policy = activeContextPolicyOption(["plan", "--compact-active-bytes", "500"]);
+  assert.deepEqual(policy, { maxUtf8Bytes: 500 });
+  const items = [
+    { kind: "message" as const, role: "user" as const, text: "old".repeat(300) },
+    { kind: "tool_call" as const, callId: "call", name: "read", input: {} },
+    { kind: "tool_result" as const, callId: "call", output: "done" },
+    { kind: "message" as const, role: "assistant" as const, text: "recent" },
+  ];
+  const compacted = compactLogicalForTarget({
+    cwd: "C:\\repo", title: "Long Claude session", createdAt: "2026-07-29T00:00:00.000Z",
+    messages: [], items,
+  }, policy);
+  assert.equal(compacted.synthesized, true);
+  assert.equal(compacted.conversation.items?.length, items.length);
+  assert.ok((compacted.conversation.compaction?.activeItemIndex ?? 0) > 0);
+  assert.ok(compacted.conversation.compaction?.summary?.includes("complete earlier history"));
+  assert.throws(
+    () => activeContextPolicyOption(["plan", "--compact-active-bytes", "230001"]),
+    /must be between/,
+  );
 });
 
 test("Goal mode CLI defaults independently and rejects contradictory aliases", () => {
@@ -276,6 +325,9 @@ test("forward semantic plan is exhaustive, deterministic, and read-only", () => 
     direction: "claude-to-codex" as const,
     renderMode: first.file.renderMode,
     goalMode: first.file.goalMode,
+    titlePolicy: null,
+    activeContextPolicy: null,
+    allowWrapperCwdRelocation: false,
     plan: first.file.plan,
     target: {
       codexHome: path.join(root, "codex"), dbPath: path.join(root, "state.sqlite"), bridgeRoot,
@@ -780,6 +832,8 @@ test("Claude wrapper identity must agree with every transcript identity", () => 
   assert.equal(transcriptIdentityError(desktop, transcript), null);
   assert.match(transcriptIdentityError(desktop, { ...transcript, sessionIds: ["cli-1", "other"] }) ?? "", /session id/);
   assert.match(transcriptIdentityError(desktop, { ...transcript, cwds: ["D:\\other"] }) ?? "", /cwd/);
+  assert.equal(wrapperCwdRelocationAllowed("wrapper cwd does not match transcript cwd", true), true);
+  assert.equal(wrapperCwdRelocationAllowed("wrapper CLI session id does not match every transcript record", true), false);
 });
 
 test("only ordered, structurally valid tool pairs are eligible for native rendering", () => {

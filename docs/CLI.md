@@ -177,6 +177,10 @@ Selection options:
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
 | `--goal-mode <mode>` | `migrate` (default) or `skip`; independent of render mode and included in the digest |
 | `--no-migrate-goal` | alias for `--goal-mode skip`; conflicting flags are rejected |
+| `--title-prefix <s>` | Claude → Codex only: prefix target titles; already-prefixed titles stay unchanged |
+| `--replace-title-prefix <s>` | Claude → Codex only: replace this leading prefix with `--title-prefix`; repeatable and plan-bound |
+| `--compact-active-bytes <n>` | Claude → Codex only: retain full history before a synthetic compact boundary while limiting resumable active context to `n` UTF-8 bytes; plan-bound and capped by the audited target limit |
+| `--allow-wrapper-cwd-relocation` | Claude → Codex only: when CLI session identity matches, use the wrapper's current project despite an older differing transcript cwd; the relocation is reported as a loss observation |
 | `--allow-overwrite` | forward apply only: authorize overwrite after exact unchanged-target proof |
 | `--dry-run` | rebuild and run read-only static preflights with zero mutation; reports blockers and live gates it cannot prove |
 

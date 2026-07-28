@@ -34,6 +34,7 @@ import {
   applyCodexTarget,
   acquireCodexTargetLock,
   assertCodexDesktopClosed,
+  CODEX_41059_SAFE_ACTIVE_UTF8_BYTES,
   estimatedActiveBytes,
   inspectCodexTargetPlan,
   operationJournalInputForPlan,
@@ -53,7 +54,11 @@ import {
   reconcileGoalActivation,
   type OperationJournal,
 } from "./operation-journal.ts";
-import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/v26_721_41059.ts";
+import {
+  assertLogicalToolHistory,
+  type LogicalCodexConversation,
+  type LogicalCodexItem,
+} from "./compat/codex/v26_721_41059.ts";
 import {
   assertCodexPrivateWriteCapabilities,
   assertSupportedCodexTarget,
@@ -172,9 +177,21 @@ export interface MatrixReversePlanFile {
   direction: "claude-to-codex";
   renderMode: RenderMode;
   goalMode: GoalMigrationMode;
+  titlePolicy: TitleTransformPolicy | null;
+  activeContextPolicy: ActiveContextPolicy | null;
+  allowWrapperCwdRelocation: boolean;
   digest: string;
   plan: ImportPlan;
   target: MatrixTargetBinding;
+}
+
+export interface TitleTransformPolicy {
+  prefix: string;
+  replacePrefixes: string[];
+}
+
+export interface ActiveContextPolicy {
+  maxUtf8Bytes: number;
 }
 
 export interface MatrixForwardTargetSessionPlan {
@@ -525,6 +542,63 @@ export function matrixDirection(argv: string[]): MatrixDirection {
   return value;
 }
 
+export function titleTransformPolicyOption(argv: string[]): TitleTransformPolicy | null {
+  const prefixes = optionValues(argv, "--title-prefix");
+  if (new Set(prefixes).size > 1) throw new Error("conflicting --title-prefix values");
+  const prefix = prefixes.at(-1);
+  const replacePrefixes = [...new Set(optionValues(argv, "--replace-title-prefix"))];
+  if (prefix == null) {
+    if (replacePrefixes.length > 0) throw new Error("--replace-title-prefix requires --title-prefix");
+    return null;
+  }
+  if (prefix === "") throw new Error("--title-prefix must not be empty");
+  if (replacePrefixes.some((candidate) => candidate === "")) {
+    throw new Error("--replace-title-prefix must not be empty");
+  }
+  return { prefix, replacePrefixes };
+}
+
+export function activeContextPolicyOption(argv: string[]): ActiveContextPolicy | null {
+  const maxUtf8Bytes = numberOption(argv, "--compact-active-bytes");
+  if (maxUtf8Bytes == null) return null;
+  if (maxUtf8Bytes === 0 || maxUtf8Bytes > CODEX_41059_SAFE_ACTIVE_UTF8_BYTES) {
+    throw new Error(
+      `--compact-active-bytes must be between 1 and ${CODEX_41059_SAFE_ACTIVE_UTF8_BYTES}`,
+    );
+  }
+  return { maxUtf8Bytes };
+}
+
+export function transformTitle(title: string, policy: TitleTransformPolicy | null): string {
+  if (policy == null || title.startsWith(policy.prefix)) return title;
+  const replacement = [...policy.replacePrefixes]
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => title.startsWith(candidate));
+  return policy.prefix + (replacement == null ? title : title.slice(replacement.length));
+}
+
+function storedTitleTransformPolicy(value: unknown): TitleTransformPolicy | null {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("unsupported title transform policy");
+  const record = value as Record<string, unknown>;
+  if (typeof record.prefix !== "string" || record.prefix === "" || !Array.isArray(record.replacePrefixes) ||
+    !record.replacePrefixes.every((candidate) => typeof candidate === "string" && candidate !== "")) {
+    throw new Error("unsupported title transform policy");
+  }
+  return { prefix: record.prefix, replacePrefixes: [...new Set(record.replacePrefixes as string[])] };
+}
+
+function parseStoredActiveContextPolicy(value: unknown): ActiveContextPolicy | null {
+  if (value == null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) throw new Error("unsupported active context policy");
+  const maxUtf8Bytes = (value as Record<string, unknown>).maxUtf8Bytes;
+  if (!Number.isSafeInteger(maxUtf8Bytes) || (maxUtf8Bytes as number) <= 0 ||
+    (maxUtf8Bytes as number) > CODEX_41059_SAFE_ACTIVE_UTF8_BYTES) {
+    throw new Error("unsupported active context policy");
+  }
+  return { maxUtf8Bytes: maxUtf8Bytes as number };
+}
+
 function targetProject(codexHome: string, cwd: string): {
   exists: boolean | null;
   name?: string;
@@ -574,6 +648,10 @@ export function transcriptIdentityError(
     }
   }
   return null;
+}
+
+export function wrapperCwdRelocationAllowed(identityError: string | null, allow: boolean): boolean {
+  return allow && identityError === "wrapper cwd does not match transcript cwd";
 }
 
 function lossObservations(events: BridgeEvent[]): Array<{ kind: string; count: number; detail?: string }> {
@@ -714,7 +792,7 @@ export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
 }
 
 function loadSources(
-  argv: string[], selection: SelectionOptions,
+  argv: string[], selection: SelectionOptions, allowWrapperCwdRelocation = false,
 ): { sources: LoadedSource[]; workspaceDir: string; unreadable: string[]; inventory: ClaudeDesktopSourceSession[] } {
   const claudeHome = resolveClaudeHome(option(argv, "--claude-home"));
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
@@ -767,7 +845,7 @@ function loadSources(
     }
     const transcript = readClaudeJsonl(desktop.transcriptPath);
     const identityError = transcriptIdentityError(desktop, transcript);
-    if (identityError != null) {
+    if (identityError != null && !wrapperCwdRelocationAllowed(identityError, allowWrapperCwdRelocation)) {
       return {
         desktop,
         bundle: null,
@@ -800,7 +878,14 @@ function loadSources(
         sourcePath: desktop.transcriptPath, sourceSha256: transcript.contentSha256,
         title: desktop.title || transcript.title || undefined,
         messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
-        losses: lossObservations(bundle.conversation.events),
+        losses: [
+          ...lossObservations(bundle.conversation.events),
+          ...(identityError == null ? [] : [{
+            kind: "transcript_cwd_relocated_to_wrapper_project",
+            count: 1,
+            detail: "The Claude wrapper project was used because its CLI session id matched while transcript cwd recorded an earlier project path.",
+          }]),
+        ],
       },
     };
   });
@@ -851,7 +936,11 @@ function exactSourceText(source: LoadedSource): string {
   return source.bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join("");
 }
 
-export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<LogicalCodexConversation, "threadId"> {
+export function bridgeToLogical(
+  source: LoadedSource,
+  renderMode: RenderMode,
+  titlePolicy: TitleTransformPolicy | null = null,
+): Omit<LogicalCodexConversation, "threadId"> {
   if (!source.bundle) throw new Error(`source transcript is missing for ${source.desktop.sessionId}`);
   if (renderMode === "verbatim") {
     const createdAtMs = source.desktop.createdAtMs;
@@ -861,7 +950,10 @@ export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): O
     const literal = `${inertHistoricalNotice("Claude JSONL")}\n\n${exactSourceText(source)}`;
     const logical = {
       cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
-      title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
+      title: transformTitle(
+        source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
+        titlePolicy,
+      ),
       createdAt,
       messages: [],
       items: [{ kind: "historical_context" as const, text: literal, timestamp: createdAt }],
@@ -977,7 +1069,10 @@ export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): O
   const createdAt = new Date(source.desktop.createdAtMs ?? earliest);
   const logical = {
     cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
-    title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation",
+    title: transformTitle(
+      source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation",
+      titlePolicy,
+    ),
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date(0).toISOString() : createdAt.toISOString(),
     messages,
     items,
@@ -986,6 +1081,46 @@ export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): O
   // Force the resume-budget computation during plan/apply mapping.
   estimatedActiveBytes(logical);
   return logical;
+}
+
+export function compactLogicalForTarget(
+  conversation: Omit<LogicalCodexConversation, "threadId">,
+  policy: ActiveContextPolicy | null,
+): { conversation: Omit<LogicalCodexConversation, "threadId">; synthesized: boolean } {
+  if (policy == null || estimatedActiveBytes(conversation) <= policy.maxUtf8Bytes) {
+    return { conversation, synthesized: false };
+  }
+  const items = conversation.items ?? conversation.messages.map((message): LogicalCodexItem => ({
+    kind: "message",
+    ...message,
+  }));
+  const summary = conversation.compaction?.summary ?? [
+    "Imported Claude conversation compacted for safe Codex resumption.",
+    "The complete earlier history remains before this compact boundary and byte-exact in the Pass the Thread bridge sidecar.",
+    "Continue from the recent messages that follow this boundary.",
+    `Source title: ${conversation.title}`,
+  ].join("\n");
+  const firstCandidate = Math.max(1, (conversation.compaction?.activeItemIndex ??
+    conversation.compaction?.activeMessageIndex ?? 0) + (conversation.compaction == null ? 0 : 1));
+  for (let activeItemIndex = firstCandidate; activeItemIndex <= items.length; activeItemIndex += 1) {
+    const active = items.slice(activeItemIndex);
+    try { assertLogicalToolHistory(active); } catch { continue; }
+    const candidate = {
+      ...conversation,
+      items,
+      compaction: {
+        ...conversation.compaction,
+        activeItemIndex,
+        summary,
+      },
+    };
+    if (estimatedActiveBytes(candidate) <= policy.maxUtf8Bytes) {
+      return { conversation: candidate, synthesized: true };
+    }
+  }
+  throw new Error(
+    `no tool-safe active tail fits the requested ${policy.maxUtf8Bytes} UTF-8 byte compacted context`,
+  );
 }
 
 export function matrixPlanDigest(
@@ -1531,9 +1666,11 @@ export function recoverCodexOperation(
 
 function summariesForPlan(
   sources: LoadedSource[], renderMode: RenderMode, goalMode: GoalMigrationMode,
+  titlePolicy: TitleTransformPolicy | null,
 ): ImportPlanSessionSummary[] {
   return summariesForRenderMode(sources, renderMode).map((summary, index) => ({
     ...summary,
+    ...(summary.title == null ? {} : { title: transformTitle(summary.title, titlePolicy) }),
     goalDecision: planGoalMigration(
       sources[index]?.bundle?.conversation.goalState, goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID,
     ),
@@ -1542,9 +1679,30 @@ function summariesForPlan(
 
 function buildMatrixPlan(
   sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode, goalMode: GoalMigrationMode,
+  titlePolicy: TitleTransformPolicy | null,
+  activeContextPolicy: ActiveContextPolicy | null,
+  allowWrapperCwdRelocation: boolean,
   codexHome: string, dbPath: string, bridgeRoot: string, evidence: CodexTargetEvidence,
 ): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
-  const summaries = summariesForPlan(sources, renderMode, goalMode);
+  const logicalById = new Map(sources.map((source) => {
+    if (!source.bundle) return [source.desktop.sessionId, null] as const;
+    return [
+      source.desktop.sessionId,
+      compactLogicalForTarget(bridgeToLogical(source, renderMode, titlePolicy), activeContextPolicy),
+    ] as const;
+  }));
+  const summaries = summariesForPlan(sources, renderMode, goalMode, titlePolicy).map((summary) => {
+    const logical = logicalById.get(summary.sessionId);
+    if (!logical?.synthesized) return summary;
+    return {
+      ...summary,
+      losses: [...(summary.losses ?? []), {
+        kind: "synthetic_compaction_for_target_limit",
+        count: 1,
+        detail: `Full history is retained before the boundary and in the bridge sidecar; active context is capped at ${activeContextPolicy!.maxUtf8Bytes} UTF-8 bytes.`,
+      }],
+    };
+  });
   const built = buildImportPlan(summaries, { selection });
   const privateWriteProfile = probeCodexPrivateWriteProfile(evidence);
   const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
@@ -1556,7 +1714,7 @@ function buildMatrixPlan(
     }
     return planCodexTarget(
       codexHome, dbPath, `${selected.sessionId}\0render:${renderMode}`, selected.sourceSha256,
-      bridgeToLogical(source, renderMode), selected.archiveState === "archived",
+      logicalById.get(selected.sessionId)!.conversation, selected.archiveState === "archived",
       source.bundle.conversation.goalState ?? null, goalMode,
     );
   });
@@ -1571,6 +1729,9 @@ function buildMatrixPlan(
     direction: "claude-to-codex",
     renderMode,
     goalMode,
+    titlePolicy,
+    activeContextPolicy,
+    allowWrapperCwdRelocation,
     plan: built.plan,
     target: {
       codexHome: canonicalExistingPath(codexHome),
@@ -1621,6 +1782,8 @@ export const MATRIX_HELP =
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
   "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
+  "[--title-prefix TEXT] [--replace-title-prefix TEXT] " +
+  "[--compact-active-bytes N] [--allow-wrapper-cwd-relocation] " +
   "[--direction claude-to-codex|codex-to-claude] [--allow-overwrite] [--dry-run]\n";
 
 function forwardWorkspace(argv: string[], claudeHome: string): string | null {
@@ -1721,10 +1884,13 @@ export function main(argv = process.argv.slice(2)): void {
       });
       return;
     }
-    const loaded = loadSources(argv, selection);
+    const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
+    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
     const goalMode = goalMigrationModeOption(argv);
-    const built = buildImportPlan(summariesForPlan(loaded.sources, renderMode, goalMode), { selection });
+    const titlePolicy = titleTransformPolicyOption(argv);
+    const activeContextPolicy = activeContextPolicyOption(argv);
+    const built = buildImportPlan(summariesForPlan(loaded.sources, renderMode, goalMode, titlePolicy), { selection });
     writeJson(option(argv, "--out"), {
       workspaceDir: loaded.workspaceDir,
       inventory: {
@@ -1738,6 +1904,9 @@ export function main(argv = process.argv.slice(2)): void {
       unreadableRecords: loaded.unreadable,
       renderMode,
       goalMode,
+      titlePolicy,
+      activeContextPolicy,
+      allowWrapperCwdRelocation,
       selected: built.plan.sessions,
       losses: built.plan.losses,
       sourceDigest: built.digest,
@@ -1767,15 +1936,19 @@ export function main(argv = process.argv.slice(2)): void {
     const evidencePath = option(argv, "--evidence");
     if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
     const selection = selectionOptions(argv);
-    const loaded = loadSources(argv, selection);
+    const allowWrapperCwdRelocation = flag(argv, "--allow-wrapper-cwd-relocation");
+    const loaded = loadSources(argv, selection, allowWrapperCwdRelocation);
     const codexHome = resolveCodexHome(option(argv, "--codex-home"));
     const dbPath = findStateDb(codexHome);
     if (!dbPath) throw new Error(`no Codex state database found under ${codexHome}`);
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
     const evidence = loadInstalledCodexTargetEvidence(evidencePath);
     const goalMode = goalMigrationModeOption(argv);
+    const titlePolicy = titleTransformPolicyOption(argv);
+    const activeContextPolicy = activeContextPolicyOption(argv);
     const matrix = buildMatrixPlan(
-      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")), goalMode,
+      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")), goalMode, titlePolicy,
+      activeContextPolicy, allowWrapperCwdRelocation,
       codexHome, dbPath, bridgeRoot, evidence,
     );
     writeJson(option(argv, "--out"), matrix.file);
@@ -1944,10 +2117,17 @@ export function main(argv = process.argv.slice(2)): void {
     stored.target.privateWriteProfile?.schema !== "pass-the-thread/codex-private-write-profile-v1") {
     throw new Error("unsupported import plan");
   }
+  const storedTitlePolicy = storedTitleTransformPolicy(stored.titlePolicy);
+  const storedActiveContextPolicy = parseStoredActiveContextPolicy(stored.activeContextPolicy);
+  if (typeof stored.allowWrapperCwdRelocation !== "boolean") {
+    throw new Error("unsupported wrapper cwd relocation policy");
+  }
   assertCurrentImportPlan(stored.plan);
   const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
     schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
-    goalMode: stored.goalMode,
+    goalMode: stored.goalMode, titlePolicy: storedTitlePolicy,
+    activeContextPolicy: storedActiveContextPolicy,
+    allowWrapperCwdRelocation: stored.allowWrapperCwdRelocation,
     plan: stored.plan, target: stored.target,
   };
   if (matrixPlanDigest(storedContent) !== stored.digest) {
@@ -1964,14 +2144,30 @@ export function main(argv = process.argv.slice(2)): void {
   if (requestedGoalMode != null && requestedGoalMode !== stored.goalMode) {
     throw new Error("apply Goal migration mode differs from the confirmed plan");
   }
-  const loaded = loadSources(argv, selectionFromPlan(stored.plan));
+  const requestedTitlePolicy = titleTransformPolicyOption(argv);
+  if ((option(argv, "--title-prefix") != null || optionValues(argv, "--replace-title-prefix").length > 0) &&
+    canonicalStringify(requestedTitlePolicy) !== canonicalStringify(storedTitlePolicy)) {
+    throw new Error("apply title transform policy differs from the confirmed plan");
+  }
+  const requestedActiveContextPolicy = activeContextPolicyOption(argv);
+  if (option(argv, "--compact-active-bytes") != null &&
+    canonicalStringify(requestedActiveContextPolicy) !== canonicalStringify(storedActiveContextPolicy)) {
+    throw new Error("apply active context policy differs from the confirmed plan");
+  }
+  if (flag(argv, "--allow-wrapper-cwd-relocation") && !stored.allowWrapperCwdRelocation) {
+    throw new Error("apply wrapper cwd relocation policy differs from the confirmed plan");
+  }
+  const loaded = loadSources(
+    argv, selectionFromPlan(stored.plan), stored.allowWrapperCwdRelocation,
+  );
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
   const dbPath = findStateDb(codexHome);
   if (!dbPath) throw new Error(`no Codex state database found under ${codexHome}`);
   const evidence = loadInstalledCodexTargetEvidence(evidencePath);
   const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
   const rebuilt = buildMatrixPlan(
-    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode, stored.goalMode,
+    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode, stored.goalMode, storedTitlePolicy,
+    storedActiveContextPolicy, stored.allowWrapperCwdRelocation,
     codexHome, dbPath, bridgeRoot, evidence,
   );
   if (rebuilt.file.digest !== stored.digest) {
