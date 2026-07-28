@@ -13,7 +13,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ClaudeTranscriptLine } from "./types.ts";
+import type { ClaudeTranscriptRecord } from "./types.ts";
 import { mapEffort, mapPermissionMode } from "./policy.ts";
 
 export interface WrapperRecord {
@@ -326,7 +326,7 @@ export interface BuildRecordInput {
   cliSessionId: string;
   /** Original-cased cwd (Codex session cwd). */
   cwd: string;
-  lines: ClaudeTranscriptLine[];
+  lines: ClaudeTranscriptRecord[];
   title: string;
   model?: string;
   /** Codex policy, mapped to Claude's single permissionMode when present. */

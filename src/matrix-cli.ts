@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
-import { resolveClaudeHome, resolveCodexHome } from "./paths.ts";
+import { normalizeCwd, resolveClaudeHome, resolveCodexHome } from "./paths.ts";
 import {
   inventoryClaudeDesktop,
   resolveClaudeDesktopWorkspace,
@@ -13,43 +13,118 @@ import {
 import { readClaudeJsonl } from "./claude-source.ts";
 import { claudeTranscriptToIr } from "./claude-to-ir.ts";
 import type { BridgeBundle, BridgeEvent } from "./ir.ts";
+import { codexRolloutToBridgeBundle, codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
+import { deriveSessionIdFromFilename, loadDesktopSessions, parseRollout } from "./codex-source.ts";
 import { writeBridgeConversation, defaultBridgeRoot } from "./bridge-store.ts";
-import { buildImportPlan, canonicalStringify, type ImportPlan, type ImportPlanSessionSummary } from "./import-plan.ts";
-import { selectSessions, type SelectionOptions } from "./selection.ts";
-import { loadDesktopSelection } from "./codex-desktop-state.ts";
-import { canonicalProjectIdentity } from "./project-identity.ts";
-import { findStateDb } from "./codex-db.ts";
+import {
+  assertCurrentImportPlan,
+  buildImportPlan,
+  canonicalStringify,
+  digestImportPlan,
+  preselectSessions,
+  REGENERATE_PLAN_MESSAGE,
+  type ImportPlan,
+  type ImportPlanSessionSummary,
+} from "./import-plan.ts";
+import { assertSelectorsResolve, selectSessions, type SelectionOptions, type SelectionSession } from "./selection.ts";
+import { loadDesktopSelection, loadDesktopSelectionResult, projectForCwd } from "./codex-desktop-state.ts";
+import { canonicalProjectIdentity, keySeparator } from "./project-identity.ts";
+import { findStateDb, loadDesktopThreads, reconcileCodexArchive, type DbThreadRow } from "./codex-db.ts";
 import {
   applyCodexTarget,
   acquireCodexTargetLock,
   assertCodexDesktopClosed,
-  estimatedActiveTokens,
+  estimatedActiveBytes,
   inspectCodexTargetPlan,
   operationJournalInputForPlan,
   planCodexTarget,
   releaseCodexTargetLock,
   type CodexTargetLock,
   type CodexTargetPlan,
+  type CodexTargetPlanState,
 } from "./codex-target.ts";
+import { assertThreadSchemaFile41059 } from "./codex-target-db.ts";
 import {
+  assertAlreadyAppliedOperationJournal,
   assertOperationJournalReady,
   commitOperationJournalIfPresent,
   loadOperationJournal,
   recoverCreatedFiles,
+  reconcileGoalActivation,
+  type OperationJournal,
 } from "./operation-journal.ts";
 import type { LogicalCodexConversation, LogicalCodexItem } from "./compat/codex/v26_721_41059.ts";
-import { assertSupportedCodexTarget, loadInstalledCodexTargetEvidence } from "./version-gate.ts";
-import type { CodexTargetEvidence } from "./version-gate.ts";
+import {
+  assertCodexPrivateWriteCapabilities,
+  assertSupportedCodexTarget,
+  loadInstalledCodexTargetEvidence,
+  probeCodexPrivateWriteProfile,
+} from "./version-gate.ts";
+import type {
+  CodexPrivateWriteCapability,
+  CodexPrivateWriteProfile,
+  CodexTargetEvidence,
+} from "./version-gate.ts";
 import { inertHistoricalNotice, parseRenderMode, type RenderMode } from "./render-mode.ts";
+import {
+  locateTranscriptFrom,
+  NO_PRIOR_IMPORTS,
+  readPriorImports,
+  transcriptPathFor,
+  type PriorImports,
+} from "./claude-target.ts";
+import { classifyTargetContent, type TargetContentClass } from "./continued.ts";
+import {
+  applyForwardSessions,
+  CLAUDE_FORWARD_RENDERER_FINGERPRINT,
+  CLAUDE_FORWARD_RENDERER_ID,
+  deterministicWrapperPath,
+  forwardSessionApplyPlan,
+  isRenderableForwardImage,
+  loadForwardApplyJournal,
+  renderForwardClaudeTranscript,
+  rollbackForwardSessions,
+  type ForwardSessionApplyPlan,
+} from "./claude-forward-target.ts";
+import {
+  findActiveWorkspaceDir,
+  findRecordFor,
+  countWorkspaceDirs,
+  resolveDesktopSessionsRoot,
+  signedInWorkspaceDir,
+} from "./claude-desktop-target.ts";
+import type { CodexSession } from "./types.ts";
+import {
+  assertClaudeGoalCondition,
+  CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+  CLAUDE_GOAL_TARGET_FINGERPRINT,
+} from "./claude-goal-target.ts";
+import {
+  assertCodexGoalReadback,
+  CODEX_GOAL_TARGET_CAPABILITY_ID,
+  CODEX_GOAL_TARGET_FINGERPRINT,
+  codexGoalSetBinding,
+  createCodexGoalRpc,
+  type CodexGoalActivationPlan,
+} from "./codex-goal-target.ts";
+import {
+  parseGoalMigrationMode,
+  planGoalMigration,
+  validateGoalMigrationDecision,
+  type GoalMigrationMode,
+} from "./goal.ts";
 
 export interface MatrixTargetSessionPlan {
-  sourceSessionId: string;
+  sourceWrapperSessionId: string;
+  sourceCliSessionId: string;
   operationId: string;
-  threadId: string;
+  targetThreadId: string;
   rolloutPath: string;
   rolloutSha256: string;
   archived: boolean;
-  activeTokenUpperBound: number;
+  activeContextUtf8Bytes: number;
+  goalActivation: CodexGoalActivationPlan | null;
+  requiredCapabilities: CodexPrivateWriteCapability[];
 }
 
 function releaseTargetLockAfter(
@@ -86,22 +161,299 @@ export interface MatrixTargetBinding {
   dbPath: string;
   bridgeRoot: string;
   evidence: CodexTargetEvidence;
+  privateWriteProfile: CodexPrivateWriteProfile;
+  goalCapabilityId: typeof CODEX_GOAL_TARGET_CAPABILITY_ID;
+  goalCapabilityFingerprint: string;
   sessions: MatrixTargetSessionPlan[];
 }
 
-export interface MatrixPlanFile {
-  schema: "agentryx.import-plan/v2";
+export interface MatrixReversePlanFile {
+  schema: "agentryx.import-plan/v4";
   direction: "claude-to-codex";
   renderMode: RenderMode;
+  goalMode: GoalMigrationMode;
   digest: string;
   plan: ImportPlan;
   target: MatrixTargetBinding;
 }
 
-interface LoadedSource {
+export interface MatrixForwardTargetSessionPlan {
+  sourceCodexRolloutId: string;
+  sourceCodexThreadId: string | null;
+  targetClaudeCliSessionId: string;
+  operationId: string;
+  targetPath: string;
+  targetProjectExists: boolean;
+  targetConversationExists: boolean;
+  targetConversationState: "absent" | "exact-existing" | "collision" | "relocated";
+  /** Present only when a transcript turned up outside the derived project directory. */
+  relocatedTranscriptPaths?: string[];
+  /**
+   * What the existing transcript was found to hold, relative to the import the
+   * history records for this session.
+   *
+   * Absent means `undecidable` — no import is recorded, or the file could not be
+   * placed against one — and absent is also what every session looked like before
+   * the plan could consult the history at all, so a plan over sessions with no
+   * recorded import digests exactly as it always has.
+   */
+  targetContentClass?: Exclude<TargetContentClass, "undecidable">;
+  targetSha256: string | null;
+  renderedSha256: string;
+  wrapperPath: string | null;
+  wrapperSha256: string | null;
+  renderedWrapperSha256: string | null;
+}
+
+export interface MatrixForwardTargetBinding {
+  codexHome: string | null;
+  claudeHome: string;
+  bridgeRoot: string;
+  workspaceDir: string | null;
+  renderPolicy: {
+    includeReasoning: true;
+    rendererId: typeof CLAUDE_FORWARD_RENDERER_ID;
+    rendererFingerprint: string;
+    goalCapabilityId: typeof CLAUDE_GOAL_TARGET_CAPABILITY_ID;
+    goalCapabilityFingerprint: string;
+  };
+  sessions: MatrixForwardTargetSessionPlan[];
+}
+
+export interface MatrixForwardPlanFile {
+  schema: "agentryx.import-plan/v4";
+  direction: "codex-to-claude";
+  renderMode: RenderMode;
+  goalMode: GoalMigrationMode;
+  digest: string;
+  plan: ImportPlan;
+  target: MatrixForwardTargetBinding;
+}
+
+export type MatrixPlanFile = MatrixReversePlanFile | MatrixForwardPlanFile;
+export type MatrixDirection = MatrixPlanFile["direction"];
+
+export interface LoadedSource {
   desktop: ClaudeDesktopSourceSession;
   bundle: BridgeBundle | null;
   summary: ImportPlanSessionSummary;
+}
+
+interface ForwardLoadedSource {
+  session: ForwardCodexSession;
+  bundle: BridgeBundle;
+  summary: ImportPlanSessionSummary;
+  targetPath: string;
+  targetProjectExists: boolean;
+  targetConversationExists: boolean;
+  /** What the transcript at `targetPath` holds, against this session's recorded import. */
+  targetContentClass: TargetContentClass;
+}
+
+type ForwardCodexSession = CodexSession & { archiveProvenance?: string };
+
+interface ForwardCodexInventory {
+  via: "desktop" | "db" | "scan";
+  sessions: ForwardCodexSession[];
+  membership: {
+    status: "available" | "missing" | "unreadable" | "unusable";
+    sourcePath: string;
+    detail: string | null;
+  };
+}
+
+export interface BuildForwardMatrixPlanOptions {
+  codexHome?: string;
+  claudeHome: string;
+  bridgeRoot: string;
+  selection?: SelectionOptions;
+  renderMode?: RenderMode;
+  goalMode?: GoalMigrationMode;
+  workspaceDir?: string | null;
+  expectedTargets?: readonly MatrixForwardTargetSessionPlan[];
+  /**
+   * What earlier imports recorded, read once by the caller — see `readPriorImports`.
+   * Omitted, every existing target is `undecidable` and stays behind
+   * `--allow-overwrite`, which is what this pipeline did before it could be told.
+   */
+  priorImports?: PriorImports;
+}
+
+export interface BuiltForwardMatrixPlan {
+  file: MatrixForwardPlanFile;
+  bundles: BridgeBundle[];
+  summaries: ImportPlanSessionSummary[];
+  sourceDigest: string;
+  applyPlans: ForwardSessionApplyPlan[];
+}
+
+/**
+ * Inventory every Codex rollout, without keeping any of them in memory.
+ *
+ * The inventory exists to be counted and selected from, and neither needs the
+ * transcript items: the forward pipeline reads the rollout file itself when it
+ * builds a bundle for a session the selection kept. Parsing with `retainItems`
+ * off leaves every field below exactly what it was and bounds the cost of this
+ * pass at one rollout at a time instead of the whole corpus at once.
+ */
+function loadForwardCodexInventory(codexHome: string): ForwardCodexInventory {
+  const parseOptions = { useCodexCompaction: false, retainItems: false } as const;
+  let inventory: ReturnType<typeof loadDesktopSessions>;
+  try {
+    inventory = loadDesktopSessions(codexHome, {
+      includeArchived: true,
+      ...parseOptions,
+    });
+  } catch {
+    // Legacy parsing may reject a future/non-object line. The typed pass below
+    // still inventories every rollout and records that envelope explicitly.
+    inventory = { via: "scan", sessions: [] };
+  }
+  const byPath = new Map(inventory.sessions.map((session) => [
+    canonicalExistingPath(session.rolloutPath).toLowerCase(),
+    session,
+  ]));
+  const dbByPath = new Map((loadDesktopThreads(codexHome, { includeArchived: true }) ?? [])
+    .filter((row) => row.rolloutPath !== "")
+    .map((row) => [canonicalExistingPath(row.rolloutPath).toLowerCase(), row]));
+  const desktopSelection = loadDesktopSelectionResult(codexHome);
+  const desktopState = desktopSelection.selection;
+  const sessions: ForwardCodexSession[] = [];
+  const seen = new Set<string>();
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(candidate);
+      else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        const key = canonicalExistingPath(candidate).toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let parsed: CodexSession | null = null;
+        try { parsed = parseRollout(candidate, parseOptions); } catch { /* typed IR handles it */ }
+        const session = enrichForwardSession(
+          byPath.get(key) ?? parsed ?? minimalCodexSession(candidate),
+          dbByPath.get(key),
+          desktopState,
+          codexHome,
+        );
+        if (!session || session.isChild || session.source.includes("subagent")) continue;
+        sessions.push(session);
+      }
+    }
+  };
+  walk(path.join(codexHome, "sessions"));
+  walk(path.join(codexHome, "archived_sessions"));
+  for (const session of inventory.sessions) {
+    const key = canonicalExistingPath(session.rolloutPath).toLowerCase();
+    if (!seen.has(key)) sessions.push(enrichForwardSession(session, dbByPath.get(key), desktopState, codexHome));
+  }
+  return {
+    via: inventory.via,
+    sessions: sessions.sort((left, right) => (right.lastTsMs ?? 0) - (left.lastTsMs ?? 0)),
+    membership: {
+      status: desktopSelection.status,
+      sourcePath: desktopSelection.sourcePath,
+      detail: desktopSelection.detail,
+    },
+  };
+}
+
+function enrichForwardSession(
+  original: CodexSession,
+  row: DbThreadRow | undefined,
+  desktopState: ReturnType<typeof loadDesktopSelection>,
+  codexHome: string,
+): ForwardCodexSession {
+  const session: ForwardCodexSession = { ...original };
+  if (row) {
+    if (session.desktopThreadId != null && session.desktopThreadId !== row.id) {
+      throw new Error(`Codex rollout thread id does not match thread index: ${session.rolloutPath}`);
+    }
+    session.desktopThreadId = row.id;
+    const rawCwd = row.cwd.replace(/^\\\\\?\\/, "");
+    if (rawCwd !== "") {
+      session.cwdOriginal = rawCwd;
+      session.cwd = normalizeCwd(rawCwd);
+    }
+    if (row.name != null) session.codexName = row.name;
+    if (row.title !== "") session.title = row.title.replace(/\s+/g, " ").slice(0, 100);
+    if (row.source !== "") session.source = row.source;
+    session.lastTsMs = row.updatedAtMs ?? session.lastTsMs;
+    session.sandboxPolicy = row.sandboxPolicy;
+    session.approvalMode = row.approvalMode;
+    session.reasoningEffort = row.reasoningEffort;
+  }
+  const archive = reconcileCodexArchive(codexHome, session.rolloutPath, row);
+  session.isArchived = archive.state === "unknown" ? undefined : archive.state === "archived";
+  session.archiveProvenance = archive.provenance;
+  if (desktopState != null) {
+    const desktopThreadId = row?.id ?? session.desktopThreadId;
+    if (desktopThreadId == null) return session;
+    if (desktopState.unknownThreadIds.has(desktopThreadId)) return session;
+    if (desktopState.mode === "assigned" &&
+      !desktopState.threadProject.has(desktopThreadId) &&
+      !desktopState.projectlessThreadIds.has(desktopThreadId)) return session;
+    const project = desktopState.mode === "assigned"
+      ? desktopState.threadProject.get(desktopThreadId) ?? null
+      : desktopState.projectlessThreadIds.has(desktopThreadId)
+        ? null
+        : projectForCwd(desktopState, session.cwdOriginal || session.cwd);
+    session.projectName = project?.name ?? "(no project)";
+    session.hasProject = project != null;
+  }
+  return session;
+}
+
+function minimalCodexSession(rolloutPath: string): CodexSession {
+  const meta: Record<string, unknown> = {};
+  let firstTsMs: number | null = null;
+  let lastTsMs: number | null = null;
+  try {
+    const raw = fs.readFileSync(rolloutPath, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      if (line.trim() === "") continue;
+      let parsed: unknown;
+      try { parsed = JSON.parse(line.replace(/^\uFEFF/, "")); } catch { continue; }
+      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const record = parsed as Record<string, unknown>;
+      const timestamp = typeof record.timestamp === "string" ? Date.parse(record.timestamp) : Number.NaN;
+      if (Number.isFinite(timestamp)) {
+        if (firstTsMs == null) firstTsMs = timestamp;
+        lastTsMs = timestamp;
+      }
+      if (record.type === "session_meta" && record.payload && typeof record.payload === "object") {
+        Object.assign(meta, record.payload);
+      }
+    }
+  } catch {
+    // The typed adapter will surface the source read error with its exact path.
+  }
+  const rawCwd = typeof meta.cwd === "string" ? meta.cwd.replace(/^\\\\\?\\/, "") : "";
+  const sourceValue = meta.source ?? meta.originator;
+  const source = typeof sourceValue === "string"
+    ? sourceValue
+    : sourceValue == null ? "" : JSON.stringify(sourceValue);
+  const sessionId = deriveSessionIdFromFilename(rolloutPath);
+  const nativeThreadId = typeof meta.id === "string" && meta.id !== "" ? meta.id : undefined;
+  return {
+    sessionId,
+    ...(nativeThreadId == null ? {} : { desktopThreadId: nativeThreadId }),
+    rolloutPath,
+    cwd: rawCwd === "" ? "" : normalizeCwd(rawCwd),
+    cwdOriginal: rawCwd,
+    meta,
+    firstTsMs,
+    lastTsMs,
+    items: [],
+    model: null,
+    messageCount: 0,
+    title: "",
+    source,
+    isChild: meta.parent_thread_id != null && meta.parent_thread_id !== "",
+    userMessageCount: 0,
+  };
 }
 
 function optionValues(argv: string[], name: string): string[] {
@@ -164,20 +516,37 @@ export function selectionOptions(argv: string[]): SelectionOptions {
   };
 }
 
-function targetProject(codexHome: string, cwd: string): { exists: boolean; name?: string } {
-  const state = loadDesktopSelection(codexHome);
-  if (!state || cwd === "") return { exists: false };
+export function matrixDirection(argv: string[]): MatrixDirection {
+  const value = option(argv, "--direction");
+  if (value == null) return "claude-to-codex";
+  if (value !== "claude-to-codex" && value !== "codex-to-claude") {
+    throw new Error("--direction must be claude-to-codex or codex-to-claude");
+  }
+  return value;
+}
+
+function targetProject(codexHome: string, cwd: string): {
+  exists: boolean | null;
+  name?: string;
+  provenance: string;
+} {
+  const result = loadDesktopSelectionResult(codexHome);
+  const state = result.selection;
+  if (!state) return { exists: null, provenance: `codex-global-state:${result.status}` };
+  if (cwd === "") return { exists: false, provenance: "canonical-target-root" };
   const needle = canonicalProjectIdentity(cwd).key;
   let best: { length: number; name: string } | null = null;
   for (const project of state.projects.values()) {
     for (const raw of project.rootPaths) {
       let root: string;
       try { root = canonicalProjectIdentity(raw).key; } catch { continue; }
-      if (needle !== root && !needle.startsWith(root + path.sep.toLowerCase())) continue;
+      if (needle !== root && !needle.startsWith(root + keySeparator(root))) continue;
       if (best == null || root.length > best.length) best = { length: root.length, name: project.name };
     }
   }
-  return best ? { exists: true, name: best.name } : { exists: false };
+  return best
+    ? { exists: true, name: best.name, provenance: "canonical-target-root" }
+    : { exists: false, provenance: "canonical-target-root" };
 }
 
 export function transcriptIdentityError(
@@ -196,10 +565,9 @@ export function transcriptIdentityError(
   for (const cwd of transcript.cwds) {
     try {
       const transcriptKey = canonicalProjectIdentity(cwd).key;
-      const separator = path.sep.toLowerCase();
       const compatible = transcriptKey === wrapperKey ||
-        transcriptKey.startsWith(wrapperKey + separator) ||
-        wrapperKey.startsWith(transcriptKey + separator);
+        transcriptKey.startsWith(wrapperKey + keySeparator(wrapperKey)) ||
+        wrapperKey.startsWith(transcriptKey + keySeparator(transcriptKey));
       if (!compatible) return "wrapper cwd does not match transcript cwd";
     } catch {
       return "transcript cwd cannot be canonicalized";
@@ -251,29 +619,96 @@ function lossObservations(events: BridgeEvent[]): Array<{ kind: string; count: n
   return [...counts].sort(([a], [b]) => a.localeCompare(b)).map(([kind, count]) => ({ kind, count }));
 }
 
+/** Loss policy for the typed Codex IR when it is rendered into Claude history. */
+export function forwardLossObservations(
+  events: readonly BridgeEvent[],
+  renderMode: RenderMode,
+): Array<{ kind: string; count: number; detail?: string }> {
+  if (renderMode === "verbatim") {
+    return [{
+      kind: "verbatim_semantics_intentionally_inert",
+      count: Math.max(1, events.length),
+      detail: "Canonical source text is preserved, but source-native semantics are not activated in Claude.",
+    }];
+  }
+
+  const counts = new Map<string, number>();
+  const add = (kind: string): void => {
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  };
+  for (const event of events) {
+    if (event.kind === "unknown") add(`unknown_event_sidecar_only:${event.reason}`);
+    else if (event.kind === "protocol") {
+      add(event.recordType === "event_msg"
+        ? "event_msg_protocol_sidecar_only"
+        : `protocol_record_sidecar_only:${event.recordType}`);
+    } else if (event.kind === "turn_context") add("turn_context_sidecar_only");
+    else if (event.kind === "world_state") add("world_state_sidecar_only");
+    else if (event.kind === "reasoning") add("reasoning_rendered_as_inert_metadata");
+    else if (event.kind === "goal_snapshot") add("historical_goal_not_rendered_or_activated");
+    // task_notification is rendered as readable inert metadata, never raw chat.
+    else if (event.kind === "access_snapshot") add("access_snapshot_not_rendered_or_applied");
+    else if (event.kind === "media" && !isRenderableForwardImage(event)) {
+      add(event.mediaType === "image"
+        ? "unsupported_image_sidecar_only"
+        : `unsupported_media_not_rendered:${event.mediaType}`);
+    }
+  }
+  return [...counts]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([kind, count]) => ({ kind, count }));
+}
+
 export function nativeToolUseIds(events: BridgeEvent[]): Set<string> {
-  const callIndexes = new Map<string, number[]>();
-  const resultIndexes = new Map<string, number[]>();
-  for (const [index, event] of events.entries()) {
+  const callCounts = new Map<string, number>();
+  const resultCounts = new Map<string, number>();
+  for (const event of events) {
     if (event.kind === "tool_use" && event.toolUseId) {
-      const indexes = callIndexes.get(event.toolUseId) ?? [];
-      indexes.push(index);
-      callIndexes.set(event.toolUseId, indexes);
+      callCounts.set(event.toolUseId, (callCounts.get(event.toolUseId) ?? 0) + 1);
     } else if (event.kind === "tool_result" && event.toolUseId) {
-      const indexes = resultIndexes.get(event.toolUseId) ?? [];
-      indexes.push(index);
-      resultIndexes.set(event.toolUseId, indexes);
+      resultCounts.set(event.toolUseId, (resultCounts.get(event.toolUseId) ?? 0) + 1);
     }
   }
   const valid = new Set<string>();
-  for (const [index, event] of events.entries()) {
-    if (event.kind !== "tool_use" || !event.toolUseId || !event.name) continue;
-    const plainInput = event.input != null && typeof event.input === "object" && !Array.isArray(event.input);
-    const calls = callIndexes.get(event.toolUseId) ?? [];
-    const results = resultIndexes.get(event.toolUseId) ?? [];
-    if (plainInput && calls.length === 1 && results.length <= 1 && (results.length === 0 || results[0]! > index)) {
-      valid.add(event.toolUseId);
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index]?.kind !== "tool_use") continue;
+    const calls: Extract<BridgeEvent, { kind: "tool_use" }>[] = [];
+    let cursor = index;
+    while (events[cursor]?.kind === "tool_use") {
+      calls.push(events[cursor] as Extract<BridgeEvent, { kind: "tool_use" }>);
+      cursor += 1;
     }
+    const results: Extract<BridgeEvent, { kind: "tool_result" }>[] = [];
+    while (events[cursor]?.kind === "tool_result") {
+      results.push(events[cursor] as Extract<BridgeEvent, { kind: "tool_result" }>);
+      cursor += 1;
+    }
+    const callIds = calls.map((call) => call.toolUseId);
+    const resultIds = results.map((result) => result.toolUseId);
+    const callEnvelopeId = calls[0]?.sourceEnvelopeId;
+    const resultEnvelopeId = results[0]?.sourceEnvelopeId;
+    const callRecordUuid = calls[0]?.sourceRecordUuid;
+    const resultRecordUuid = results[0]?.sourceRecordUuid;
+    const validCalls = calls.length > 0 && calls.every((call) =>
+      call.role === "assistant" && call.toolUseId != null && call.toolUseId.trim() !== "" &&
+      call.sourceEnvelopeId === callEnvelopeId && call.sourceRecordUuid === callRecordUuid &&
+      callRecordUuid != null && callRecordUuid.trim() !== "" &&
+      call.name != null && call.name.trim() !== "" &&
+      call.input != null && typeof call.input === "object" && !Array.isArray(call.input) &&
+      callCounts.get(call.toolUseId) === 1);
+    const validResults = results.length === calls.length && results.every((result) =>
+      result.role === "user" && result.toolUseId != null && result.toolUseId.trim() !== "" &&
+      result.sourceEnvelopeId === resultEnvelopeId && result.sourceRecordUuid === resultRecordUuid &&
+      resultRecordUuid != null && resultRecordUuid.trim() !== "" &&
+      result.sourceParentUuid === callRecordUuid &&
+      resultCounts.get(result.toolUseId) === 1);
+    if (validCalls && validResults &&
+      callEnvelopeId !== resultEnvelopeId && callRecordUuid !== resultRecordUuid &&
+      new Set(callIds).size === calls.length && new Set(resultIds).size === results.length &&
+      callIds.every((callId) => resultIds.includes(callId))) {
+      for (const callId of callIds) valid.add(callId!);
+    }
+    index = Math.max(index, cursor - 1);
   }
   return valid;
 }
@@ -288,7 +723,7 @@ function loadSources(
     resolveClaudeDesktopWorkspace(claudeHome, sessionsRoot);
   const inventory = inventoryClaudeDesktop(claudeHome, workspaceDir);
   const targets = new Map(inventory.sessions.map((desktop) => [desktop.sessionId, targetProject(codexHome, desktop.cwd)]));
-  const selectedIds = new Set(selectSessions(inventory.sessions.map((desktop) => {
+  const selectionSessions: SelectionSession[] = inventory.sessions.map((desktop) => {
     const target = targets.get(desktop.sessionId)!;
     return {
       sessionId: desktop.sessionId,
@@ -297,11 +732,20 @@ function loadSources(
       projectName: target.name,
       hasProject: desktop.cwd !== "",
       isArchived: desktop.isArchived,
-      targetExists: target.exists,
+      archiveState: desktop.archiveState,
+      archiveProvenance: desktop.archiveProvenance,
+      projectMembership: desktop.cwd === "" ? "projectless" : "project",
+      projectMembershipProvenance: "claude-wrapper-cwd",
+      targetProjectExists: target.exists,
       firstTsMs: desktop.createdAtMs,
       lastTsMs: desktop.lastActivityAtMs,
     };
-  }), selection).map((session) => session.sessionId));
+  });
+  // Checked once, against the whole freshly loaded inventory, before selection
+  // narrows it: an explicit --session/--project value that matches nothing here
+  // means the request was not honored, not that it selected fewer sessions.
+  assertSelectorsResolve(selectionSessions, selection);
+  const selectedIds = new Set(selectSessions(selectionSessions, selection).map((session) => session.sessionId));
   const sources: LoadedSource[] = inventory.sessions.filter((desktop) => selectedIds.has(desktop.sessionId)).map((desktop) => {
     const target = targets.get(desktop.sessionId)!;
     if (!desktop.transcriptExists || desktop.transcriptPath == null) {
@@ -311,7 +755,11 @@ function loadSources(
         summary: {
           sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
           projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-          targetExists: target.exists, firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
+          archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
+          projectMembership: desktop.cwd === "" ? "projectless" : "project",
+          projectMembershipProvenance: "claude-wrapper-cwd",
+          targetProjectExists: target.exists,
+          firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
           sourcePath: desktop.transcriptPath ?? undefined, title: desktop.title,
           losses: [{ kind: `transcript_${desktop.transcriptStatus}`, count: 1 }],
         },
@@ -326,7 +774,11 @@ function loadSources(
         summary: {
           sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
           projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-          targetExists: target.exists, firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
+          archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
+          projectMembership: desktop.cwd === "" ? "projectless" : "project",
+          projectMembershipProvenance: "claude-wrapper-cwd",
+          targetProjectExists: target.exists,
+          firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
           sourcePath: desktop.transcriptPath, sourceSha256: transcript.contentSha256,
           title: desktop.title || transcript.title || undefined,
           losses: [{ kind: "transcript_identity_mismatch", count: 1, detail: identityError }],
@@ -340,7 +792,11 @@ function loadSources(
       summary: {
         sessionId: desktop.sessionId, cwd: desktop.cwd, projectRoot: desktop.cwd,
         projectName: target.name, hasProject: desktop.cwd !== "", isArchived: desktop.isArchived,
-        targetExists: target.exists, firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
+        archiveState: desktop.archiveState, archiveProvenance: desktop.archiveProvenance,
+        projectMembership: desktop.cwd === "" ? "projectless" : "project",
+        projectMembershipProvenance: "claude-wrapper-cwd",
+        targetProjectExists: target.exists,
+        firstTsMs: desktop.createdAtMs, lastTsMs: desktop.lastActivityAtMs,
         sourcePath: desktop.transcriptPath, sourceSha256: transcript.contentSha256,
         title: desktop.title || transcript.title || undefined,
         messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
@@ -395,7 +851,7 @@ function exactSourceText(source: LoadedSource): string {
   return source.bundle.envelopes.map((envelope) => envelope.raw + envelope.lineEnding).join("");
 }
 
-function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<LogicalCodexConversation, "threadId"> {
+export function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<LogicalCodexConversation, "threadId"> {
   if (!source.bundle) throw new Error(`source transcript is missing for ${source.desktop.sessionId}`);
   if (renderMode === "verbatim") {
     const createdAtMs = source.desktop.createdAtMs;
@@ -404,13 +860,13 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
       : new Date(0).toISOString();
     const literal = `${inertHistoricalNotice("Claude JSONL")}\n\n${exactSourceText(source)}`;
     const logical = {
-      cwd: source.desktop.cwd || os.homedir(),
+      cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
       title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation (verbatim)",
       createdAt,
       messages: [],
       items: [{ kind: "historical_context" as const, text: literal, timestamp: createdAt }],
     };
-    estimatedActiveTokens(logical);
+    estimatedActiveBytes(logical);
     return logical;
   }
   const events = source.bundle.conversation.events;
@@ -488,13 +944,30 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
       });
     } else if (event.kind === "compact_boundary") {
       if (event.activeContextStartsAfter) {
-        compaction = { activeItemIndex: items.length, ...compactNumbers(event.compactMetadata) };
+        const summary = compactSummary(event.compactMetadata) ?? pendingSummary;
+        compaction = {
+          activeItemIndex: items.length,
+          ...compactNumbers(event.compactMetadata),
+          ...(summary == null ? {} : { summary }),
+        };
+        pendingSummary = undefined;
       } else {
-        pendingSummary = compactSummary(event.compactMetadata) ?? pendingSummary;
+        const summary = compactSummary(event.compactMetadata);
+        if (summary != null && compaction != null && compaction.summary == null) {
+          // Claude Desktop 2.1.x writes the visible compact summary directly
+          // after the system compact_boundary record.
+          compaction.summary = summary;
+        } else {
+          pendingSummary = summary ?? pendingSummary;
+        }
       }
     }
   }
-  if (compaction && pendingSummary) compaction.summary = pendingSummary;
+  if (compaction != null && (compaction.summary == null || compaction.summary.trim() === "")) {
+    throw new Error(
+      `Claude compact boundary has no recoverable replacement summary: ${source.desktop.sessionId}`,
+    );
+  }
   let earliest = Number.POSITIVE_INFINITY;
   for (const event of events) {
     if (!event.timestamp) continue;
@@ -503,7 +976,7 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
   }
   const createdAt = new Date(source.desktop.createdAtMs ?? earliest);
   const logical = {
-    cwd: source.desktop.cwd || os.homedir(),
+    cwd: canonicalProjectIdentity(source.desktop.cwd || os.homedir()).path,
     title: source.desktop.title || source.bundle.conversation.title || "Imported Claude conversation",
     createdAt: Number.isNaN(createdAt.getTime()) ? new Date(0).toISOString() : createdAt.toISOString(),
     messages,
@@ -511,11 +984,14 @@ function bridgeToLogical(source: LoadedSource, renderMode: RenderMode): Omit<Log
     compaction,
   };
   // Force the resume-budget computation during plan/apply mapping.
-  estimatedActiveTokens(logical);
+  estimatedActiveBytes(logical);
   return logical;
 }
 
-export function matrixPlanDigest(value: Omit<MatrixPlanFile, "digest">): string {
+export function matrixPlanDigest(
+  value: Omit<MatrixReversePlanFile, "digest"> | Omit<MatrixForwardPlanFile, "digest">,
+): string {
+  assertCurrentImportPlan(value.plan);
   return createHash("sha256").update(canonicalStringify(value), "utf8").digest("hex");
 }
 
@@ -524,15 +1000,369 @@ function canonicalExistingPath(value: string): string {
   try { return fs.realpathSync.native(resolved); } catch { return resolved; }
 }
 
-function targetSummary(sourceSessionId: string, plan: CodexTargetPlan): MatrixTargetSessionPlan {
+function loadForwardSource(
+  session: ForwardCodexSession,
+  codexHome: string | undefined,
+  claudeHome: string,
+  renderMode: RenderMode,
+  goalMode: GoalMigrationMode,
+  priorImports: PriorImports,
+): ForwardLoadedSource {
+  const canonicalSession = { ...session, rolloutPath: canonicalExistingPath(session.rolloutPath) };
+  const bundle = codexHome == null
+    ? codexRolloutToBridgeBundle(canonicalSession)
+    : codexRolloutWithGoalToBridgeBundle(canonicalSession, codexHome);
+  const targetPath = canonicalExistingPath(transcriptPathFor(
+    claudeHome, session.cwdOriginal || session.cwd, session.sessionId,
+  ));
+  const boundSession = { ...canonicalSession, sourceContentSha256: bundle.conversation.sourceContentSha256 };
+  const projectRoot = session.cwdOriginal || session.cwd;
+  const targetConversationExists = fs.existsSync(targetPath);
+  const targetProjectExists = fs.existsSync(path.dirname(targetPath));
+  // Nothing at the derived path is not the same as nothing anywhere: Claude
+  // keeps a conversation under its own project directory, which need not be the
+  // one this session's cwd derives. Resolve by session id before calling it absent.
+  const location = locateTranscriptFrom(claudeHome, targetPath, session.sessionId);
+  // What an existing transcript holds, judged against the import the history
+  // records. The evidence arrives as an argument rather than being read here, so
+  // that two plans over the same sessions and the same evidence stay identical.
+  // A relocated conversation is not classified at all: whatever sits at the
+  // derived path says nothing about the file Claude actually kept, and the write
+  // is refused outright either way.
+  const prior = priorImports.get(session.sessionId);
+  const targetContentClass: TargetContentClass = location.state === "relocated"
+    ? "undecidable"
+    : classifyTargetContent(targetPath, prior?.importedAtMs, {
+      expectedSha256: prior?.targetSha256 ?? null,
+    }).classification;
   return {
-    sourceSessionId,
+    session: boundSession,
+    bundle,
+    targetPath,
+    targetProjectExists,
+    targetConversationExists,
+    targetContentClass,
+    summary: {
+      sessionId: session.sessionId,
+      cwd: projectRoot,
+      projectRoot,
+      projectName: session.projectName,
+      hasProject: session.hasProject,
+      projectMembership: session.hasProject === true
+        ? "project"
+        : session.hasProject === false ? "projectless" : "unknown",
+      projectMembershipProvenance: session.hasProject == null
+        ? "codex-global-state-unavailable"
+        : "codex-desktop-membership",
+      isArchived: session.isArchived,
+      archiveState: session.isArchived === true ? "archived" : session.isArchived === false ? "active" : "unknown",
+      archiveProvenance: session.archiveProvenance ?? "codex-archive-unavailable",
+      targetProjectExists,
+      targetConversationExists,
+      targetConversationState: location.state === "relocated"
+        ? "relocated"
+        : targetConversationExists ? "collision" : "absent",
+      ...(location.relocatedPaths.length > 0
+        ? { relocatedTranscriptPaths: location.relocatedPaths }
+        : {}),
+      firstTsMs: session.firstTsMs,
+      lastTsMs: session.lastTsMs,
+      sourcePath: canonicalExistingPath(session.rolloutPath),
+      sourceSha256: bundle.conversation.sourceContentSha256,
+      title: session.codexName || session.title || undefined,
+      messageCount: bundle.conversation.events.filter((event) => event.kind === "text").length,
+      losses: forwardLossObservations(bundle.conversation.events, renderMode),
+      goalDecision: (() => {
+        if (goalMode === "migrate" && bundle.conversation.goalState?.migrationEligible) {
+          assertClaudeGoalCondition(bundle.conversation.goalState.objective);
+        }
+        return planGoalMigration(
+          bundle.conversation.goalState, goalMode, CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+        );
+      })(),
+    },
+  };
+}
+
+/**
+ * What selection reads about one inventoried session, without opening its rollout.
+ *
+ * Every field here is the one `loadForwardSource` puts on the full summary, and
+ * they are the only fields `selectSessions` consults. The rest of that summary —
+ * the source hash, the title, the message count, the losses, the Goal decision —
+ * costs a bundle per session and is therefore built after the selection, for the
+ * sessions the selection kept.
+ */
+function forwardSelectionSummary(
+  session: CodexSession,
+  claudeHome: string,
+): ImportPlanSessionSummary {
+  const projectRoot = session.cwdOriginal || session.cwd;
+  const targetPath = canonicalExistingPath(transcriptPathFor(claudeHome, projectRoot, session.sessionId));
+  return {
+    sessionId: session.sessionId,
+    cwd: projectRoot,
+    projectRoot,
+    projectName: session.projectName,
+    hasProject: session.hasProject,
+    projectMembership: session.hasProject === true
+      ? "project"
+      : session.hasProject === false ? "projectless" : "unknown",
+    isArchived: session.isArchived,
+    archiveState: session.isArchived === true ? "archived" : session.isArchived === false ? "active" : "unknown",
+    targetProjectExists: fs.existsSync(path.dirname(targetPath)),
+    firstTsMs: session.firstTsMs,
+    lastTsMs: session.lastTsMs,
+  };
+}
+
+/**
+ * Narrow the inventory before anything is loaded from it.
+ *
+ * Selection order, the fail-closed unknowns, and the newest-first `--limit` are
+ * the plan builder's own, applied to the same values it would have seen; running
+ * them again over the survivors changes nothing, so the plan and its digest are
+ * exactly what an unpruned build produced.
+ */
+function selectForwardSessions<T extends CodexSession>(
+  sessions: readonly T[],
+  claudeHome: string,
+  selection: SelectionOptions,
+  expectedById?: ReadonlyMap<string, MatrixForwardTargetSessionPlan>,
+): T[] {
+  const summaries = sessions.map((session) => {
+    const summary = forwardSelectionSummary(session, claudeHome);
+    const expected = expectedById?.get(session.sessionId);
+    if (expected != null) {
+      if (selection.projectScope === "existing-targets" && summary.targetProjectExists !== true) {
+        throw new Error(`confirmed target project ceased to exist for ${session.sessionId}`);
+      }
+      // A rebuild judges the target the confirmed plan bound, as it did before.
+      summary.targetProjectExists = expected.targetProjectExists;
+    }
+    return summary;
+  });
+  // Checked once, against the whole freshly loaded inventory, before selection
+  // narrows it: an explicit --session/--project value that matches nothing here
+  // means the request was not honored, not that it selected fewer sessions.
+  assertSelectorsResolve(summaries, selection);
+  const kept = new Set(preselectSessions(summaries, { selection }).map((summary) => summary.sessionId));
+  return sessions.filter((session) => kept.has(session.sessionId));
+}
+
+function buildForwardApplyPlan(
+  source: ForwardLoadedSource,
+  workspaceDir: string | null,
+  renderMode: RenderMode,
+  goalMode: GoalMigrationMode,
+  expected?: MatrixForwardTargetSessionPlan,
+): ForwardSessionApplyPlan {
+  let existingWrapper = workspaceDir == null ? null : findRecordFor(workspaceDir, source.session.sessionId);
+  if (workspaceDir != null) {
+    const matches: string[] = [];
+    for (const name of fs.readdirSync(workspaceDir)) {
+      if (!name.startsWith("local_") || !name.endsWith(".json")) continue;
+      const candidate = path.join(workspaceDir, name);
+      try {
+        const record = JSON.parse(fs.readFileSync(candidate, "utf8")) as { cliSessionId?: unknown };
+        if (record.cliSessionId === source.session.sessionId) matches.push(candidate);
+      } catch { /* unrelated unreadable records do not become overwrite candidates */ }
+    }
+    if (matches.length > 1) throw new Error(`multiple Claude wrappers target ${source.session.sessionId}; selection is ambiguous`);
+    if (matches.length === 1 && existingWrapper?.path !== matches[0]) {
+      existingWrapper = findRecordFor(workspaceDir, source.session.sessionId);
+    }
+  }
+  const newWrapperPath = workspaceDir == null ? null : deterministicWrapperPath(workspaceDir, source.session.sessionId);
+  if (existingWrapper == null && newWrapperPath != null && fs.existsSync(newWrapperPath)) {
+    let cliSessionId: unknown;
+    try { cliSessionId = (JSON.parse(fs.readFileSync(newWrapperPath, "utf8")) as { cliSessionId?: unknown }).cliSessionId; }
+    catch { throw new Error(`deterministic Claude wrapper collision for ${source.session.sessionId}`); }
+    if (cliSessionId !== source.session.sessionId) {
+      throw new Error(`Claude wrapper was repointed or collides for ${source.session.sessionId}; it will not be overwritten`);
+    }
+  }
+  let wrapperPath = workspaceDir == null ? null : canonicalExistingPath(existingWrapper?.path ?? newWrapperPath!);
+  if (expected) {
+    const wrapperMatches = wrapperPath === expected.wrapperPath ||
+      (wrapperPath != null && expected.wrapperPath != null &&
+        canonicalExistingPath(wrapperPath).toLowerCase() === canonicalExistingPath(expected.wrapperPath).toLowerCase());
+    if (!wrapperMatches) throw new Error(`forward wrapper binding changed for ${source.session.sessionId}`);
+    // Retain the exact confirmed spelling before deriving the session operation id.
+    wrapperPath = expected.wrapperPath;
+  }
+  const lines = renderForwardClaudeTranscript(source.session, source.bundle, { renderMode, goalMode });
+  return forwardSessionApplyPlan(source.session, lines, source.targetPath, wrapperPath);
+}
+
+/**
+ * Build a deterministic, read-only Codex-to-Claude matrix plan from an isolated
+ * inventory. The only filesystem operations are source reads and reads of the
+ * targets themselves — existence, bytes, and what an existing transcript holds;
+ * neither the bridge store nor Claude home is created.
+ *
+ * Everything outside those targets arrives as an argument. In particular the
+ * import history is not opened here: `options.priorImports` carries it, read once
+ * by the caller, so that the same inventory and the same evidence always build
+ * the same plan.
+ */
+export function buildForwardMatrixPlan(
+  sessions: readonly CodexSession[],
+  options: BuildForwardMatrixPlanOptions,
+): BuiltForwardMatrixPlan {
+  const renderMode = options.renderMode ?? "semantic";
+  const goalMode = options.goalMode ?? "migrate";
+  const selection = options.selection ?? {};
+  // Plan-bound target roots must not change merely because apply creates them.
+  const claudeHome = path.resolve(options.claudeHome);
+  const bridgeRoot = path.resolve(options.bridgeRoot);
+  const workspaceDir = options.workspaceDir == null ? null : path.resolve(options.workspaceDir);
+  const priorImports = options.priorImports ?? NO_PRIOR_IMPORTS;
+  const expectedById = new Map((options.expectedTargets ?? []).map((target) => [target.sourceCodexRolloutId, target]));
+  // Selection first: what it excludes costs no bundle, no render, and no scan
+  // of the target home.
+  const sources = selectForwardSessions(sessions, claudeHome, selection, expectedById)
+    .map((session) => loadForwardSource(
+      session, options.codexHome, claudeHome, renderMode, goalMode, priorImports,
+    ));
+  for (const source of sources) {
+    const expected = expectedById.get(source.session.sessionId);
+    if (expected) {
+      if (selection.projectScope === "existing-targets" && !source.targetProjectExists) {
+        throw new Error(`confirmed target project ceased to exist for ${source.session.sessionId}`);
+      }
+      source.summary.targetProjectExists = expected.targetProjectExists;
+      source.summary.targetConversationExists = expected.targetConversationExists;
+      source.summary.targetConversationState = expected.targetConversationState;
+      source.targetPath = expected.targetPath;
+    }
+  }
+  const summaries = sources.map((source) => source.summary);
+  const built = buildImportPlan(summaries, { selection });
+  const byId = new Map(sources.map((source) => [source.session.sessionId, source]));
+  const selectedApplyPlans = new Map(built.plan.sessions.map((selected) => {
+    const source = byId.get(selected.sessionId);
+    if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
+    const expected = expectedById.get(selected.sessionId);
+    const applyPlan = buildForwardApplyPlan(source, workspaceDir, renderMode, goalMode, expected);
+    if (expected) {
+      const actualWrapperPath = applyPlan.wrapper?.path ?? null;
+      const wrapperPathMatches = actualWrapperPath === expected.wrapperPath ||
+        (actualWrapperPath != null && expected.wrapperPath != null &&
+          canonicalExistingPath(actualWrapperPath).toLowerCase() === canonicalExistingPath(expected.wrapperPath).toLowerCase());
+      if (canonicalExistingPath(applyPlan.transcript.path).toLowerCase() !== canonicalExistingPath(expected.targetPath).toLowerCase() ||
+        applyPlan.transcript.afterSha256 !== expected.renderedSha256 ||
+        applyPlan.operationId !== expected.operationId || !wrapperPathMatches ||
+        (applyPlan.wrapper?.afterSha256 ?? null) !== expected.renderedWrapperSha256) {
+        throw new Error(`forward target or rendered output changed for ${selected.sessionId}`);
+      }
+      if (applyPlan.transcript.beforeSha256 !== expected.targetSha256 && applyPlan.transcript.beforeSha256 !== expected.renderedSha256) {
+        throw new Error(`forward transcript drift for ${selected.sessionId}`);
+      }
+      if (applyPlan.wrapper != null && applyPlan.wrapper.beforeSha256 !== expected.wrapperSha256 &&
+        applyPlan.wrapper.beforeSha256 !== expected.renderedWrapperSha256) {
+        throw new Error(`forward wrapper drift for ${selected.sessionId}`);
+      }
+      applyPlan.transcript.beforeSha256 = expected.targetSha256;
+      applyPlan.transcript.path = expected.targetPath;
+      if (applyPlan.wrapper != null) {
+        applyPlan.wrapper.beforeSha256 = expected.wrapperSha256;
+        applyPlan.wrapper.path = expected.wrapperPath!;
+      }
+    }
+    return [selected.sessionId, applyPlan] as const;
+  }));
+  for (const selected of built.plan.sessions) {
+    const source = byId.get(selected.sessionId)!;
+    const applyPlan = selectedApplyPlans.get(selected.sessionId)!;
+    selected.targetProjectExists = source.summary.targetProjectExists ?? null;
+    selected.targetConversationExists = applyPlan.transcript.beforeSha256 != null;
+    // A relocated transcript survives the hash-derived restatement below: there
+    // are no bytes at the derived path to hash, and "absent" is the one verdict
+    // it must not collapse into.
+    selected.targetConversationState = source.summary.targetConversationState === "relocated"
+      ? "relocated"
+      : applyPlan.transcript.beforeSha256 == null
+        ? "absent"
+        : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
+          ? "exact-existing" : "collision";
+  }
+  const withoutDigest: Omit<MatrixForwardPlanFile, "digest"> = {
+    schema: "agentryx.import-plan/v4",
+    direction: "codex-to-claude",
+    renderMode,
+    goalMode,
+    plan: built.plan,
+    target: {
+      codexHome: options.codexHome == null ? null : canonicalExistingPath(options.codexHome),
+      claudeHome,
+      bridgeRoot,
+      workspaceDir,
+      renderPolicy: {
+        includeReasoning: true,
+        rendererId: CLAUDE_FORWARD_RENDERER_ID,
+        rendererFingerprint: CLAUDE_FORWARD_RENDERER_FINGERPRINT,
+        goalCapabilityId: CLAUDE_GOAL_TARGET_CAPABILITY_ID,
+        goalCapabilityFingerprint: CLAUDE_GOAL_TARGET_FINGERPRINT,
+      },
+      sessions: built.plan.sessions.map((selected) => {
+        const source = byId.get(selected.sessionId);
+        if (!source) throw new Error(`source is unavailable: ${selected.sessionId}`);
+        const applyPlan = selectedApplyPlans.get(selected.sessionId)!;
+        return {
+          sourceCodexRolloutId: selected.sessionId,
+          sourceCodexThreadId: source.session.desktopThreadId ?? null,
+          targetClaudeCliSessionId: selected.sessionId,
+          operationId: applyPlan.operationId,
+          targetPath: source.targetPath,
+          targetProjectExists: source.summary.targetProjectExists === true,
+          targetConversationExists: applyPlan.transcript.beforeSha256 != null,
+          targetConversationState: selected.targetConversationState === "relocated"
+            ? "relocated" as const
+            : applyPlan.transcript.beforeSha256 == null
+              ? "absent" as const
+              : applyPlan.transcript.beforeSha256 === applyPlan.transcript.afterSha256
+                ? "exact-existing" as const : "collision" as const,
+          ...(selected.relocatedTranscriptPaths == null
+            ? {}
+            : { relocatedTranscriptPaths: selected.relocatedTranscriptPaths }),
+          // Undecidable is the absence of a verdict, and it is written as the
+          // absence of the key: a plan over sessions with no recorded import is
+          // then byte-for-byte the plan this pipeline produced before it could
+          // consult the history at all.
+          ...(source.targetContentClass === "undecidable"
+            ? {}
+            : { targetContentClass: source.targetContentClass }),
+          targetSha256: applyPlan.transcript.beforeSha256,
+          renderedSha256: applyPlan.transcript.afterSha256,
+          wrapperPath: applyPlan.wrapper?.path ?? null,
+          wrapperSha256: applyPlan.wrapper?.beforeSha256 ?? null,
+          renderedWrapperSha256: applyPlan.wrapper?.afterSha256 ?? null,
+        };
+      }),
+    },
+  };
+  return {
+    file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) },
+    bundles: built.plan.sessions.map((selected) => byId.get(selected.sessionId)!.bundle),
+    summaries,
+    sourceDigest: digestImportPlan(built.plan).digest,
+    applyPlans: built.plan.sessions.map((selected) => selectedApplyPlans.get(selected.sessionId)!),
+  };
+}
+
+function targetSummary(source: LoadedSource, plan: CodexTargetPlan): MatrixTargetSessionPlan {
+  return {
+    sourceWrapperSessionId: source.desktop.wrapperSessionId,
+    sourceCliSessionId: source.desktop.cliSessionId!,
     operationId: plan.operationId,
-    threadId: plan.threadId,
+    targetThreadId: plan.threadId,
     rolloutPath: canonicalExistingPath(plan.rolloutPath),
     rolloutSha256: plan.rolloutSha256,
     archived: plan.archived,
-    activeTokenUpperBound: estimatedActiveTokens(plan.conversation),
+    activeContextUtf8Bytes: estimatedActiveBytes(plan.conversation),
+    goalActivation: plan.goalActivation,
+    requiredCapabilities: plan.requiredCapabilities,
   };
 }
 
@@ -550,38 +1380,214 @@ function summariesForRenderMode(sources: LoadedSource[], renderMode: RenderMode)
   });
 }
 
+export interface ReverseStaticPreflight {
+  states: Array<CodexTargetPlanState | null>;
+  blockers: string[];
+}
+
+/** Run every read-only private-target gate used by dry-run and real apply. */
+export function inspectReverseStaticPreflight(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+): ReverseStaticPreflight {
+  const blockers: string[] = [];
+  try {
+    assertThreadSchemaFile41059(dbPath);
+  } catch (error) {
+    blockers.push(`threads schema: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const states = targetPlans.map((targetPlan): CodexTargetPlanState | null => {
+    let state: CodexTargetPlanState;
+    try {
+      state = inspectCodexTargetPlan(targetPlan);
+    } catch (error) {
+      blockers.push(`${targetPlan.threadId}: target inspection failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+    try {
+      const journalInput = operationJournalInputForPlan(targetPlan);
+      if (state === "collision") {
+        throw new Error("target collision");
+      }
+      if (state === "absent") assertOperationJournalReady(bridgeRoot, journalInput);
+      else assertAlreadyAppliedOperationJournal(bridgeRoot, journalInput);
+    } catch (error) {
+      blockers.push(`${targetPlan.threadId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return state;
+  });
+  return { states, blockers };
+}
+
+export function assertReverseStaticPreflight(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+): CodexTargetPlanState[] {
+  const preflight = inspectReverseStaticPreflight(targetPlans, bridgeRoot, dbPath);
+  if (preflight.blockers.length > 0) {
+    throw new Error(`Codex static preflight failed: ${preflight.blockers.join("; ")}`);
+  }
+  return preflight.states.map((state) => {
+    if (state == null) throw new Error("Codex static preflight returned no target state");
+    return state;
+  });
+}
+
+/** Preserve the required no-mutation ordering at the start of reverse apply. */
+export function beginReverseApply(
+  targetPlans: readonly CodexTargetPlan[],
+  bridgeRoot: string,
+  dbPath: string,
+  outputTarget: string | undefined,
+  codexHome: string,
+): CodexTargetLock {
+  assertReverseStaticPreflight(targetPlans, bridgeRoot, dbPath);
+  assertJsonOutputWritable(outputTarget);
+  return acquireCodexTargetLock(codexHome);
+}
+
+export function assertCodexTargetSnapshot(
+  expectedEvidence: CodexTargetEvidence,
+  expectedProfile: CodexPrivateWriteProfile,
+  targetPlans: readonly CodexTargetPlan[],
+  actualEvidence: CodexTargetEvidence,
+  phase: string,
+): void {
+  const actualProfile = probeCodexPrivateWriteProfile(actualEvidence);
+  if (canonicalStringify(actualEvidence) !== canonicalStringify(expectedEvidence) ||
+    canonicalStringify(actualProfile) !== canonicalStringify(expectedProfile)) {
+    throw new Error(`Codex artifacts or private-write capability profile changed ${phase}`);
+  }
+  for (const targetPlan of targetPlans) {
+    assertCodexPrivateWriteCapabilities(actualEvidence, targetPlan.requiredCapabilities);
+  }
+}
+
+export interface CodexRecoveryDependencies {
+  desktopGuard: () => void;
+  evidenceLoader: (manifestPath: string) => CodexTargetEvidence;
+  recoverFiles: typeof recoverCreatedFiles;
+  reconcileGoal: typeof reconcileGoalActivation;
+  goalRpcFactory: typeof createCodexGoalRpc;
+}
+
+const CODEX_RECOVERY_DEPENDENCIES: CodexRecoveryDependencies = {
+  desktopGuard: assertCodexDesktopClosed,
+  evidenceLoader: loadInstalledCodexTargetEvidence,
+  recoverFiles: recoverCreatedFiles,
+  reconcileGoal: reconcileGoalActivation,
+  goalRpcFactory: createCodexGoalRpc,
+};
+
+/** Execute the under-lock recovery decision after re-hashing the installed Appx. */
+export function recoverCodexOperation(
+  journal: OperationJournal,
+  bridgeRoot: string,
+  operationId: string,
+  codexHome: string,
+  evidencePath: string,
+  preLockEvidence: CodexTargetEvidence,
+  dependencies: CodexRecoveryDependencies = CODEX_RECOVERY_DEPENDENCIES,
+): OperationJournal {
+  dependencies.desktopGuard();
+  const postLockEvidence = dependencies.evidenceLoader(evidencePath);
+  const preLockProfile = probeCodexPrivateWriteProfile(preLockEvidence);
+  const postLockProfile = probeCodexPrivateWriteProfile(postLockEvidence);
+  if (canonicalStringify(postLockEvidence) !== canonicalStringify(preLockEvidence) ||
+    canonicalStringify(postLockProfile) !== canonicalStringify(preLockProfile)) {
+    throw new Error("Codex artifacts or private-write capability profile changed under the recovery lock");
+  }
+  assertSupportedCodexTarget(postLockEvidence);
+
+  const nativeGoalMayExist = journal.goalActivation != null && new Set([
+    "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+  ]).has(journal.state);
+  if (!nativeGoalMayExist) return dependencies.recoverFiles(bridgeRoot, operationId);
+
+  const rpc = dependencies.goalRpcFactory(postLockEvidence, codexHome);
+  let rpcError: unknown;
+  try {
+    rpc.probe();
+    return dependencies.reconcileGoal(
+      bridgeRoot,
+      operationId,
+      rpc.get(journal.targetThreadId, codexGoalSetBinding(operationId, journal.goalActivation!)),
+    );
+  } catch (error) {
+    rpcError = error;
+    throw error;
+  } finally {
+    try { rpc.dispose(); }
+    catch (cleanupError) {
+      if (rpcError != null) {
+        throw new AggregateError([rpcError, cleanupError], "Codex Goal recovery and RPC cleanup failed");
+      }
+      throw cleanupError;
+    }
+  }
+}
+
+function summariesForPlan(
+  sources: LoadedSource[], renderMode: RenderMode, goalMode: GoalMigrationMode,
+): ImportPlanSessionSummary[] {
+  return summariesForRenderMode(sources, renderMode).map((summary, index) => ({
+    ...summary,
+    goalDecision: planGoalMigration(
+      sources[index]?.bundle?.conversation.goalState, goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID,
+    ),
+  }));
+}
+
 function buildMatrixPlan(
-  sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode,
+  sources: LoadedSource[], selection: SelectionOptions, renderMode: RenderMode, goalMode: GoalMigrationMode,
   codexHome: string, dbPath: string, bridgeRoot: string, evidence: CodexTargetEvidence,
-): { file: MatrixPlanFile; targetPlans: CodexTargetPlan[] } {
-  const summaries = summariesForRenderMode(sources, renderMode);
+): { file: MatrixReversePlanFile; targetPlans: CodexTargetPlan[] } {
+  const summaries = summariesForPlan(sources, renderMode, goalMode);
   const built = buildImportPlan(summaries, { selection });
+  const privateWriteProfile = probeCodexPrivateWriteProfile(evidence);
   const byId = new Map(sources.map((source) => [source.desktop.sessionId, source]));
   const targetPlans = built.plan.sessions.map((selected) => {
     const source = byId.get(selected.sessionId);
     if (!source?.bundle || !selected.sourceSha256) throw new Error(`source is unavailable: ${selected.sessionId}`);
+    if (selected.archiveState === "unknown") {
+      throw new Error(`target archive state is unknown for ${selected.sessionId}`);
+    }
     return planCodexTarget(
       codexHome, dbPath, `${selected.sessionId}\0render:${renderMode}`, selected.sourceSha256,
-      bridgeToLogical(source, renderMode), selected.archived,
+      bridgeToLogical(source, renderMode), selected.archiveState === "archived",
+      source.bundle.conversation.goalState ?? null, goalMode,
     );
   });
-  const withoutDigest: Omit<MatrixPlanFile, "digest"> = {
-    schema: "agentryx.import-plan/v2",
+  for (let index = 0; index < targetPlans.length; index += 1) {
+    const state = inspectCodexTargetPlan(targetPlans[index]!);
+    built.plan.sessions[index]!.targetConversationExists = state !== "absent";
+    built.plan.sessions[index]!.targetConversationState = state === "already-applied"
+      ? "exact-existing" : state;
+  }
+  const withoutDigest: Omit<MatrixReversePlanFile, "digest"> = {
+    schema: "agentryx.import-plan/v4",
     direction: "claude-to-codex",
     renderMode,
+    goalMode,
     plan: built.plan,
     target: {
       codexHome: canonicalExistingPath(codexHome),
       dbPath: canonicalExistingPath(dbPath),
       bridgeRoot: canonicalExistingPath(bridgeRoot),
       evidence,
-      sessions: targetPlans.map((target, index) => targetSummary(built.plan.sessions[index].sessionId, target)),
+      privateWriteProfile,
+      goalCapabilityId: CODEX_GOAL_TARGET_CAPABILITY_ID,
+      goalCapabilityFingerprint: CODEX_GOAL_TARGET_FINGERPRINT,
+      sessions: targetPlans.map((target, index) => targetSummary(byId.get(built.plan.sessions[index].sessionId)!, target)),
     },
   };
   return { file: { ...withoutDigest, digest: matrixPlanDigest(withoutDigest) }, targetPlans };
 }
 
 export function selectionFromPlan(plan: ImportPlan): SelectionOptions {
+  assertCurrentImportPlan(plan);
   return {
     archive: plan.selection.archive,
     projectScope: plan.selection.projectScope,
@@ -614,7 +1620,61 @@ export const MATRIX_HELP =
   "usage: threadpass <scan|plan|apply|recover> [--archive active|archived|all] " +
   "[--project-scope all|projects|projectless|existing-targets] [--session ID] " +
   "[--project NAME_OR_PATH] [--from-date ISO] [--to-date ISO] [--limit N] " +
-  "[--render-mode semantic|verbatim]\n";
+  "[--render-mode semantic|verbatim] [--goal-mode migrate|skip] [--no-migrate-goal] " +
+  "[--direction claude-to-codex|codex-to-claude] [--allow-overwrite] [--dry-run]\n";
+
+function forwardWorkspace(argv: string[], claudeHome: string): string | null {
+  if (flag(argv, "--no-register")) return null;
+  const explicit = option(argv, "--workspace-dir");
+  if (explicit) return path.resolve(explicit);
+  const root = resolveDesktopSessionsRoot(option(argv, "--sessions-root"));
+  const signedIn = signedInWorkspaceDir(root, claudeHome);
+  if (signedIn == null && countWorkspaceDirs(root) > 1) {
+    throw new Error("multiple Claude Desktop workspaces exist and the signed-in one cannot be proven; pass --workspace-dir");
+  }
+  const resolved = signedIn ?? findActiveWorkspaceDir(root);
+  if (resolved == null) {
+    throw new Error("no Claude Desktop workspace could be resolved; pass --workspace-dir or explicitly use --no-register");
+  }
+  return resolved;
+}
+
+export function goalMigrationModeOption(argv: string[]): GoalMigrationMode {
+  const values = optionValues(argv, "--goal-mode");
+  const modes = values.map(parseGoalMigrationMode);
+  if (new Set(modes).size > 1) throw new Error("conflicting --goal-mode values");
+  const explicit = modes.at(-1);
+  const noMigrate = flag(argv, "--no-migrate-goal");
+  if (noMigrate && explicit != null && explicit !== "skip") {
+    throw new Error("--no-migrate-goal contradicts --goal-mode migrate");
+  }
+  return noMigrate ? "skip" : parseGoalMigrationMode(explicit);
+}
+
+export function assertGoalMigrationReady(
+  plan: ImportPlan,
+  goalMode: GoalMigrationMode,
+  implementedCapabilityId?: string,
+): void {
+  for (const session of plan.sessions) {
+    validateGoalMigrationDecision(session.goalDecision);
+    if (session.goalDecision.mode !== goalMode) {
+      throw new Error(`Goal migration mode mismatch for session ${session.sessionId}`);
+    }
+    if (session.goalDecision.status === "pending_target_implementation") {
+      throw new Error(
+        `Goal migration for session ${session.sessionId} is eligible but target activation is not implemented; ` +
+        "re-plan with --goal-mode skip (or --no-migrate-goal) for conversation-only apply",
+      );
+    }
+    if (session.goalDecision.status === "ready_for_activation" &&
+      session.goalDecision.targetCapabilityId !== implementedCapabilityId) {
+      throw new Error(
+        `Goal migration capability ${session.goalDecision.targetCapabilityId} is not wired to this target apply path`,
+      );
+    }
+  }
+}
 
 export function main(argv = process.argv.slice(2)): void {
   const command = argv[0];
@@ -626,20 +1686,58 @@ export function main(argv = process.argv.slice(2)): void {
   if (command === "scan") {
     const selection = selectionOptions(argv);
     if (selection.archive == null) selection.archive = "all";
+    const direction = matrixDirection(argv);
+    if (direction === "codex-to-claude") {
+      const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+      const inventory = loadForwardCodexInventory(codexHome);
+      const renderMode = parseRenderMode(option(argv, "--render-mode"));
+      const goalMode = goalMigrationModeOption(argv);
+      const claudeHome = canonicalExistingPath(resolveClaudeHome(option(argv, "--claude-home")));
+      const priorImports = readPriorImports(claudeHome);
+      // The inventory is counted in full below, but only what the selection
+      // keeps is loaded.
+      const sources = selectForwardSessions(inventory.sessions, claudeHome, selection)
+        .map((session) => loadForwardSource(
+          session, codexHome, claudeHome, renderMode, goalMode, priorImports,
+        ));
+      const built = buildImportPlan(sources.map((source) => source.summary), { selection });
+      writeJson(option(argv, "--out"), {
+        codexHome: canonicalExistingPath(codexHome),
+        inventory: {
+          via: inventory.via,
+          projectMembership: inventory.membership,
+          total: inventory.sessions.length,
+          selected: built.plan.sessions.length,
+          active: inventory.sessions.filter((source) => source.isArchived === false).length,
+          archived: inventory.sessions.filter((source) => source.isArchived === true).length,
+          unknownArchive: inventory.sessions.filter((source) => source.isArchived == null).length,
+        },
+        direction,
+        renderMode,
+        goalMode,
+        selected: built.plan.sessions,
+        losses: built.plan.losses,
+        sourceDigest: built.digest,
+      });
+      return;
+    }
     const loaded = loadSources(argv, selection);
     const renderMode = parseRenderMode(option(argv, "--render-mode"));
-    const built = buildImportPlan(summariesForRenderMode(loaded.sources, renderMode), { selection });
+    const goalMode = goalMigrationModeOption(argv);
+    const built = buildImportPlan(summariesForPlan(loaded.sources, renderMode, goalMode), { selection });
     writeJson(option(argv, "--out"), {
       workspaceDir: loaded.workspaceDir,
       inventory: {
         total: loaded.inventory.length,
         selected: loaded.sources.length,
-        active: loaded.inventory.filter((source) => !source.isArchived).length,
-        archived: loaded.inventory.filter((source) => source.isArchived).length,
+        active: loaded.inventory.filter((source) => source.archiveState === "active").length,
+        archived: loaded.inventory.filter((source) => source.archiveState === "archived").length,
+        unknownArchive: loaded.inventory.filter((source) => source.archiveState === "unknown").length,
         unavailable: loaded.inventory.filter((source) => source.transcriptStatus !== "available").length,
       },
       unreadableRecords: loaded.unreadable,
       renderMode,
+      goalMode,
       selected: built.plan.sessions,
       losses: built.plan.losses,
       sourceDigest: built.digest,
@@ -647,6 +1745,25 @@ export function main(argv = process.argv.slice(2)): void {
     return;
   }
   if (command === "plan") {
+    const direction = matrixDirection(argv);
+    if (direction === "codex-to-claude") {
+      const selection = selectionOptions(argv);
+      const codexHome = resolveCodexHome(option(argv, "--codex-home"));
+      const claudeHome = resolveClaudeHome(option(argv, "--claude-home"));
+      const inventory = loadForwardCodexInventory(codexHome);
+      const matrix = buildForwardMatrixPlan(inventory.sessions, {
+        codexHome,
+        claudeHome,
+        bridgeRoot: path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot()),
+        selection,
+        renderMode: parseRenderMode(option(argv, "--render-mode")),
+        goalMode: goalMigrationModeOption(argv),
+        workspaceDir: forwardWorkspace(argv, claudeHome),
+        priorImports: readPriorImports(claudeHome),
+      });
+      writeJson(option(argv, "--out"), matrix.file);
+      return;
+    }
     const evidencePath = option(argv, "--evidence");
     if (!evidencePath) throw new Error("plan requires --evidence <41059 snapshot manifest>");
     const selection = selectionOptions(argv);
@@ -656,8 +1773,9 @@ export function main(argv = process.argv.slice(2)): void {
     if (!dbPath) throw new Error(`no Codex state database found under ${codexHome}`);
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
     const evidence = loadInstalledCodexTargetEvidence(evidencePath);
+    const goalMode = goalMigrationModeOption(argv);
     const matrix = buildMatrixPlan(
-      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")),
+      loaded.sources, selection, parseRenderMode(option(argv, "--render-mode")), goalMode,
       codexHome, dbPath, bridgeRoot, evidence,
     );
     writeJson(option(argv, "--out"), matrix.file);
@@ -665,9 +1783,18 @@ export function main(argv = process.argv.slice(2)): void {
   }
   if (command === "recover") {
     const operationId = option(argv, "--operation");
-    const evidencePath = option(argv, "--evidence");
-    if (!operationId || !evidencePath) throw new Error("recover requires --operation and --evidence");
+    if (!operationId) throw new Error("recover requires --operation");
     const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
+    try {
+      loadForwardApplyJournal(bridgeRoot, operationId);
+      assertJsonOutputWritable(option(argv, "--out"));
+      writeJson(option(argv, "--out"), rollbackForwardSessions(bridgeRoot, operationId));
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    const evidencePath = option(argv, "--evidence");
+    if (!evidencePath) throw new Error("Codex-target recover requires --evidence");
     const journal = loadOperationJournal(bridgeRoot, operationId);
     const codexHome = resolveCodexHome(option(argv, "--codex-home") ?? journal.targetCodexHome);
     if (canonicalExistingPath(codexHome).toLowerCase() !== canonicalExistingPath(journal.targetCodexHome).toLowerCase()) {
@@ -680,8 +1807,9 @@ export function main(argv = process.argv.slice(2)): void {
     let operationFailed = false;
     let operationError: unknown;
     try {
-      assertCodexDesktopClosed();
-      const recovered = recoverCreatedFiles(bridgeRoot, operationId);
+      const recovered = recoverCodexOperation(
+        journal, bridgeRoot, operationId, codexHome, evidencePath, evidence,
+      );
       writeJson(option(argv, "--out"), recovered);
     } catch (error) {
       operationFailed = true;
@@ -695,18 +1823,131 @@ export function main(argv = process.argv.slice(2)): void {
   if (command !== "apply") throw new Error(MATRIX_HELP.trimEnd());
 
   const planPath = option(argv, "--plan");
+  if (planPath) {
+    const candidate = JSON.parse(fs.readFileSync(planPath, "utf8")) as Record<string, unknown>;
+    if ((candidate.schema === "agentryx.import-plan/v2" || candidate.schema === "agentryx.import-plan/v3")) {
+      throw new Error(`unsupported persisted import-plan schema ${String(candidate.schema)}; ${REGENERATE_PLAN_MESSAGE}`);
+    }
+    if (candidate.schema === "agentryx.import-plan/v4" &&
+      (candidate.direction === "codex-to-claude" || candidate.direction === "claude-to-codex")) {
+      assertCurrentImportPlan(candidate.plan);
+    }
+    if (candidate.schema === "agentryx.import-plan/v4" && candidate.direction === "codex-to-claude") {
+      const stored = candidate as unknown as MatrixForwardPlanFile;
+      const confirmation = option(argv, "--confirm");
+      if (!confirmation) throw new Error("forward apply requires --confirm <plan digest>");
+      const content: Omit<MatrixForwardPlanFile, "digest"> = {
+        schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
+        goalMode: stored.goalMode, plan: stored.plan, target: stored.target,
+      };
+      if (matrixPlanDigest(content) !== stored.digest) throw new Error("stored import plan content does not match its digest");
+      if (confirmation !== stored.digest) throw new Error("confirmation digest does not match the plan");
+      if (stored.target.renderPolicy.rendererId !== CLAUDE_FORWARD_RENDERER_ID ||
+        stored.target.renderPolicy.rendererFingerprint !== CLAUDE_FORWARD_RENDERER_FINGERPRINT ||
+        stored.target.renderPolicy.goalCapabilityId !== CLAUDE_GOAL_TARGET_CAPABILITY_ID ||
+        stored.target.renderPolicy.goalCapabilityFingerprint !== CLAUDE_GOAL_TARGET_FINGERPRINT) {
+        throw new Error("forward target renderer or Goal capability does not match this build");
+      }
+      const requestedMode = option(argv, "--render-mode");
+      if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
+        throw new Error("apply render mode differs from the confirmed plan");
+      }
+      const requestedGoalMode = option(argv, "--goal-mode") != null || flag(argv, "--no-migrate-goal")
+        ? goalMigrationModeOption(argv) : null;
+      if (requestedGoalMode != null && requestedGoalMode !== stored.goalMode) {
+        throw new Error("apply Goal migration mode differs from the confirmed plan");
+      }
+      if (stored.target.codexHome == null) throw new Error("forward plan has no source Codex home; regenerate through the CLI");
+      const requestedCodexHome = option(argv, "--codex-home");
+      if (requestedCodexHome != null && canonicalExistingPath(resolveCodexHome(requestedCodexHome)).toLowerCase() !==
+        canonicalExistingPath(stored.target.codexHome).toLowerCase()) throw new Error("apply Codex home differs from the confirmed plan");
+      const requestedClaudeHome = option(argv, "--claude-home");
+      if (requestedClaudeHome != null && canonicalExistingPath(resolveClaudeHome(requestedClaudeHome)).toLowerCase() !==
+        canonicalExistingPath(stored.target.claudeHome).toLowerCase()) throw new Error("apply Claude home differs from the confirmed plan");
+      const inventory = loadForwardCodexInventory(stored.target.codexHome);
+      const rebuilt = buildForwardMatrixPlan(inventory.sessions, {
+        codexHome: stored.target.codexHome,
+        claudeHome: stored.target.claudeHome,
+        bridgeRoot: stored.target.bridgeRoot,
+        workspaceDir: stored.target.workspaceDir,
+        selection: selectionFromPlan(stored.plan),
+        renderMode: stored.renderMode,
+        goalMode: stored.goalMode,
+        expectedTargets: stored.target.sessions,
+        // Re-read rather than trusting the stored verdict: a message sent between
+        // plan and apply must change the rebuilt plan, and the digest comparison
+        // below is what refuses the write when it does.
+        priorImports: readPriorImports(stored.target.claudeHome),
+      });
+      if (rebuilt.file.digest !== stored.digest) {
+        throw new Error("source inventory, render output, Goal state/policy, or target binding changed after the plan was created");
+      }
+      if (rebuilt.file.plan.sessions.some((session) => session.archiveState === "unknown")) {
+        throw new Error("source archive state is unknown; target write refused");
+      }
+      assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CLAUDE_GOAL_TARGET_CAPABILITY_ID);
+      if (flag(argv, "--dry-run")) {
+        if (option(argv, "--out")) throw new Error("forward --dry-run refuses --out because dry-run is zero-mutation");
+        const heldBySession = new Map(rebuilt.file.target.sessions.map(
+          (session) => [session.sourceCodexRolloutId, session.targetContentClass ?? "undecidable"] as const,
+        ));
+        process.stdout.write(`${JSON.stringify({
+          dryRun: true, digest: stored.digest, renderMode: stored.renderMode, goalMode: stored.goalMode,
+          sessions: rebuilt.applyPlans.map((plan) => ({
+            sessionId: plan.sessionId, transcript: plan.transcript.path,
+            transcriptAction: plan.transcript.beforeSha256 == null ? "create" : "overwrite",
+            // What the existing transcript holds, and therefore whether the
+            // overwrite needs authorizing at all — or cannot be authorized.
+            ...(plan.transcript.beforeSha256 == null
+              ? {}
+              : { transcriptHolds: heldBySession.get(plan.sessionId) ?? "undecidable" }),
+            wrapper: plan.wrapper?.path ?? null,
+            wrapperAction: plan.wrapper == null ? "not-registered" : plan.wrapper.beforeSha256 == null ? "create" : "overwrite",
+          })),
+        }, null, 2)}\n`);
+        return;
+      }
+      assertJsonOutputWritable(option(argv, "--out"));
+      // Persist every exact source revision before any Claude target mutation.
+      for (const bundle of rebuilt.bundles) writeBridgeConversation(stored.target.bridgeRoot, bundle);
+      const journal = applyForwardSessions(rebuilt.applyPlans, {
+        bridgeRoot: stored.target.bridgeRoot,
+        claudeHome: stored.target.claudeHome,
+        workspaceDir: stored.target.workspaceDir,
+        planDigest: stored.digest,
+        allowOverwrite: flag(argv, "--allow-overwrite"),
+        // From the rebuilt plan, whose digest was just proved equal to the one
+        // the user confirmed. A transcript shown to hold nothing but the import
+        // needs no flag; one holding a continuation is refused whatever was passed.
+        targetContent: new Map(rebuilt.file.target.sessions.map(
+          (session) => [session.sourceCodexRolloutId, session.targetContentClass ?? "undecidable"],
+        )),
+      });
+      writeJson(option(argv, "--out"), {
+        direction: stored.direction, renderMode: stored.renderMode, goalMode: stored.goalMode,
+        operationId: journal.operationId, state: journal.state,
+        applied: rebuilt.applyPlans.length,
+        sessions: rebuilt.applyPlans.map((plan) => ({ sessionId: plan.sessionId, operationId: plan.operationId })),
+      });
+      return;
+    }
+  }
   const evidencePath = option(argv, "--evidence");
   const confirmation = option(argv, "--confirm");
   if (!planPath || !evidencePath || !confirmation) {
     throw new Error("apply requires --plan, --evidence, and --confirm <plan digest>");
   }
   const stored = JSON.parse(fs.readFileSync(planPath, "utf8")) as MatrixPlanFile;
-  if (stored.schema !== "agentryx.import-plan/v2" || stored.direction !== "claude-to-codex" ||
-    !["semantic", "verbatim"].includes(stored.renderMode)) {
+  if (stored.schema !== "agentryx.import-plan/v4" || stored.direction !== "claude-to-codex" ||
+    !["semantic", "verbatim"].includes(stored.renderMode) ||
+    !["migrate", "skip"].includes(stored.goalMode) ||
+    stored.target.privateWriteProfile?.schema !== "pass-the-thread/codex-private-write-profile-v1") {
     throw new Error("unsupported import plan");
   }
-  const storedContent: Omit<MatrixPlanFile, "digest"> = {
+  assertCurrentImportPlan(stored.plan);
+  const storedContent: Omit<MatrixReversePlanFile, "digest"> = {
     schema: stored.schema, direction: stored.direction, renderMode: stored.renderMode,
+    goalMode: stored.goalMode,
     plan: stored.plan, target: stored.target,
   };
   if (matrixPlanDigest(storedContent) !== stored.digest) {
@@ -717,6 +1958,12 @@ export function main(argv = process.argv.slice(2)): void {
   if (requestedMode != null && parseRenderMode(requestedMode) !== stored.renderMode) {
     throw new Error("apply render mode differs from the confirmed plan");
   }
+  const requestedGoalMode = option(argv, "--goal-mode") != null || flag(argv, "--no-migrate-goal")
+    ? goalMigrationModeOption(argv)
+    : null;
+  if (requestedGoalMode != null && requestedGoalMode !== stored.goalMode) {
+    throw new Error("apply Goal migration mode differs from the confirmed plan");
+  }
   const loaded = loadSources(argv, selectionFromPlan(stored.plan));
   const codexHome = resolveCodexHome(option(argv, "--codex-home"));
   const dbPath = findStateDb(codexHome);
@@ -724,32 +1971,93 @@ export function main(argv = process.argv.slice(2)): void {
   const evidence = loadInstalledCodexTargetEvidence(evidencePath);
   const bridgeRoot = path.resolve(option(argv, "--bridge-root") ?? defaultBridgeRoot());
   const rebuilt = buildMatrixPlan(
-    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode,
+    loaded.sources, selectionFromPlan(stored.plan), stored.renderMode, stored.goalMode,
     codexHome, dbPath, bridgeRoot, evidence,
   );
   if (rebuilt.file.digest !== stored.digest) {
-    throw new Error("source inventory, render mode, or target binding changed after the plan was created");
+    throw new Error("source inventory, render mode, Goal state/policy, or target binding changed after the plan was created");
   }
+  if (flag(argv, "--dry-run")) {
+    if (option(argv, "--out")) {
+      throw new Error("Codex-target --dry-run refuses --out because dry-run is zero-mutation");
+    }
+    const staticPreflight = inspectReverseStaticPreflight(rebuilt.targetPlans, bridgeRoot, dbPath);
+    const blockers = [...staticPreflight.blockers];
+    if (!rebuilt.file.target.privateWriteProfile.structurallyVerified) {
+      blockers.push("installed Codex artifacts do not match a registered private-write profile");
+    }
+    try {
+      assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
+    } catch (error) {
+      blockers.push(error instanceof Error ? error.message : String(error));
+    }
+    const requiresGoalProbe = rebuilt.targetPlans.some((plan) => plan.goalActivation != null);
+    process.stdout.write(`${JSON.stringify({
+      direction: stored.direction,
+      dryRun: true,
+      digest: stored.digest,
+      writeReadiness: blockers.length > 0
+        ? "blocked"
+        : requiresGoalProbe
+          ? "static-preflight-passed-goal-rpc-probe-required"
+          : "static-preflight-passed-runtime-gates-pending",
+      blockers,
+      unprovenGates: [
+        "Codex Desktop closed-state and post-lock installed-artifact re-probe",
+        ...(requiresGoalProbe
+          ? ["Codex app-server Goal RPC probe, collision check, and native Goal readback"]
+          : []),
+      ],
+      sessions: stored.plan.sessions.map((session, index) => ({
+        sessionId: session.sessionId,
+        state: staticPreflight.states[index],
+        requiredCapabilities: rebuilt.targetPlans[index].requiredCapabilities,
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
+  assertGoalMigrationReady(rebuilt.file.plan, stored.goalMode, CODEX_GOAL_TARGET_CAPABILITY_ID);
   const byId = new Map(loaded.sources.map((source) => [source.desktop.sessionId, source]));
   const operations: Array<{ sessionId: string; operationId: string; threadId: string; status: "applied" | "already-applied" }> = [];
-  assertJsonOutputWritable(option(argv, "--out"));
-  const lock = acquireCodexTargetLock(codexHome);
+  const lock = beginReverseApply(
+    rebuilt.targetPlans, bridgeRoot, dbPath, option(argv, "--out"), codexHome,
+  );
+  let goalRpc: ReturnType<typeof createCodexGoalRpc> | null = null;
   let operationFailed = false;
   let operationError: unknown;
   try {
     assertCodexDesktopClosed();
-    const states = rebuilt.targetPlans.map(inspectCodexTargetPlan);
-    const collision = states.findIndex((state) => state === "collision");
-    if (collision >= 0) {
-      throw new Error(`target collision for ${stored.plan.sessions[collision].sessionId}; no sessions were written`);
-    }
+    const liveEvidence = loadInstalledCodexTargetEvidence(evidencePath);
+    assertCodexTargetSnapshot(
+      stored.target.evidence, stored.target.privateWriteProfile, rebuilt.targetPlans,
+      liveEvidence, "immediately before apply",
+    );
+    const states = assertReverseStaticPreflight(rebuilt.targetPlans, bridgeRoot, dbPath);
+    goalRpc = rebuilt.targetPlans.some((plan) => plan.goalActivation != null)
+      ? createCodexGoalRpc(liveEvidence, codexHome)
+      : null;
+    goalRpc?.probe();
     for (let index = 0; index < rebuilt.targetPlans.length; index += 1) {
       const journalInput = operationJournalInputForPlan(rebuilt.targetPlans[index]);
       if (states[index] === "already-applied") {
+        if (rebuilt.targetPlans[index].goalActivation != null) {
+          if (goalRpc == null) {
+            throw new Error("already-applied Goal target requires the native Goal RPC");
+          }
+          assertCodexGoalReadback(
+            goalRpc.get(
+              rebuilt.targetPlans[index].threadId,
+              codexGoalSetBinding(
+                rebuilt.targetPlans[index].operationId,
+                rebuilt.targetPlans[index].goalActivation!,
+              ),
+            ),
+            rebuilt.targetPlans[index].goalActivation!.expectedReadback,
+          );
+        }
         commitOperationJournalIfPresent(bridgeRoot, journalInput);
         continue;
       }
-      assertOperationJournalReady(bridgeRoot, journalInput);
     }
     // Preserve every canonical source revision before the first target mutation.
     for (const selected of stored.plan.sessions) {
@@ -757,6 +2065,11 @@ export function main(argv = process.argv.slice(2)): void {
       if (!source?.bundle) throw new Error(`source is unavailable: ${selected.sessionId}`);
       writeBridgeConversation(bridgeRoot, source.bundle);
     }
+    const batchEvidence = loadInstalledCodexTargetEvidence(evidencePath);
+    assertCodexTargetSnapshot(
+      stored.target.evidence, stored.target.privateWriteProfile, rebuilt.targetPlans,
+      batchEvidence, "at the Codex mutation batch boundary",
+    );
     for (let index = 0; index < rebuilt.targetPlans.length; index += 1) {
       const targetPlan = rebuilt.targetPlans[index];
       const selected = stored.plan.sessions[index];
@@ -765,7 +2078,8 @@ export function main(argv = process.argv.slice(2)): void {
         continue;
       }
       const operation = applyCodexTarget(targetPlan, {
-        allowWrite: true, evidence, bridgeRoot, lock,
+        allowWrite: true, evidence: batchEvidence, bridgeRoot, lock,
+        ...(goalRpc == null ? {} : { goalRpc }),
       });
       operations.push({ sessionId: selected.sessionId, operationId: operation.operationId, threadId: targetPlan.threadId, status: "applied" });
     }
@@ -774,10 +2088,26 @@ export function main(argv = process.argv.slice(2)): void {
     operationError = error;
     throw error;
   } finally {
-    releaseTargetLockAfter(lock, operationFailed, operationError);
+    let rpcCleanupError: unknown;
+    try { goalRpc?.dispose(); } catch (error) { rpcCleanupError = error; }
+    try { releaseTargetLockAfter(lock, operationFailed, operationError); } catch (lockError) {
+      if (rpcCleanupError != null) {
+        throw new AggregateError([operationError, rpcCleanupError, lockError].filter(Boolean), "Codex target cleanup failed");
+      }
+      throw lockError;
+    }
+    if (rpcCleanupError != null) {
+      if (operationFailed) throw new AggregateError([operationError, rpcCleanupError], "Codex target operation and RPC cleanup failed");
+      throw rpcCleanupError;
+    }
   }
   writeJson(option(argv, "--out"), {
     renderMode: stored.renderMode,
+    goalMode: stored.goalMode,
+    goalDecisions: stored.plan.sessions.map((session) => ({
+      sessionId: session.sessionId,
+      ...session.goalDecision,
+    })),
     applied: operations.filter((operation) => operation.status === "applied").length,
     alreadyApplied: operations.filter((operation) => operation.status === "already-applied").length,
     operations,

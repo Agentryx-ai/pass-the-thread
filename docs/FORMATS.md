@@ -10,14 +10,14 @@ What this tool reads and writes. These are **undocumented, internal** formats of
 { "timestamp": "2026-07-24T05:38:12.123Z", "type": "<item-type>", "payload": { … } }
 ```
 
-| `type` | Meaning | Used |
-| --- | --- | --- |
-| `session_meta` | first line: `id`, `cwd`, `cli_version`, `source`, `git`, `parent_thread_id`, … | yes |
-| `response_item` | model output and tool traffic | yes — the conversation is rebuilt from these |
-| `turn_context` | per-turn settings snapshot (model, cwd, approval policy) | model only |
-| `event_msg` | UI/protocol events (`agent_message`, `token_count`, …) | no (duplicates response items) |
-| `compacted` | context-compaction summary | no |
-| `world_state`, `inter_agent_communication_metadata` | agent internals | no |
+| `type` | Meaning | Byte-exact IR / sidecar | Semantic target rendering |
+| --- | --- | --- | --- |
+| `session_meta` | first line: `id`, `cwd`, `cli_version`, `source`, `git`, `parent_thread_id`, … | yes | selected conversation metadata, not chat |
+| `response_item` | model output and tool traffic | yes | supported messages, reasoning/media policy, and valid tool traffic |
+| `turn_context` | per-turn settings snapshot (model, cwd, approval policy) | yes | selected metadata only; the full record stays sidecar-only |
+| `event_msg` | UI/protocol events (`agent_message`, `token_count`, task/Goal updates, …) | yes | only explicitly typed projections such as inert task history or Goal state; generic protocol events stay sidecar-only |
+| `compacted` | context-compaction summary | yes | the latest portable summary may rebuild compact context; earlier or invalid boundaries stay sidecar-only |
+| `world_state`, `inter_agent_communication_metadata` | agent internals | yes | no live semantics; sidecar-only |
 
 `response_item` payload variants:
 
@@ -37,9 +37,22 @@ Calls and results are flat and paired by `call_id`, not nested.
 
 Not every rollout is a conversation in the sidebar. Sub-agent threads, `codex exec` automation runs and archived threads all live in the same directory. It resolves the list from Codex's own state, in this order:
 
-1. `~/.codex/.codex-global-state.json` — the sidebar's grouping, in one of two shapes. Older builds record `thread-project-assignments` (thread → project) plus `projectless-thread-ids`, which together *are* the membership. Current builds drop the assignment map: projects are registered under `local-projects` with `rootPaths`, and a thread belongs to whichever project's root contains its `cwd` (longest match), so membership comes from the index below and this file only supplies the names.
+1. `~/.codex/.codex-global-state.json` — the sidebar's grouping, in one of two shapes. Older builds record `thread-project-assignments` (thread → project) plus `projectless-thread-ids`, which together *are* the membership. Presence of even an empty valid assignment map selects this authoritative mode; absent thread ids remain unknown rather than being inferred from `cwd`. Current builds drop the assignment map: projects are registered under `local-projects` with `rootPaths`, and a thread belongs to whichever project's root contains its `cwd` (longest match), so membership comes from the index below and this file only supplies the names. Malformed membership substructures make otherwise valid JSON unusable instead of being coerced.
 2. `~/.codex/state_<n>.sqlite` — `threads` (`archived`, `rollout_path`, `title`, `name`, `first_user_message`, `cwd`, `source`, `recency_at_ms`) and `thread_spawn_edges` (parent → child). Used to drop archived and spawned threads, and to resolve each thread's rollout file.
 3. Rollout-file scan, applying the equivalent rules from `session_meta` (`parent_thread_id`, `source`), when neither is available.
+
+DB/rollout fallback inventory does not invent project membership. Scan output
+marks membership and provenance explicitly when global state is missing,
+unreadable, or unusable; any filter that needs that fact fails closed. Project
+roots use one canonical filesystem identity: `realpath` for existing paths and
+normalized absolute spelling for missing paths. Reading or planning never
+rewrites `.codex-global-state.json`, registers a project, or derives a duplicate
+display name.
+
+The rollout filename id, `session_meta.id`, and SQLite thread id have distinct
+roles. The adapter validates available joins and reports them as source rollout
+and native/index thread identities instead of assuming that similarly named ids
+are equal.
 
 ### Conversation names
 
@@ -54,6 +67,56 @@ The name Codex shows is not the first thing the user typed. Codex generates a sh
 Renaming appends another line, so the newest `updated_at` wins. On the machine this was reconstructed from, 38 of 38 app-created threads had an entry and none of the 13 CLI/exec threads did.
 
 `threads.name` / `threads.title` is a weaker second source, used when there is no index file. `title` is seeded with `first_user_message` and replaced when Codex names the thread, so a `title` that differs from `first_user_message` is a generated name — but the DB lags renames (8 of 38 still carried the first message).
+
+## Target — Codex Desktop 26.721.41059
+
+Claude → Codex writes a new rollout under `sessions/YYYY/MM/DD` or
+`archived_sessions`, then registers that exact path in the `threads` table of
+the pinned `state_<n>.sqlite`. Equivalent existing project paths are resolved
+to one canonical filesystem identity before the rollout and index row are
+planned. The importer never writes `goals_1.sqlite`; eligible live Goals are
+activated only through the separately fingerprinted app-server Goal RPC after
+thread registration.
+
+Idempotent readback binds the rollout path/hash and archive columns together:
+active requires `archived = 0` with null `archived_at`; archived requires
+`archived = 1` with a valid non-null `archived_at`. Any mismatch is a collision.
+
+Semantic mode emits human/model text and native tool traffic only for a
+contiguous parallel call batch from one assistant record/envelope followed by
+the exact result set in one distinct, direct-child user record/envelope. Native
+record lineage is mandatory; missing or ambiguous `uuid`/`parentUuid` fails
+closed to inert history. Task notifications,
+historical/superseded Goals, access snapshots, and other source controls are
+rendered as explicitly inert assistant history, never copied as raw user
+commands. Verbatim mode preserves the exact Claude JSONL as one inert context
+item. Both modes retain every original byte in the immutable bridge sidecar.
+
+Claude Desktop writes an auto-compact boundary followed by an
+`isCompactSummary` record. The adapter turns that summary into a nonempty Codex
+`compacted.payload.replacement_history` and appends post-boundary items once.
+In semantic mode, planning fails if no summary is recoverable. Verbatim mode
+keeps the original compact records as inert archival context and does not claim
+native resume semantics. Both modes fail when serialized active context exceeds
+the conservative pinned UTF-8 byte limit. This offline refusal check is named
+and reported in bytes; it does not compare source provider token counters with
+character/byte counts or claim to calculate a Codex token budget. Source
+compaction counters remain only in bridge/rollout provenance, and target
+`tokens_used` starts at zero.
+
+Private writes are enabled only when separate rollout, thread-index, archive
+(when selected), project-identity, and Goal (when selected) bindings resolve to
+the exact audited 26.721.41059 artifacts. Unknown records and newer versions
+remain readable/plannable, but do not acquire write capability. Researching an
+unknown/new installed build requires a user-supplied provenance manifest that
+binds the live installed artifacts; it does not grant write capability until a
+new audited profile is implemented and registered.
+
+Apply takes a second full hash of the active Appx identity after Goal/journal
+and sidecar setup, immediately before the first Codex target mutation. That
+probe is the exact batch-start support snapshot. An application update during
+the subsequent multi-session batch is outside the importer's atomicity model;
+the importer does not re-hash per session.
 
 ## Target — Claude Desktop
 
@@ -85,7 +148,7 @@ Observed on Windows and macOS; the Linux location follows Electron's convention 
 
 Only non-archived records are listed. The `<accountId>/<deviceId>` pair comes from `oauthAccount` in `~/.claude.json`; if that is missing it falls back to the directory with active records and the most recent activity. Existing records are never touched.
 
-`cliSessionId` is not a stable identity. Continuing an imported conversation makes Claude fork it into a session of its own and rewrite that field to point at the fork, after which the record no longer looks like one this tool wrote. `sessionId` — the record's own id, and its file name — does not change, so the import history remembers the records it wrote by that instead. A repointed record is Claude's conversation and is left alone; its transcript is at `projects/<projectKey>/<its cliSessionId>.jsonl`, which is where messages sent after the import will be.
+`cliSessionId` is not a stable identity. It is also not the wrapper `sessionId`: the former identifies the CLI transcript, while the latter identifies the Desktop wrapper/file. Continuing an imported conversation makes Claude fork it into a session of its own and rewrite `cliSessionId` to point at the fork, after which the record no longer looks like one this tool wrote. `sessionId` — the record's own id, and its file name — does not change, so the import history remembers the records it wrote by that instead. Inventory validates that the wrapper's CLI id agrees with every transcript record before semantic planning. A repointed record is Claude's conversation and is left alone; its transcript is at `projects/<projectKey>/<its cliSessionId>.jsonl`, which is where messages sent after the import will be.
 
 ### 2. Transcript (the content)
 

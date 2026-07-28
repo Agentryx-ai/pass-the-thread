@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { main as runLegacyCommand } from "./cli.ts";
 import { formatCliError, main as runMatrixCommand } from "./matrix-cli.ts";
+import { runSessionHandoffCommand } from "./session-handoff-cli.ts";
 
 const LEGACY_COMMANDS = new Set(["list", "import", "fix"]);
 const MATRIX_COMMANDS = new Set(["scan", "plan", "apply", "recover"]);
@@ -22,6 +23,7 @@ COMMANDS
   plan      build a deterministic provider-matrix import plan
   apply     apply a confirmed provider-matrix plan
   recover   recover an interrupted provider-matrix operation
+  handoff   create, select, or read an inert Markdown session handoff
 
 Run threadpass <command> --help for command-specific options.
 The codex-to-claude executable remains available as a compatibility alias.
@@ -41,6 +43,9 @@ export function dispatch(argv: string[]): number {
   if (MATRIX_COMMANDS.has(command)) {
     runMatrixCommand(argv);
     return 0;
+  }
+  if (command === "handoff") {
+    return runSessionHandoffCommand(argv.slice(1));
   }
   process.stderr.write(`Unknown command: ${command}\n\n${HELP}`);
   return 1;

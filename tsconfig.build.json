@@ -3,6 +3,7 @@
   "compilerOptions": {
     "allowImportingTsExtensions": true,
     "declaration": false,
+    "newLine": "lf",
     "noEmit": false,
     "outDir": "dist",
     "rewriteRelativeImportExtensions": true,

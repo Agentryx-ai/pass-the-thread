@@ -59,6 +59,8 @@ export interface SessionMeta {
 /** A parsed Codex session ready for filtering / conversion. */
 export interface CodexSession {
   sessionId: string;
+  /** Authoritative Codex Desktop thread id, when resolved from the thread index. */
+  desktopThreadId?: string;
   rolloutPath: string;
   /** SHA-256 of the exact rollout bytes parsed into this snapshot. */
   sourceContentSha256?: string;
@@ -158,6 +160,39 @@ export interface ClaudeTranscriptLine {
   isCompactSummary?: boolean;
 }
 
+/** Native Claude Code transcript control record used to restore a live Goal. */
+export interface ClaudeGoalAttachmentLine {
+  parentUuid: string | null;
+  isSidechain: false;
+  userType: "external";
+  entrypoint: "claude-desktop";
+  cwd: string;
+  sessionId: string;
+  version: string;
+  gitBranch?: string;
+  type: "attachment";
+  uuid: string;
+  timestamp: string;
+  attachment: {
+    type: "goal_status";
+    met: false;
+    sentinel: true;
+    condition: string;
+  };
+}
+
+/** Native Goal directive uses Claude's scalar user-content transcript shape. */
+export interface ClaudeGoalDirectiveLine extends Omit<ClaudeTranscriptLine, "message" | "isMeta"> {
+  type: "user";
+  message: { role: "user"; content: string };
+  isMeta: true;
+}
+
+export type ClaudeTranscriptRecord =
+  | ClaudeTranscriptLine
+  | ClaudeGoalDirectiveLine
+  | ClaudeGoalAttachmentLine;
+
 // ---------- Filtering ----------
 
 export interface SessionFilter {
@@ -188,6 +223,11 @@ export interface ImportHistoryRecord {
   projectRoot: string;
   /** Target rendering used for this import. Missing on legacy records means semantic. */
   renderMode?: RenderMode;
+  /** Missing on legacy records means skip: old imports never activated Goals. */
+  goalMode?: import("./goal.ts").GoalMigrationMode;
+  sourceGoalSha256?: string | null;
+  targetGoalCapabilityId?: string | null;
+  targetGoalFingerprint?: string | null;
   /** sha256 of the transcript this tool wrote, to detect later edits by Claude. */
   targetSha256?: string;
   /**

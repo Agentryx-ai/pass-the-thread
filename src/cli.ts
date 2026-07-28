@@ -13,6 +13,7 @@ import {
   inspectTarget,
   lastRecordFor,
   loadImportHistory,
+  locateTranscriptFrom,
   mapVerbatimRolloutToClaudeLines,
   makeHistoryRecord,
   saveImportHistory,
@@ -37,13 +38,57 @@ import {
   writeWrapperRecord,
 } from "./claude-desktop-target.ts";
 import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
-import { findContinuation } from "./continued.ts";
+import { classifyTargetContent, overwriteEligible, type TargetContentVerdict } from "./continued.ts";
+import type { TargetState, TranscriptLocation } from "./claude-target.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
 import { parseRenderMode } from "./render-mode.ts";
-import { codexRolloutToBridgeBundle } from "./codex-to-ir.ts";
+import { codexRolloutWithGoalToBridgeBundle } from "./codex-to-ir.ts";
 import { defaultBridgeRoot, writeBridgeConversation } from "./bridge-store.ts";
-import type { SessionFilter } from "./types.ts";
+import type { ClaudeTranscriptRecord, SessionFilter } from "./types.ts";
+import { parseGoalMigrationMode, type GoalMigrationMode } from "./goal.ts";
+import {
+  applyClaudeGoalTarget,
+  claudeGoalHistoryIdentity,
+} from "./claude-goal-target.ts";
+import { applyBudget } from "./repair.ts";
+
+/**
+ * The verdict to open the overwrite decision with, before any fork is checked.
+ *
+ * `location.state === "absent"` is meant to mean nothing is at `targetPath` at
+ * all, in which case there is nothing to read and "unchanged" can be assumed
+ * outright. But `locateTranscriptFrom` reaches "absent" by scanning every
+ * Claude project directory for the session id, and swallows any
+ * `readdirSync`/`statSync` failure — an EPERM from a virus scanner touching
+ * `.claude/projects`, an EMFILE under fd pressure — into an empty scan, which
+ * reports "absent" even when a transcript sits right at `targetPath`. `state`
+ * is the independent check: `inspectTarget`'s own `existsSync` on that exact
+ * path. Only when both agree nothing is there is "unchanged" synthesized
+ * without reading the file; otherwise the file is classified (or, if it turns
+ * out unreadable after all, `classifyTargetContent` itself returns
+ * `undecidable` — never a silently assumed "unchanged").
+ */
+export function initialTargetVerdict(
+  location: Pick<TranscriptLocation, "state">,
+  state: TargetState,
+  targetPath: string,
+  importedAtMs: number | undefined | null,
+  expectedSha256: string | null,
+): TargetContentVerdict {
+  if (location.state === "absent" && state === "absent") {
+    return {
+      classification: "unchanged",
+      continuation: null,
+      assistantLines: 0,
+      incidentalLines: 0,
+      undecidable: null,
+      markerLines: 0,
+      sha256Matches: null,
+    };
+  }
+  return classifyTargetContent(targetPath, importedAtMs, { expectedSha256 });
+}
 
 export const LEGACY_HELP = `threadpass — import Codex CLI/Desktop sessions into Claude Code / Claude Desktop
 
@@ -71,6 +116,9 @@ SELECTION (Codex Desktop conversation-list criteria)
                        to (faithful, but may not fit Claude's context window)
   --render-mode <mode> semantic (default) converts supported structures;
                        verbatim renders the exact rollout as inert history
+  --goal-mode <mode>   migrate (default) restores an authoritative active Goal;
+                       skip preserves it as history only
+  --no-migrate-goal   alias for --goal-mode skip
   --max-tool-output <n>  cap each tool result at n characters (default 4000)
   --max-chars <n>        cap the whole transcript (default 1000000); older turns
                          are dropped so a resumed conversation fits the context
@@ -91,6 +139,22 @@ PATHS
 Sessions are written to <claude-home>/projects/<encoded-cwd>/<sessionId>.jsonl and
 deduped via <claude-home>/codex-import-history.json (source-content sha256).
 `;
+
+export function legacyGoalMigrationMode(
+  explicit: string | undefined,
+  noMigrateGoal: boolean,
+): GoalMigrationMode {
+  const parsed = parseGoalMigrationMode(explicit);
+  if (noMigrateGoal && explicit != null && parsed !== "skip") {
+    throw new Error("--no-migrate-goal contradicts --goal-mode migrate");
+  }
+  return noMigrateGoal ? "skip" : parsed;
+}
+
+function transcriptTitle(lines: readonly ClaudeTranscriptRecord[]): string | undefined {
+  const first = lines[0];
+  return first?.type === "attachment" ? undefined : first?.customTitle;
+}
 
 function parseDateMs(v: string | undefined): number | undefined {
   if (!v) return undefined;
@@ -164,6 +228,8 @@ export function main(argv: string[]): number {
       "max-chars": { type: "string" },
       "full-history": { type: "boolean", default: false },
       "render-mode": { type: "string" },
+      "goal-mode": { type: "string" },
+      "no-migrate-goal": { type: "boolean", default: false },
       "bridge-root": { type: "string" },
       prune: { type: "boolean", default: false },
     },
@@ -174,6 +240,10 @@ export function main(argv: string[]): number {
   const nowMs = Date.now();
   const filter = toFilter(values as Record<string, string | boolean | undefined>);
   const renderMode = parseRenderMode(values["render-mode"] as string | undefined);
+  const goalMode = legacyGoalMigrationMode(
+    values["goal-mode"] as string | undefined,
+    values["no-migrate-goal"] === true,
+  );
   const bridgeRoot = path.resolve(
     typeof values["bridge-root"] === "string" ? values["bridge-root"] : defaultBridgeRoot(),
   );
@@ -306,6 +376,7 @@ export function main(argv: string[]): number {
     process.stderr.write(
       `Codex home:  ${codexHome}\nClaude home: ${claudeHome}\n` +
         `Render mode: ${renderMode}\n` +
+        `Goal mode: ${goalMode}\n` +
         `Selection: Codex Desktop conversation list (via ${via === "desktop" ? "Desktop sidebar state" : via === "db" ? "index DB" : "file scan"}).\n` +
         `${selected.length} conversation(s) selected${dryRun ? " (dry-run)" : ""}.\n\n`,
     );
@@ -317,12 +388,15 @@ export function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (source rollout changed after inventory; run again)\n`);
         continue;
       }
-      if (!force && alreadyImported(history, sha, renderMode)) {
+      const bundle = codexRolloutWithGoalToBridgeBundle(s, codexHome);
+      const sourceGoal = bundle.conversation.goalState;
+      const goalIdentity = claudeGoalHistoryIdentity(sourceGoal, goalMode);
+      if (!force && alreadyImported(history, sha, renderMode, goalIdentity)) {
         skipped += 1;
         // The transcript already exists, but it may predate registration —
         // register it so it actually shows up in the Claude Desktop list.
         if (workspaceDir != null && !alreadyRegistered.has(s.sessionId) && !dryRun) {
-          const catchUp =
+          const catchUpBase =
             renderMode === "verbatim"
               ? mapVerbatimRolloutToClaudeLines(s, {
                   titlePrefix:
@@ -336,12 +410,13 @@ export function main(argv: string[]): number {
                       ? (values["title-prefix"] as string)
                       : undefined,
                 });
+          const catchUp = applyClaudeGoalTarget(s, catchUpBase, sourceGoal, goalMode);
           if (catchUp.length > 0) {
             const record = buildWrapperRecord({
               cliSessionId: s.sessionId,
               cwd: s.cwdOriginal || s.cwd,
               lines: catchUp,
-              title: catchUp[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+              title: transcriptTitle(catchUp) ?? s.codexName ?? s.title ?? "(untitled)",
               model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
               sandboxPolicy: s.sandboxPolicy,
               approvalMode: s.approvalMode,
@@ -368,7 +443,8 @@ export function main(argv: string[]): number {
         process.stdout.write(`skip  ${s.sessionId}  (already imported)\n`);
         continue;
       }
-      const lines =
+      const maxChars = values["max-chars"] != null ? Number(values["max-chars"]) : undefined;
+      const baseLines =
         renderMode === "verbatim"
           ? mapVerbatimRolloutToClaudeLines(s, {
               version:
@@ -394,8 +470,13 @@ export function main(argv: string[]): number {
                 values["max-tool-output"] != null
                   ? Number(values["max-tool-output"])
                   : undefined,
-              maxChars: values["max-chars"] != null ? Number(values["max-chars"]) : undefined,
+              maxChars,
             });
+      const composedLines = applyClaudeGoalTarget(s, baseLines, sourceGoal, goalMode);
+      const goalSuffixLength = composedLines.length - baseLines.length;
+      const lines = renderMode === "semantic" && goalSuffixLength > 0
+        ? applyBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength }).lines
+        : composedLines;
       if (lines.length === 0) {
         skipped += 1;
         process.stdout.write(`skip  ${s.sessionId}  (no convertible content)\n`);
@@ -413,87 +494,129 @@ export function main(argv: string[]): number {
       }
       const { targetPath } = targetPathFor(claudeHome, s);
 
-      // Claude appends to a transcript when the conversation is opened or
-      // continued. Overwriting then destroys messages sent after the import,
-      // so a transcript that changed since we wrote it is left alone.
+      // Claude rewrites a transcript byte-for-byte whenever the conversation is
+      // opened, so the stored hash mismatches for practically every imported
+      // session and says nothing about whether anything of the user's is in it.
+      // What decides is the content: a turn somebody typed after the import, or
+      // an answer Claude gave to one. The hash is kept as corroboration only.
       const prior = lastRecordFor(history, s.sessionId);
       const state = inspectTarget(targetPath, prior?.targetSha256);
 
-      // "Changed since we wrote it" covers both a history Claude replayed into
-      // the file — which --force exists to get past — and messages the user sent
-      // afterwards, which nothing can bring back. Only the second is refused,
-      // and --force does not override it: the flag is for replay duplicates, not
-      // for discarding conversation.
-      // Claude does not always continue in place: it can fork an imported
-      // conversation into a session of its own and repoint the record we wrote
-      // at the fork. The messages are then in a file no Codex session names, so
-      // looking only at our own target would call the conversation untouched.
+      // Claude does not always keep a conversation where the import put it: a
+      // changed cwd, or a project directory Claude spelled its own way, moves
+      // the transcript under the same session id. Deriving a path from the
+      // recorded project root then reports nothing there, and writing a fresh
+      // transcript would orphan a live conversation.
+      const location = locateTranscriptFrom(claudeHome, targetPath, s.sessionId);
+      if (location.state === "relocated") {
+        conflicts += 1;
+        skipped += 1;
+        process.stdout.write(
+          `skip  ${s.sessionId}  (RELOCATED — Claude keeps this conversation elsewhere)\n` +
+            `      ${location.relocatedPaths.join("\n      ")}\n` +
+            `      nothing is at ${targetPath}, but writing there would orphan it.\n` +
+            `      Move that file aside first; --force does not cover this.\n`,
+        );
+        continue;
+      }
+
+      // Claude can also fork an imported conversation into a session of its own
+      // and repoint the record we wrote at the fork. The messages are then in a
+      // file no Codex session names, so looking only at our own target would
+      // call the conversation untouched.
       const owned =
         workspaceDir != null
           ? ourRecords(workspaceDir, prior?.recordSessionIds ?? [], s.sessionId)
           : { current: null, repointed: [] };
-      let continued =
-        state === "modified" || state === "foreign"
-          ? findContinuation(targetPath, prior?.importedAtMs)
-          : null;
-      let continuedIn = targetPath;
+      let verdict: TargetContentVerdict = initialTargetVerdict(
+        location,
+        state,
+        targetPath,
+        prior?.importedAtMs,
+        prior?.targetSha256 ?? null,
+      );
+      let verdictIn = targetPath;
       for (const fork of owned.repointed) {
-        if (continued != null) break;
+        if (verdict.classification === "modified") break;
         const forkPath = transcriptPathFor(claudeHome, fork.record.cwd, fork.record.cliSessionId);
-        continued = findContinuation(forkPath, prior?.importedAtMs);
-        if (continued != null) continuedIn = forkPath;
+        const forked = classifyTargetContent(forkPath, prior?.importedAtMs);
+        if (forked.classification === "modified") {
+          verdict = forked;
+          verdictIn = forkPath;
+        }
       }
-      if (continued != null) {
+
+      const continued = verdict.continuation;
+      if (verdict.classification === "modified") {
         conflicts += 1;
         skipped += 1;
-        const when =
-          continued.firstAtMs != null
+        if (continued != null) {
+          const when = continued.firstAtMs != null
             ? new Date(continued.firstAtMs).toISOString().replace("T", " ").slice(0, 16)
             : "after the import";
-        process.stdout.write(
-          `skip  ${s.sessionId}  (${continued.turns} message(s) sent in Claude after the import)\n` +
-            `      first was ${when}: ${JSON.stringify(continued.firstText)}\n` +
-            `      they are in ${continuedIn}\n` +
-            `      re-importing would leave them behind. Move that file aside first.\n`,
-        );
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — ${continued.turns} message(s) sent in Claude after the import)\n` +
+              `      first was ${when}: ${JSON.stringify(continued.firstText)}\n` +
+              `      they are in ${verdictIn}\n` +
+              `      re-importing would leave them behind. Move that file aside first.\n`,
+          );
+        } else {
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — ${verdict.assistantLines} reply line(s) written after the import)\n` +
+              `      they are in ${verdictIn}\n` +
+              `      re-importing would leave them behind. Move that file aside first.\n`,
+          );
+        }
         continue;
       }
 
-      if (force && (state === "modified" || state === "foreign")) {
+      // Nothing was decided about the file — an unreadable or unparseable
+      // transcript, or one this tool never recorded importing. It may hold a
+      // conversation, so it is not overwritten unattended.
+      if (verdict.classification === "undecidable") {
         conflicts += 1;
+        if (!force) {
+          skipped += 1;
+          process.stdout.write(
+            `skip  ${s.sessionId}  (UNDECIDABLE — ${verdict.undecidable}; use --force to overwrite)\n`,
+          );
+          continue;
+        }
         process.stdout.write(
-          state === "modified"
-            ? `WARN  ${s.sessionId}  overwriting a transcript Claude rewrote (no messages of yours in it)
-`
-            : `WARN  ${s.sessionId}  overwriting a transcript this tool did not write
-`,
+          `WARN  ${s.sessionId}  overwriting a transcript nothing could be decided about ` +
+            `(${verdict.undecidable})\n`,
         );
-      }
-      if (!force && (state === "modified" || state === "foreign")) {
+      } else if (location.state !== "absent" && !overwriteEligible(verdict)) {
+        // Unreachable today; kept so a new class cannot silently become writable.
         conflicts += 1;
         skipped += 1;
-        process.stdout.write(
-          state === "modified"
-            ? `skip  ${s.sessionId}  (continued in Claude since import — use --force to overwrite)
-`
-            : `skip  ${s.sessionId}  (a transcript this tool did not write is already there)
-`,
-        );
+        process.stdout.write(`skip  ${s.sessionId}  (${verdict.classification} — not overwrite-eligible)\n`);
         continue;
+      } else if (location.state !== "absent" && state !== "ours") {
+        // Overwrite-eligible: the bytes differ from what was recorded, but the
+        // file holds nothing anybody wrote. Say so rather than demanding --force.
+        process.stdout.write(
+          `note  ${s.sessionId}  ${verdict.classification.toUpperCase()} since import` +
+            `${verdict.incidentalLines > 0 ? ` (${verdict.incidentalLines} line(s) nobody authored)` : ""}` +
+            `; safe to rewrite\n`,
+        );
       }
 
       if (dryRun) {
-        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath}\n`);
+        const goalAction = sourceGoal == null ? "none"
+          : goalMode === "migrate" && sourceGoal.migrationEligible ? "activate"
+            : "historical-only";
+        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath} (Goal: ${goalAction})\n`);
         imported += 1;
         continue;
       }
-      writeBridgeConversation(bridgeRoot, codexRolloutToBridgeBundle(s));
+      writeBridgeConversation(bridgeRoot, bundle);
       const res = writeTranscript(claudeHome, s, lines);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
       // repointed one is recognisable later instead of looking like a stranger.
       const recordSessionIds = [...(prior?.recordSessionIds ?? [])];
-      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256, renderMode);
+      const historyRecord = makeHistoryRecord(s, sha, nowMs, res.sha256, renderMode, goalIdentity);
       historyRecord.recordSessionIds = recordSessionIds;
       history.records.push(historyRecord);
       imported += 1;
@@ -523,7 +646,7 @@ export function main(argv: string[]): number {
               cliSessionId: s.sessionId,
               cwd: s.cwdOriginal || s.cwd,
               lines,
-              title: lines[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+              title: transcriptTitle(lines) ?? s.codexName ?? s.title ?? "(untitled)",
               model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
               sandboxPolicy: s.sandboxPolicy,
               approvalMode: s.approvalMode,
@@ -539,7 +662,7 @@ export function main(argv: string[]): number {
           cliSessionId: s.sessionId,
           cwd: s.cwdOriginal || s.cwd,
           lines,
-          title: lines[0]?.customTitle ?? s.codexName ?? s.title ?? "(untitled)",
+          title: transcriptTitle(lines) ?? s.codexName ?? s.title ?? "(untitled)",
           model: typeof values["model"] === "string" ? (values["model"] as string) : undefined,
           sandboxPolicy: s.sandboxPolicy,
           approvalMode: s.approvalMode,

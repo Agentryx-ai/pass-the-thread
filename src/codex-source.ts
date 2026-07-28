@@ -3,7 +3,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import type { CodexSession, RolloutLine, SessionMeta } from "./types.ts";
 import { normalizeCwd } from "./paths.ts";
-import { loadDesktopThreads, loadThreadsByIds } from "./codex-db.ts";
+import { loadDesktopThreads, loadThreadsByIds, reconcileCodexArchive, type DbThreadRow } from "./codex-db.ts";
 import { loadDesktopSelection, projectForCwd } from "./codex-desktop-state.ts";
 import { loadThreadNames, nameFromThreadRow } from "./codex-thread-names.ts";
 import { splitUserMessage } from "./preamble.ts";
@@ -101,13 +101,16 @@ export function parseRollout(
     if (rec.type === "compacted") {
       const replacement = payload["replacement_history"];
       if (useCompaction) {
-        if (Array.isArray(replacement) && replacement.length > 0) {
-          compactedAway += items.length;
-          items.length = 0;
-          for (const it of replacement) {
-            if (it && typeof it === "object") {
-              items.push({ tsMs, payload: it as Record<string, unknown> });
-            }
+        if (!Array.isArray(replacement) || replacement.length === 0) {
+          throw new Error(`compacted rollout has empty or missing replacement history: ${rolloutPath}`);
+        }
+        compactedAway += items.length;
+        items.length = 0;
+        for (const it of replacement) {
+          if (it && typeof it === "object" && !Array.isArray(it)) {
+            items.push({ tsMs, payload: it as Record<string, unknown> });
+          } else {
+            throw new Error(`compacted rollout has a malformed replacement item: ${rolloutPath}`);
           }
         }
       } else {
@@ -170,8 +173,10 @@ export function parseRollout(
     // model_provider is a provider name, not a model; leave model null unless a turn_context set it.
   }
 
+  const nativeThreadId = typeof meta.id === "string" && meta.id !== "" ? meta.id : undefined;
   return {
     sessionId,
+    ...(nativeThreadId == null ? {} : { desktopThreadId: nativeThreadId }),
     rolloutPath,
     sourceContentSha256,
     cwd,
@@ -179,7 +184,9 @@ export function parseRollout(
     meta,
     firstTsMs: firstTsMs ?? tsToMs(meta.timestamp),
     lastTsMs: lastTsMs ?? tsToMs(meta.timestamp),
-    items,
+    // Everything above is derived from the item list; a caller that only needs
+    // that derivation keeps none of the bodies it was derived from.
+    items: opts.retainItems === false ? [] : items,
     model,
     messageCount,
     title,
@@ -208,7 +215,7 @@ export function loadCodexSessions(
   const sessions: CodexSession[] = [];
   for (const f of files) {
     const s = parseRollout(f, opts);
-    if (s) sessions.push(s);
+    if (s) sessions.push({ ...s, isArchived: false });
   }
   // newest last-activity first
   sessions.sort((a, b) => (b.lastTsMs ?? 0) - (a.lastTsMs ?? 0));
@@ -227,6 +234,17 @@ export interface ParseOptions {
    * on the next turn, which Claude cannot do because it fails first.
    */
   useCodexCompaction?: boolean;
+  /**
+   * Keep the parsed transcript items on the returned session. Default true.
+   *
+   * Set false to inventory a whole corpus: every derived field — timestamps,
+   * title, message counts, the source hash, how much Codex compacted away — is
+   * computed exactly as it is with items retained, but the bodies themselves are
+   * released per file instead of accumulating across the corpus. Only the legacy
+   * Codex→Claude mapper replays `items`; a caller that needs them re-parses the
+   * one rollout it selected.
+   */
+  retainItems?: boolean;
 }
 
 export interface DesktopSelectOptions {
@@ -237,6 +255,11 @@ export interface DesktopSelectOptions {
 export interface DesktopSelectResult {
   via: "desktop" | "db" | "scan";
   sessions: CodexSession[];
+}
+
+function applyIndexedArchiveState(session: CodexSession, codexHome: string, row: DbThreadRow): void {
+  const archive = reconcileCodexArchive(codexHome, row.rolloutPath, row);
+  session.isArchived = archive.state === "unknown" ? undefined : archive.state === "archived";
 }
 
 /**
@@ -271,6 +294,10 @@ export function loadDesktopSessions(
         if (!r.rolloutPath) continue;
         const s = parseRollout(r.rolloutPath, opts);
         if (!s) continue;
+        if (s.desktopThreadId != null && s.desktopThreadId !== r.id) {
+          throw new Error(`Codex rollout thread id does not match thread index: ${r.rolloutPath}`);
+        }
+        s.desktopThreadId = r.id;
         if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
         s.codexName = nameFor(r);
         if (r.source) s.source = r.source;
@@ -279,7 +306,7 @@ export function loadDesktopSessions(
           : projectForCwd(selection, r.cwd || s.cwdOriginal || s.cwd);
         s.projectName = proj?.name ?? "(no project)";
         s.hasProject = proj != null;
-        s.isArchived = r.archived;
+        applyIndexedArchiveState(s, codexHome, r);
         s.sandboxPolicy = r.sandboxPolicy;
         s.approvalMode = r.approvalMode;
         s.reasoningEffort = r.reasoningEffort;
@@ -290,7 +317,7 @@ export function loadDesktopSessions(
   }
 
   if (selection && selection.mode === "assigned") {
-    const ids = [...selection.threadProject.keys()];
+    const ids = [...new Set([...selection.threadProject.keys(), ...selection.unknownThreadIds])];
     const rows = loadThreadsByIds(codexHome, ids, opts);
     if (rows) {
       const sessions: CodexSession[] = [];
@@ -299,13 +326,19 @@ export function loadDesktopSessions(
         if (opts.interactiveOnly && r.source.includes("exec")) continue;
         const s = parseRollout(r.rolloutPath, opts);
         if (!s) continue;
+        if (s.desktopThreadId != null && s.desktopThreadId !== r.id) {
+          throw new Error(`Codex rollout thread id does not match thread index: ${r.rolloutPath}`);
+        }
+        s.desktopThreadId = r.id;
         if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
         s.codexName = nameFor(r);
         if (r.source) s.source = r.source;
-        const proj = selection.threadProject.get(r.id) ?? null;
-        s.projectName = proj?.name ?? "(no project)";
-        s.hasProject = proj != null;
-        s.isArchived = r.archived;
+        if (!selection.unknownThreadIds.has(r.id)) {
+          const proj = selection.threadProject.get(r.id) ?? null;
+          s.projectName = proj?.name ?? "(no project)";
+          s.hasProject = proj != null;
+        }
+        applyIndexedArchiveState(s, codexHome, r);
         s.sandboxPolicy = r.sandboxPolicy;
         s.approvalMode = r.approvalMode;
         s.reasoningEffort = r.reasoningEffort;
@@ -322,13 +355,17 @@ export function loadDesktopSessions(
       if (!r.rolloutPath) continue;
       const s = parseRollout(r.rolloutPath, opts);
       if (!s) continue;
+      if (s.desktopThreadId != null && s.desktopThreadId !== r.id) {
+        throw new Error(`Codex rollout thread id does not match thread index: ${r.rolloutPath}`);
+      }
+      s.desktopThreadId = r.id;
       if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
       s.codexName = nameFor(r);
       if (r.source) s.source = r.source;
       s.sandboxPolicy = r.sandboxPolicy;
       s.approvalMode = r.approvalMode;
       s.reasoningEffort = r.reasoningEffort;
-      s.isArchived = r.archived;
+      applyIndexedArchiveState(s, codexHome, r);
       sessions.push(s); // DB already ordered by recency
     }
     return { via: "db", sessions };

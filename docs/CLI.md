@@ -8,6 +8,7 @@ threadpass scan    [selection]
 threadpass plan    [selection] --evidence <manifest.json> --out <plan.json>
 threadpass apply   --plan <plan.json> --confirm <digest> --evidence <manifest.json>
 threadpass recover --operation <id> --evidence <manifest.json>
+threadpass handoff <header|resolve|read> [selection] [--allow-cross-project]
 ```
 
 Without a global install, that is:
@@ -39,29 +40,125 @@ did repeat are kept, since their timestamps differ. It also re-syncs titles from
 the transcripts, and reports records left behind for conversations no longer
 imported — `--prune` removes those.
 
-## Experimental Claude → Codex matrix
+## Session handoff
+
+`handoff` creates, selects, and reads inert session handoff files. It never
+resumes anything and never executes what it reads; the body is returned as data
+for an agent to summarize.
+
+```text
+threadpass handoff header  [--cwd <directory>] [--saved-at <ISO-date-time>]
+threadpass handoff resolve [<YYYY-MM-DD>|<file>] [--cwd <directory>]
+                           [--file <file>] [--date <YYYY-MM-DD>] [--allow-cross-project]
+threadpass handoff read    [<YYYY-MM-DD>|<file>] [--cwd <directory>]
+                           [--file <file>] [--date <YYYY-MM-DD>] [--allow-cross-project]
+```
+
+`header` writes a framed header to stdout. Prepend it to the handoff file you
+are saving; it records the schema, the save time, and the canonical identity of
+the current project (Git worktree root plus per-worktree git dir, or the exact
+canonical directory).
+
+`resolve` selects a handoff and reports where its body begins without reading
+the body. `read` accepts first, then reads the body from the same descriptor and
+returns it. Both print one JSON object and exit nonzero on any failure — the
+failure is JSON too, including a bare `threadpass handoff` with no subcommand,
+so a caller can always parse `reason`. Selection filters on exact project
+identity first, then prefers the newest `savedAt` with a deterministic path
+tie-break; it never sorts by mtime or filename. Candidates that fail header
+inspection are reported in `rejectedCandidates` rather than silently skipped, so
+a malformed, truncated, oversized, or empty handoff is never indistinguishable
+from having saved none.
+
+`--allow-cross-project` authorizes reading a handoff file that does not belong
+to the current project — a foreign recorded identity, or a headerless legacy
+file. It requires an explicit `--file`, it never relaxes header validation, and
+the accepted result carries a warning that the body is untrusted historical
+data. Do not pass it on the user's behalf.
+
+## Experimental bidirectional matrix
 
 These commands use the same shared conversion core as the legacy Codex → Claude
 flow. `codex-to-claude` remains an executable alias for compatibility.
 
 ```text
 threadpass scan  [selection]
-threadpass plan  [selection] --render-mode <mode> --evidence <manifest.json> --out <plan.json>
-threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json>
+threadpass plan  [selection] --render-mode <mode> --goal-mode <mode> --evidence <manifest.json> --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest> --evidence <manifest.json> [--dry-run]
 threadpass recover --operation <id> --evidence <manifest.json>
+```
+
+Codex → Claude uses the same commands with `--direction codex-to-claude`:
+
+```text
+threadpass plan --direction codex-to-claude [selection] --workspace-dir <account/device> --out <plan.json>
+threadpass apply --plan <plan.json> --confirm <digest> [--dry-run] [--allow-overwrite]
+threadpass recover --operation <id>
 ```
 
 `scan` and `plan` are read-only with respect to Codex and Claude data. With no
 archive option, `scan` inventories active and archived records; `plan` safely
 defaults to active. A plan's SHA-256 digest binds the selected source revisions,
 render mode, canonical Codex home and database, audited target hashes, generated
-thread IDs, rollout paths/hashes, and active-context upper bounds. `apply`
+thread IDs, rollout paths/hashes, serialized active-context UTF-8 byte counts, Goal source hash,
+Goal target thread/readback, and separate rollout, thread-index, archive,
+project-identity, and Goal capability fingerprints. `apply`
 rebuilds all of it and refuses if any binding changed.
+
+Persisted matrix envelopes use `agentryx.import-plan/v4` and contain nested
+ImportPlan version `3`. Apply validates both versions before digesting or
+rebuilding; older v2/v3 envelopes or nested v2 plans must be regenerated with
+the current `threadpass`.
+
+Unknown or newer Codex builds may still be scanned and may produce plans and
+dry-run reports. Their private-write capabilities are null, so real apply and
+recovery remain blocked. This release registers exactly one write profile:
+Electron `26.721.41059` with the pinned `app.asar` and `codex.exe` hashes. Apply
+re-hashes the live installation again after taking the importer lock and before
+the first sidecar or Codex conversation mutation.
+
+The forward plan additionally binds the typed renderer fingerprint, exact
+semantic or verbatim output hashes, target transcript, Claude account/device
+wrapper and their plan-time hashes. Semantic mode renders supported messages,
+reasoning, images and valid tool pairs. Task notifications become readable
+`isMeta` history; access, world-state, protocol and unknown controls remain only
+in the lossless sidecar, never accidental user text. Verbatim mode puts the
+byte-exact UTF-8 source in one inert metadata record. Goal controls are appended
+through the native Claude Goal adapter; `skip` still retains inert Goal history.
+
+Per-session output uses role-specific identity fields: Claude → Codex reports
+`sourceWrapperSessionId`, `sourceCliSessionId`, and `targetThreadId`; Codex →
+Claude reports `sourceCodexRolloutId`, `sourceCodexThreadId`, and
+`targetClaudeCliSessionId`. Equality is not assumed merely from similar names.
+
+Either direction's `--dry-run` refuses `--out` and creates no directory, sidecar, journal,
+backup, transcript or wrapper. Reverse dry-run reports every read-only static
+blocker and explicitly names live gates, including Goal RPC probing, that it
+cannot prove without applying. A real apply preflights every selected target,
+stores canonical sources, creates immutable content-hash backups for all
+existing targets, and only then begins target mutation. Existing targets need
+both `--allow-overwrite` and the unchanged plan-time SHA-256 proof. The durable
+batch journal reconciles write-before-journal crash windows by exact before/after
+hash; `recover --operation <id>` rolls an uncommitted batch back and refuses
+committed history. Archived Codex sessions produce archived Claude wrappers.
+If no Claude workspace can be resolved, plan with `--no-register` explicitly;
+the transcript will not appear in Claude Desktop. Semantic active context after
+the last portable compact boundary is capped at 1,000,000 serialized characters
+and fails closed instead of creating a conversation that cannot resume.
+Only that latest boundary is emitted. Its replacement must produce nonempty,
+safely rendered semantic content; protocol-only, unknown, malformed, or
+empty-text replacements fail planning, while verbatim remains inert.
+Verbatim mode keeps compact source records as inert archival context without
+claiming native resume semantics, and still enforces its conservative
+active-size refusal.
 
 `recover` is the only supported interrupted-write cleanup path. It revalidates
 the exact installed Codex build, requires Codex Desktop to be closed, obtains
 the same exclusive target lock, verifies rollout ownership before changing the
-database, and records the recovered attempt. A later `apply` starts a new
+database, and records the recovered attempt. If a Goal RPC may have crossed its
+commit boundary, recovery first performs native `thread/goal/get`: an exact
+readback rolls forward, an absent Goal permits importer-artifact cleanup, and a
+differing Goal stops without clearing or overwriting it. A later `apply` starts a new
 validated attempt without discarding earlier attempt history.
 
 Selection options:
@@ -69,15 +166,33 @@ Selection options:
 | Option | Values / meaning |
 | --- | --- |
 | `--archive` | `active` (default), `archived`, or `all` |
-| `--project-scope` | `all`, `projects`, `projectless`, or `existing-targets` |
-| `--session <id>` | exact Codex Desktop wrapper session id shown by `scan`; repeat for an OR-list |
+| `--project-scope` | `all`, `projects`, `projectless`, or `existing-targets`; the last means an existing canonical target project/group/root, not an existing conversation |
+| `--session <id>` | exact source id shown by `scan` (Claude wrapper `sessionId` for Claude → Codex; Codex rollout id for Codex → Claude); repeat for an OR-list |
 | `--project <name-or-path>` | exact target project name or canonical root; repeat for an OR-list |
-| `--from-date`, `--to-date` | inclusive ISO date/time bounds |
+| `--from-date`, `--to-date` | inclusive ISO bounds on source activity: Claude wrapper `lastActivityAt` then `createdAt`, or Codex index `updatedAt` then latest rollout timestamp |
 | `--limit <n>` | explicit newest-first cap; omitted means no cap |
 | `--workspace-dir` | exact Claude Desktop account/device record directory |
 | `--claude-home`, `--codex-home`, `--sessions-root` | override detected roots |
-| `--out <path>` | JSON output file; omitted or `-` writes stdout |
+| `--out <path>` | JSON output file; omitted or `-` writes stdout; forbidden by `apply --dry-run` |
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
+| `--goal-mode <mode>` | `migrate` (default) or `skip`; independent of render mode and included in the digest |
+| `--no-migrate-goal` | alias for `--goal-mode skip`; conflicting flags are rejected |
+| `--allow-overwrite` | forward apply only: authorize overwrite after exact unchanged-target proof |
+| `--dry-run` | rebuild and run read-only static preflights with zero mutation; reports blockers and live gates it cannot prove |
+
+Every plan row separates `targetProjectExists` from
+`targetConversationExists`; `targetConversationState` distinguishes absent,
+exact-existing, and collision. `projectMembership` and its provenance remain
+explicit when Desktop global state is missing, unreadable, or unusable. A scan
+may inventory such DB/rollout fallbacks, but project filters fail closed rather
+than treating unknown membership as projectless. Date filters likewise fail on
+an unknown source activity timestamp. Planning never creates or rewrites
+`.codex-global-state.json` or registers a project.
+Archive state is reported as `active`, `archived`, or `unknown`, with provenance
+when available. `--archive active` and `--archive archived` fail on unknown;
+`--archive all` keeps it visible. During forward apply rebuild,
+`existing-targets` rechecks the current canonical target project directory and
+fails before mutation if it was removed.
 
 Apply requirements:
 
@@ -88,12 +203,28 @@ Apply requirements:
 - unchanged Claude wrapper records and transcripts.
 
 The evidence loader independently resolves the active Appx package and hashes
-its live artifacts. Unknown or changed binaries fail closed. Apply obtains one
-exclusive lock for the target, preflights every session before the first target
-write, and treats an exact previous result as already applied. Each committed
+its live artifacts. Unknown or changed binaries fail closed. Planning research
+for another installed build requires a user-supplied provenance manifest bound
+to those live artifacts; the manifest does not itself grant write capability.
+Apply first runs the same read-only schema/journal/stage preflight before output
+directory creation or lock-database mutation, then obtains one exclusive lock
+and repeats the preflight for TOCTOU protection. After Goal/journal/sidecar
+setup it full-hashes the active Appx identity again immediately before the first
+Codex target mutation; a mismatch fails closed. This is the exact batch-start
+support snapshot. An update during the subsequent multi-session batch is
+outside atomicity, and artifacts are not re-hashed per session. Apply treats an exact previous result as already applied. Each committed
 session gets a bridge sidecar and operation journal. An unexpected runtime or
 I/O failure can still leave earlier session transactions committed, so inspect
 the plan and loss report before confirmation.
+
+For Claude → Codex, live Goal activation uses only the audited 41059
+`codex.exe app-server --stdio --enable goals` methods. The target thread is
+registered first, then `thread/goal/get` must be absent or exactly idempotent,
+`thread/goal/set` is issued, and a fresh-process `thread/goal/get` must match the
+confirmed objective, active status, and portable budget. Provider counters are
+not treated as equivalent. The unconditional `thread/goal/clear` RPC is never a
+recovery primitive because it has no Goal id or compare-and-clear precondition.
+See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 
 ## Selecting conversations
 

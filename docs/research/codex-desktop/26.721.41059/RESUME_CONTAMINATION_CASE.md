@@ -34,7 +34,7 @@ Ansim therefore demonstrates the same global lookup defect but not actual conten
 
 The no-argument migrated `resume-session` skill says to load the most recent file under `~/.Codex/session-data`. It does not require the handoff's project/worktree to match the current thread `cwd`. At observation time that directory contained only the Baton handoff.
 
-Native durable Goal continuation and this generic command are different mechanisms. Existing native threads that retain Goal/world-state/turn-context can resume through their structured state; the 50 imported rollouts contained none of those record types. It is therefore consistent for ordinary native conversations to appear unaffected while imported long-running work falls into the generic fallback. It is not proof that native threads can never invoke the unsafe skill.
+Native durable Goal continuation and this generic command are different mechanisms. Existing native threads that retain Goal/world-state/turn-context can resume through their structured state; the 50 cohort A rollouts contained none of those record types. It is therefore consistent for ordinary native conversations to appear unaffected while imported long-running work falls into the generic fallback. It is not proof that native threads can never invoke the unsafe skill.
 
 ## Required guard
 

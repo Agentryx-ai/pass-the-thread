@@ -3,8 +3,8 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import type { CodexTargetEvidence } from "./version-gate.ts";
-import { assertSupportedCodexTarget } from "./version-gate.ts";
+import type { CodexPrivateWriteCapability, CodexTargetEvidence } from "./version-gate.ts";
+import { assertCodexPrivateWriteCapabilities } from "./version-gate.ts";
 import {
   buildCodexRollout41059,
   serializeCodexRollout41059,
@@ -18,9 +18,22 @@ import {
   type OperationJournalInput,
 } from "./operation-journal.ts";
 import { stripWindowsExtendedPrefix } from "./project-identity.ts";
+import type { CanonicalGoalSnapshot, GoalMigrationMode } from "./goal.ts";
+import {
+  assertCodexGoalReadback,
+  CODEX_GOAL_TARGET_CAPABILITY_ID,
+  CODEX_GOAL_TARGET_FINGERPRINT,
+  codexGoalSetBinding,
+  createCodexGoalRpc,
+  planCodexGoalActivation,
+  validateCodexGoalActivationPlan,
+  type CodexGoalActivationPlan,
+  type CodexGoalRpc,
+} from "./codex-goal-target.ts";
 
-export const CODEX_41059_CONTEXT_WINDOW = 258_400;
-export const CODEX_41059_SAFE_ACTIVE_TOKENS = 230_000;
+export const CODEX_41059_PROVIDER_CONTEXT_WINDOW_TOKENS = 258_400;
+/** Conservative offline refusal cap; this is serialized UTF-8 bytes, not provider tokens. */
+export const CODEX_41059_SAFE_ACTIVE_UTF8_BYTES = 230_000;
 
 export interface CodexTargetPlan {
   operationId: string;
@@ -34,6 +47,8 @@ export interface CodexTargetPlan {
   serializedRollout: string;
   rolloutSha256: string;
   conversation: LogicalCodexConversation;
+  goalActivation: CodexGoalActivationPlan | null;
+  requiredCapabilities: CodexPrivateWriteCapability[];
 }
 
 export interface ApplyCodexTargetOptions {
@@ -41,6 +56,8 @@ export interface ApplyCodexTargetOptions {
   evidence: CodexTargetEvidence;
   bridgeRoot: string;
   lock: CodexTargetLock;
+  goalRpc?: CodexGoalRpc;
+  desktopGuard?: () => void;
 }
 
 export interface CodexTargetLock {
@@ -51,6 +68,12 @@ export interface CodexTargetLock {
 }
 
 export type CodexTargetPlanState = "absent" | "already-applied" | "collision";
+
+interface CodexTargetThreadReadback {
+  rolloutPath: string;
+  archived: number;
+  archivedAt: number | bigint | null;
+}
 
 function hashText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -131,14 +154,42 @@ export function releaseCodexTargetLock(lock: CodexTargetLock): void {
 
 export function inspectCodexTargetPlan(plan: CodexTargetPlan): CodexTargetPlanState {
   const rolloutExists = fs.existsSync(plan.rolloutPath);
-  const registeredPath = fs.existsSync(plan.dbPath) ? threadRolloutPath(plan.dbPath, plan.threadId) : null;
-  if (!rolloutExists && registeredPath == null) return "absent";
-  if (rolloutExists && registeredPath != null &&
-    canonicalPath(registeredPath) === canonicalPath(plan.rolloutPath) &&
+  const registered = fs.existsSync(plan.dbPath) ? targetThreadReadback(plan.dbPath, plan.threadId) : null;
+  if (!rolloutExists && registered == null) return "absent";
+  if (rolloutExists && registered != null &&
+    canonicalPath(registered.rolloutPath) === canonicalPath(plan.rolloutPath) &&
+    archiveReadbackMatches(plan.archived, registered) &&
     createHash("sha256").update(fs.readFileSync(plan.rolloutPath)).digest("hex") === plan.rolloutSha256) {
     return "already-applied";
   }
   return "collision";
+}
+
+function targetThreadReadback(dbPath: string, threadId: string): CodexTargetThreadReadback | null {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const row = db.prepare("SELECT rollout_path, archived, archived_at FROM threads WHERE id = ?")
+      .get(threadId) as { rollout_path?: unknown; archived?: unknown; archived_at?: unknown } | undefined;
+    if (row == null) return null;
+    if (typeof row.rollout_path !== "string" || typeof row.archived !== "number" ||
+      ![0, 1].includes(row.archived) ||
+      (row.archived_at !== null && typeof row.archived_at !== "number" && typeof row.archived_at !== "bigint")) {
+      return { rolloutPath: "", archived: -1, archivedAt: null };
+    }
+    return { rolloutPath: row.rollout_path, archived: row.archived, archivedAt: row.archived_at };
+  } finally {
+    db.close();
+  }
+}
+
+function archiveReadbackMatches(
+  plannedArchived: boolean,
+  readback: Pick<CodexTargetThreadReadback, "archived" | "archivedAt">,
+): boolean {
+  if (!plannedArchived) return readback.archived === 0 && readback.archivedAt === null;
+  if (readback.archived !== 1 || readback.archivedAt == null) return false;
+  const archivedAt = Number(readback.archivedAt);
+  return Number.isSafeInteger(archivedAt) && archivedAt >= 0;
 }
 
 export function operationJournalInputForPlan(plan: CodexTargetPlan): OperationJournalInput {
@@ -151,25 +202,35 @@ export function operationJournalInputForPlan(plan: CodexTargetPlan): OperationJo
     targetStagePath: plan.stagePath,
     targetRolloutSha256: plan.rolloutSha256,
     targetDbPath: plan.dbPath,
+    goalActivation: plan.goalActivation,
   };
 }
 
-export function estimatedActiveTokens(conversation: Omit<LogicalCodexConversation, "threadId">): number {
-  const explicit = conversation.compaction?.postTokens;
+export function estimatedActiveBytes(conversation: Omit<LogicalCodexConversation, "threadId">): number {
   const items = conversation.items ?? conversation.messages;
-  const activeIndex = conversation.compaction?.activeItemIndex ??
-    conversation.compaction?.activeMessageIndex ?? 0;
-  const active = items.slice(activeIndex);
-  // A conservative offline estimate used only as a refusal threshold. Exact
-  // tokenisation is model-specific; callers see this estimate in the plan.
-  // The pinned tokenizer is not available locally. Every token consumes at
-  // least one UTF-8 byte, so byte length is a deliberately conservative upper
-  // bound for CJK, emoji, ASCII, and high-entropy content.
-  const appendedEstimate = Buffer.byteLength(JSON.stringify(active), "utf8");
-  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit >= 0) {
-    return explicit + appendedEstimate;
+  const configuredIndex = conversation.compaction?.activeItemIndex ??
+    conversation.compaction?.activeMessageIndex;
+  if (conversation.compaction != null && configuredIndex == null) {
+    throw new Error("compacted history must identify its active-item boundary");
   }
-  return appendedEstimate;
+  const activeIndex = configuredIndex ?? 0;
+  if (!Number.isSafeInteger(activeIndex) || activeIndex < 0 || activeIndex > items.length) {
+    throw new Error(`compaction active-item index ${activeIndex} is outside 0..${items.length}`);
+  }
+  for (const [name, value] of [
+    ["source pre-compaction token counter", conversation.compaction?.preTokens],
+    ["source post-compaction token counter", conversation.compaction?.postTokens],
+  ] as const) {
+    if (value != null && (!Number.isSafeInteger(value) || value < 0)) {
+      throw new Error(`${name} must be a non-negative safe integer`);
+    }
+  }
+  const active = items.slice(activeIndex);
+  const appendedBytes = Buffer.byteLength(JSON.stringify(active), "utf8");
+  const replacementBytes = conversation.compaction?.summary == null
+    ? 0
+    : Buffer.byteLength(conversation.compaction.summary, "utf8");
+  return replacementBytes + appendedBytes;
 }
 
 export function deterministicThreadId(sourceId: string, sourceSha256: string): string {
@@ -184,11 +245,18 @@ export function planCodexTarget(
   sourceSha256: string,
   conversation: Omit<LogicalCodexConversation, "threadId">,
   archived = false,
+  goal: CanonicalGoalSnapshot | null = null,
+  goalMode: GoalMigrationMode = "migrate",
 ): CodexTargetPlan {
-  const activeTokens = estimatedActiveTokens(conversation);
-  if (activeTokens > CODEX_41059_SAFE_ACTIVE_TOKENS) {
+  if (conversation.compaction != null &&
+    (conversation.compaction.summary == null || conversation.compaction.summary.trim() === "")) {
+    throw new Error("compacted Claude history has no replacement summary and cannot be resumed safely");
+  }
+  const activeBytes = estimatedActiveBytes(conversation);
+  if (activeBytes > CODEX_41059_SAFE_ACTIVE_UTF8_BYTES) {
     throw new Error(
-      `active imported context is about ${activeTokens} tokens; safe limit is ${CODEX_41059_SAFE_ACTIVE_TOKENS}`,
+      `active imported context is ${activeBytes} UTF-8 bytes; conservative offline limit is ` +
+      `${CODEX_41059_SAFE_ACTIVE_UTF8_BYTES} UTF-8 bytes (no provider token count is inferred)`,
     );
   }
   const threadId = deterministicThreadId(sourceId, sourceSha256);
@@ -200,6 +268,7 @@ export function planCodexTarget(
   const stamp = conversation.createdAt.replace(/[:.]/g, "-").replace(/Z$/, "");
   const rolloutPath = path.join(codexHome, dir, `rollout-${stamp}-${threadId}.jsonl`);
   const operationId = hashText(`operation\0${sourceSha256}\0${threadId}`).slice(0, 32);
+  const goalActivation = planCodexGoalActivation(goal, goalMode, threadId);
   return {
     operationId,
     codexHome: path.resolve(codexHome),
@@ -212,14 +281,59 @@ export function planCodexTarget(
     serializedRollout,
     rolloutSha256: hashText(serializedRollout),
     conversation: fullConversation,
+    goalActivation,
+    requiredCapabilities: [
+      "rollout",
+      "threadIndex",
+      "projectIdentity",
+      ...(archived ? ["archive" as const] : []),
+    ],
   };
 }
 
 export function applyCodexTarget(plan: CodexTargetPlan, options: ApplyCodexTargetOptions): OperationJournal {
   if (!options.allowWrite) throw new Error("Codex target apply is disabled; create and inspect a plan first");
   assertTargetLock(options.lock, plan.codexHome);
-  assertCodexDesktopClosed();
-  assertSupportedCodexTarget(options.evidence);
+  (options.desktopGuard ?? assertCodexDesktopClosed)();
+  assertCodexPrivateWriteCapabilities(options.evidence, plan.requiredCapabilities);
+  if (plan.goalActivation != null &&
+    (plan.goalActivation.capabilityId !== CODEX_GOAL_TARGET_CAPABILITY_ID ||
+      plan.goalActivation.profileFingerprint !== CODEX_GOAL_TARGET_FINGERPRINT)) {
+    throw new Error("Codex Goal target capability changed after planning");
+  }
+  if (plan.goalActivation != null) validateCodexGoalActivationPlan(plan.goalActivation);
+  const goalRpc = plan.goalActivation == null
+    ? null
+    : options.goalRpc ?? createCodexGoalRpc(options.evidence, plan.codexHome);
+  const ownsGoalRpc = goalRpc != null && options.goalRpc == null;
+  let applyError: unknown;
+  try {
+    // The exported API has the same before-first-write capability check as the
+    // matrix CLI. Injected RPCs are probed too, so callers cannot accidentally
+    // bypass the exact app-server profile preflight.
+    goalRpc?.probe();
+    return applyCodexTargetAfterGoalPreflight(plan, options, goalRpc);
+  } catch (error) {
+    applyError = error;
+    throw error;
+  } finally {
+    if (ownsGoalRpc) {
+      try { goalRpc.dispose(); }
+      catch (cleanupError) {
+        if (applyError != null) {
+          throw new AggregateError([applyError, cleanupError], "Codex target apply and Goal RPC cleanup failed");
+        }
+        throw cleanupError;
+      }
+    }
+  }
+}
+
+function applyCodexTargetAfterGoalPreflight(
+  plan: CodexTargetPlan,
+  options: ApplyCodexTargetOptions,
+  goalRpc: CodexGoalRpc | null,
+): OperationJournal {
   const targetState = inspectCodexTargetPlan(plan);
   if (targetState !== "absent") throw new Error(`target is not absent (${targetState}): ${plan.threadId}`);
 
@@ -251,9 +365,74 @@ export function applyCodexTarget(plan: CodexTargetPlan, options: ApplyCodexTarge
       firstUserMessage: firstUser,
       preview: firstUser.slice(0, 500),
     });
+    if (inspectCodexTargetPlan(plan) !== "already-applied") {
+      throw new Error(`Codex target archive/path/hash readback differs after registration: ${plan.threadId}`);
+    }
+    journal = updateOperationJournal(options.bridgeRoot, journal, { state: "thread-registered" });
+    if (plan.goalActivation != null) {
+      if (goalRpc == null) throw new Error("Codex Goal RPC preflight was not established");
+      const binding = codexGoalSetBinding(plan.operationId, plan.goalActivation);
+      const preexisting = goalRpc.get(plan.threadId, binding);
+      if (preexisting != null) {
+        try {
+          assertCodexGoalReadback(preexisting, plan.goalActivation.expectedReadback);
+        } catch {
+          journal = updateOperationJournal(options.bridgeRoot, journal, {
+            state: "reconciliation-required",
+            error: "Codex target thread has a differing Goal; importer preserved the thread and did not clear it",
+          });
+          throw new Error("Codex target Goal collision; importer will not overwrite or clear it");
+        }
+        if (hashText(fs.readFileSync(plan.rolloutPath, "utf8")) !== plan.rolloutSha256) {
+          throw new Error("Codex Goal idempotency check found a changed imported rollout");
+        }
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-verified", observedGoal: preexisting,
+        });
+      } else {
+        journal = updateOperationJournal(options.bridgeRoot, journal, { state: "goal-activation-requested" });
+        const setGoal = goalRpc.set(plan.goalActivation.request, binding);
+        assertCodexGoalReadback(setGoal, plan.goalActivation.expectedReadback);
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-activation-confirmed", observedGoal: setGoal,
+        });
+        const readback = goalRpc.get(plan.threadId, binding);
+        assertCodexGoalReadback(readback, plan.goalActivation.expectedReadback);
+        if (!(["threadId", "objective", "status", "tokenBudget", "tokensUsed", "timeUsedSeconds", "createdAt", "updatedAt"] as const)
+          .every((field) => readback[field] === setGoal[field])) {
+          throw new Error("Codex Goal changed between set response and restart readback");
+        }
+        if (hashText(fs.readFileSync(plan.rolloutPath, "utf8")) !== plan.rolloutSha256) {
+          throw new Error("Codex Goal RPC changed the imported rollout");
+        }
+        journal = updateOperationJournal(options.bridgeRoot, journal, {
+          state: "goal-verified", observedGoal: readback,
+        });
+      }
+    }
     journal = updateOperationJournal(options.bridgeRoot, journal, { state: "committed" });
     return journal;
   } catch (error) {
+    if (plan.goalActivation != null && new Set([
+      "goal-activation-requested", "goal-activation-confirmed", "goal-verified", "reconciliation-required",
+    ]).has(journal.state)) {
+      let journalError: unknown;
+      try {
+        if (journal.state !== "reconciliation-required") {
+          updateOperationJournal(options.bridgeRoot, journal, {
+            state: "reconciliation-required",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } catch (failure) { journalError = failure; }
+      if (journalError != null) {
+        throw new AggregateError([error, journalError], "Goal activation failed and reconciliation journaling failed");
+      }
+      throw new Error(
+        `Codex Goal activation outcome requires reconciliation; importer artifacts were preserved: ${
+          error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     let cleanupError: unknown;
     try {
       const registeredPath = fs.existsSync(plan.dbPath) ? threadRolloutPath(plan.dbPath, plan.threadId) : null;

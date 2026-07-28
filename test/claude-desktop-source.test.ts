@@ -43,6 +43,19 @@ test("transcript-unavailable wrappers remain visible in archive inventory", () =
   assert.equal(inventory.sessions[0].transcriptPath, null);
 });
 
+test("a missing wrapper archive field remains explicit unknown with provenance", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-archive-unknown-"));
+  const workspace = path.join(root, "sessions", "account", "device");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.writeFileSync(path.join(workspace, "local_unknown.json"), JSON.stringify({
+    sessionId: "local_unknown", cwd: "C:\\repo", transcriptUnavailable: true,
+  }));
+  const inventory = inventoryClaudeDesktop(path.join(root, "claude"), workspace);
+  assert.equal(inventory.sessions[0]?.isArchived, undefined);
+  assert.equal(inventory.sessions[0]?.archiveState, "unknown");
+  assert.equal(inventory.sessions[0]?.archiveProvenance, "claude-wrapper-missing-isArchived");
+});
+
 test("workspace resolution fails closed when several accounts are ambiguous", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-accounts-"));
   const sessionsRoot = path.join(root, "sessions");

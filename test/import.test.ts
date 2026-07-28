@@ -34,11 +34,13 @@ import {
   titleShowsCodexName,
 } from "../src/claude-desktop-target.ts";
 import { loadDesktopSelection, projectForCwd } from "../src/codex-desktop-state.ts";
+import { keySeparator } from "../src/project-identity.ts";
 import { loadThreadNames, nameFromThreadRow } from "../src/codex-thread-names.ts";
 import { renderCitation, splitCitations } from "../src/citation.ts";
 import { validateTranscript } from "../src/validate.ts";
 import { encodeProjectDir } from "../src/paths.ts";
 import { parseRenderMode } from "../src/render-mode.ts";
+import { claudeGoalHistoryIdentity } from "../src/claude-goal-target.ts";
 import type { CodexSession } from "../src/types.ts";
 
 const SID = "11111111-1111-4111-8111-111111111111";
@@ -278,6 +280,41 @@ test("render-mode history dedup treats legacy records as semantic", () => {
   assert.equal(alreadyImported(history, "same-source", "verbatim"), true);
 });
 
+test("history identity binds Goal mode, source revision, and target capability", () => {
+  const s = fixtureSession();
+  const identity = {
+    mode: "migrate" as const,
+    sourceGoalSha256: "a".repeat(64),
+    targetCapabilityId: "claude.goal-transcript/v1",
+    targetFingerprint: "b".repeat(64),
+  };
+  const history = { version: 1 as const, records: [
+    makeHistoryRecord(s, "same-source", NOW, undefined, "semantic", identity),
+  ] };
+  assert.equal(alreadyImported(history, "same-source", "semantic", identity), true);
+  assert.equal(alreadyImported(history, "same-source", "semantic", { ...identity, mode: "skip" }), false);
+  assert.equal(alreadyImported(history, "same-source", "semantic", {
+    ...identity, sourceGoalSha256: "c".repeat(64),
+  }), false);
+  assert.equal(alreadyImported(history, "same-source", "semantic", {
+    ...identity, targetFingerprint: "d".repeat(64),
+  }), false);
+
+  const legacy = structuredClone(history.records[0]!);
+  delete legacy.goalMode;
+  delete legacy.sourceGoalSha256;
+  delete legacy.targetGoalCapabilityId;
+  delete legacy.targetGoalFingerprint;
+  assert.equal(alreadyImported({ version: 1, records: [legacy] }, "same-source"), true);
+  assert.equal(alreadyImported(
+    { version: 1, records: [legacy] },
+    "same-source",
+    "semantic",
+    claudeGoalHistoryIdentity(null, "migrate"),
+  ), true);
+  assert.equal(alreadyImported({ version: 1, records: [legacy] }, "same-source", "semantic", identity), false);
+});
+
 test("injected Codex context maps to isMeta, not to a plain user message", () => {
   const s = fixtureSession();
   // developer-role preamble + tag-wrapped user message + a real user message
@@ -382,8 +419,9 @@ test("the signed-in account decides which session-record directory is used", () 
   assert.equal(findActiveWorkspaceDir(root), stale, "the guess alone would land on the wrong account");
 });
 
-test("current Codex Desktop state groups by project root, not by an assignment map", () => {
+test("current Codex Desktop state groups by project root, not by an assignment map", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(
     path.join(home, ".codex-global-state.json"),
     JSON.stringify({
@@ -411,8 +449,9 @@ test("current Codex Desktop state groups by project root, not by an assignment m
   assert.equal(projectForCwd(sel, ""), null);
 });
 
-test("an older Desktop state with an assignment map still drives selection directly", () => {
+test("an older Desktop state with an assignment map still drives selection directly", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(
     path.join(home, ".codex-global-state.json"),
     JSON.stringify({
@@ -428,6 +467,44 @@ test("an older Desktop state with an assignment map still drives selection direc
   assert.equal(sel.threadProject.get("t-2"), null);
   // Windows roots still match despite drive-letter case and separators
   assert.equal(projectForCwd(sel, "C:\\work\\repo")?.name, "eagle");
+});
+
+// Regression for the separator bug fixed alongside the typed IR work: matching
+// a canonicalProjectIdentity key must use the key's own separator, not
+// path.sep (the host's), since a Windows-style key can occur on any host and
+// a POSIX-style key can occur on any host. Asserted without reference to
+// process.platform so the same assertions hold whichever host runs them; see
+// keySeparator's own direct test below for how that holds by construction.
+test("projectForCwd matches a root against a deeper cwd in both Windows and POSIX styles, but not a prefix-sharing sibling", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-sep-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(home, ".codex-global-state.json"),
+    JSON.stringify({
+      "local-projects": {
+        p1: { id: "p1", name: "eagle", rootPaths: ["c:\\work"] },
+        p2: { id: "p2", name: "gecko", rootPaths: ["/srv/work"] },
+      },
+      "thread-project-assignments": {},
+      "projectless-thread-ids": [],
+    }),
+  );
+  const sel = loadDesktopSelection(home);
+  assert.ok(sel);
+
+  assert.equal(projectForCwd(sel, "C:\\work\\repo")?.name, "eagle");
+  assert.equal(projectForCwd(sel, "c:\\workshop\\repo"), null, "workshop merely shares a prefix with work");
+
+  assert.equal(projectForCwd(sel, "/srv/work/repo")?.name, "gecko");
+  assert.equal(projectForCwd(sel, "/srv/workshop/repo"), null, "workshop merely shares a prefix with work");
+});
+
+test("keySeparator derives the separator from the key's own style, not the host's path.sep", () => {
+  assert.equal(keySeparator("c:\\work"), "\\");
+  assert.equal(keySeparator("c:\\work\\repo"), "\\");
+  assert.equal(keySeparator("\\\\server\\share\\work"), "\\");
+  assert.equal(keySeparator("/srv/work"), "/");
+  assert.equal(keySeparator("/srv/work/repo"), "/");
 });
 
 test("Codex's generated conversation name is read, newest entry winning", () => {
@@ -636,4 +713,25 @@ test("a record already showing the Codex name is not re-synced from an older tra
   assert.equal(titleShowsCodexName("anything", null), false);
   assert.equal(titleShowsCodexName("anything", "   "), false);
   assert.equal(titleShowsCodexName(undefined, "최신화하고 문서 읽기"), false);
+});
+
+test("inventory parsing derives every field without keeping the transcript body", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-retain-items-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const rolloutPath = path.join(root, "rollout-2026-07-25T10-00-00-11111111-2222-4333-8444-555555555555.jsonl");
+  fs.writeFileSync(rolloutPath, [
+    JSON.stringify({ timestamp: "2026-07-25T10:00:00.000Z", type: "session_meta", payload: { id: "thread-1", cwd: root, source: "vscode" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:01.000Z", type: "turn_context", payload: { model: "gpt-5" } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:02.000Z", type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "first ask" }] } }),
+    JSON.stringify({ timestamp: "2026-07-25T10:00:03.000Z", type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] } }),
+  ].join("\n") + "\n", "utf8");
+
+  const retained = parseRollout(rolloutPath, { useCodexCompaction: false })!;
+  const released = parseRollout(rolloutPath, { useCodexCompaction: false, retainItems: false })!;
+
+  assert.equal(retained.items.length, 2);
+  assert.deepEqual(released.items, []);
+  // Title, counts, timestamps and the source hash are derived identically; only
+  // the bodies they were derived from are let go.
+  assert.deepEqual({ ...released, items: null }, { ...retained, items: null });
 });

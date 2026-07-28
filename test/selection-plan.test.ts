@@ -10,9 +10,10 @@ import {
   sameProject,
   stripWindowsExtendedPrefix,
 } from "../src/project-identity.ts";
-import { selectSessions, type SelectionSession } from "../src/selection.ts";
+import { assertSelectorsResolve, selectSessions, type SelectionSession } from "../src/selection.ts";
 import { summarizeLosses } from "../src/loss-report.ts";
-import { buildImportPlan, digestImportPlan } from "../src/import-plan.ts";
+import { buildImportPlan, digestImportPlan, preselectSessions } from "../src/import-plan.ts";
+import { loadDesktopSelectionResult, projectForCwd } from "../src/codex-desktop-state.ts";
 
 function session(
   sessionId: string,
@@ -97,18 +98,118 @@ test("selection defaults to every active session and has no implicit cap", () =>
   assert.equal(selectSessions([...active, archived], { archive: "all" }).length, 76);
 });
 
-test("selection separates project, projectless, and existing-target scopes", () => {
+test("unknown archive state remains visible unfiltered and requested archive filters fail", () => {
+  const unknown = session("unknown-archive", {
+    isArchived: undefined,
+    archiveState: "unknown",
+    archiveProvenance: "missing-native-archive-field",
+  });
+  assert.deepEqual(selectSessions([unknown], { archive: "all" }), [unknown]);
+  assert.throws(() => selectSessions([unknown], { archive: "active" }), /archive state is unknown/);
+  assert.throws(() => selectSessions([unknown], { archive: "archived" }), /archive state is unknown/);
+  assert.deepEqual(selectSessions([unknown], { archive: "active", sessionIds: ["other"] }), []);
+
+  const built = buildImportPlan([unknown], { selection: { archive: "all" } });
+  assert.equal(built.plan.sessions[0]?.archiveState, "unknown");
+  assert.equal(built.plan.sessions[0]?.archiveProvenance, "missing-native-archive-field");
+});
+
+test("selection separates project membership, target project existence, and conversation collisions", () => {
   const sessions = [
-    session("project", { projectName: "Alpha", targetExists: false }),
-    session("existing", { projectName: "Beta", targetExists: true }),
-    session("recent", { hasProject: false, projectName: undefined, targetExists: false }),
+    session("project", { projectName: "Alpha", targetProjectExists: false, targetConversationExists: false }),
+    session("existing", { projectName: "Beta", targetProjectExists: true, targetConversationExists: false }),
+    session("collision", { projectName: "Beta", targetProjectExists: true, targetConversationExists: true }),
+    session("recent", { hasProject: false, projectName: undefined, targetProjectExists: false }),
   ];
   const ids = (projectScope: "projects" | "projectless" | "existing-targets") =>
     selectSessions(sessions, { projectScope }).map((s) => s.sessionId);
 
-  assert.deepEqual(ids("projects"), ["project", "existing"]);
+  assert.deepEqual(ids("projects"), ["project", "existing", "collision"]);
   assert.deepEqual(ids("projectless"), ["recent"]);
-  assert.deepEqual(ids("existing-targets"), ["existing"]);
+  assert.deepEqual(ids("existing-targets"), ["existing", "collision"]);
+});
+
+test("Desktop project matching canonicalizes realpath aliases without mutating global state", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-alias-"));
+  const real = path.join(root, "real-project");
+  const alias = path.join(root, "alias-project");
+  fs.mkdirSync(path.join(real, "nested"), { recursive: true });
+  try {
+    fs.symlinkSync(real, alias, process.platform === "win32" ? "junction" : "dir");
+  } catch {
+    return;
+  }
+  const codexHome = path.join(root, "codex");
+  fs.mkdirSync(codexHome);
+  const globalState = path.join(codexHome, ".codex-global-state.json");
+  fs.writeFileSync(globalState, JSON.stringify({
+    "local-projects": { p: { name: "Alias", rootPaths: [alias] } },
+    "project-order": ["p"],
+  }));
+  const before = fs.readFileSync(globalState);
+  const loaded = loadDesktopSelectionResult(codexHome);
+  assert.equal(loaded.status, "available");
+  assert.equal(projectForCwd(loaded.selection!, path.join(real, "nested"))?.name, "Alias");
+  assert.deepEqual(fs.readFileSync(globalState), before);
+});
+
+test("an assignment to an unregistered Desktop project remains unknown, not projectless", () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-unknown-"));
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": {},
+    "thread-project-assignments": {
+      thread: { projectId: "missing-project" },
+      projectless: { projectId: "missing-project" },
+    },
+    "projectless-thread-ids": ["projectless"],
+  }));
+  const loaded = loadDesktopSelectionResult(codexHome);
+  assert.equal(loaded.status, "available");
+  assert.equal(loaded.selection?.unknownThreadIds.has("thread"), true);
+  assert.equal(loaded.selection?.threadProject.has("thread"), false);
+  assert.equal(loaded.selection?.unknownThreadIds.has("projectless"), true);
+  assert.equal(loaded.selection?.threadProject.has("projectless"), false);
+});
+
+test("an empty assignment map is authoritative assigned mode", () => {
+  const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-empty-assigned-"));
+  fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify({
+    "local-projects": { project: { name: "Project", rootPaths: [codexHome] } },
+    "thread-project-assignments": {},
+    "projectless-thread-ids": [],
+  }));
+  const loaded = loadDesktopSelectionResult(codexHome);
+  assert.equal(loaded.status, "available");
+  assert.equal(loaded.selection?.mode, "assigned");
+  assert.equal(loaded.selection?.threadProject.size, 0);
+});
+
+test("malformed Desktop membership substructures make valid JSON unusable", () => {
+  const malformed = [
+    { "local-projects": [] },
+    { "local-projects": { p: { rootPaths: [1] } } },
+    { "projectless-thread-ids": [1] },
+    { "thread-project-assignments": [] },
+    { "thread-project-assignments": { thread: {} } },
+  ];
+  for (const state of malformed) {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), "desktop-project-malformed-"));
+    fs.writeFileSync(path.join(codexHome, ".codex-global-state.json"), JSON.stringify(state));
+    const loaded = loadDesktopSelectionResult(codexHome);
+    assert.equal(loaded.status, "unusable");
+    assert.equal(loaded.selection, null);
+  }
+});
+
+test("filters fail visibly when project membership, target registration, or activity is unknown", () => {
+  const unknownMembership = session("membership", { hasProject: undefined, projectMembership: "unknown" });
+  const unknownTarget = session("target", { targetProjectExists: null });
+  const unknownActivity = session("activity", { firstTsMs: null, lastTsMs: null });
+
+  assert.throws(() => selectSessions([unknownMembership], { projectScope: "projectless" }), /membership is unknown/);
+  assert.throws(() => selectSessions([unknownTarget], { projectScope: "existing-targets" }), /existence is unknown/);
+  assert.throws(() => selectSessions([unknownActivity], { fromMs: 0 }), /timestamp is unknown/);
+  assert.equal(selectSessions([unknownMembership]).length, 1, "unfiltered scans keep unknown membership visible");
 });
 
 test("repeated session/project selectors, inclusive time bounds, and explicit limit compose", () => {
@@ -126,9 +227,49 @@ test("repeated session/project selectors, inclusive time bounds, and explicit li
     limit: 1,
   });
   assert.deepEqual(selected.map((s) => s.sessionId), ["b"]);
+  assert.deepEqual(selectSessions(sessions, { fromMs: 30, toMs: 30 }).map((s) => s.sessionId), ["c"]);
   assert.deepEqual(selectSessions(sessions, { limit: 0 }), []);
   assert.throws(() => selectSessions(sessions, { limit: -1 }), /limit/);
   assert.throws(() => selectSessions(sessions, { fromMs: 30, toMs: 20 }), /fromMs/);
+});
+
+test("an explicit selector that matches nothing in the inventory is reported, not silently dropped", () => {
+  const sessions = [
+    session("a", { projectName: "Alpha" }),
+    session("b", { projectName: "Beta" }),
+  ];
+
+  // One good id and one that matches nothing: the bad one is named.
+  assert.throws(
+    () => assertSelectorsResolve(sessions, { sessionIds: ["a", "no-such-id"] }),
+    /--session matched no session in the inventory: no-such-id/,
+  );
+  // A typo'd project name is reported the same way.
+  assert.throws(
+    () => assertSelectorsResolve(sessions, { projects: ["Alpha", "Gemma"] }),
+    /--project matched no project in the inventory: Gemma/,
+  );
+  // A CRLF-fed id list is the observed real-world shape: trim before matching,
+  // rather than reporting a trimmed id as unmatched.
+  assert.doesNotThrow(() => assertSelectorsResolve(sessions, { sessionIds: ["a\r\n", " b "] }));
+  // Every selector matching is silent, as before.
+  assert.doesNotThrow(() => assertSelectorsResolve(sessions, { sessionIds: ["a", "b"], projects: ["Alpha", "Beta"] }));
+});
+
+test("running the unmatched-selector check ahead of a plan build changes nothing when every selector matches", () => {
+  const inventory = [
+    session("a", { projectName: "Alpha", lastTsMs: 10 }),
+    session("b", { projectName: "Beta", lastTsMs: 20 }),
+  ];
+  const selection = { archive: "all" as const, sessionIds: ["a"], projects: ["Alpha"] };
+
+  const withoutCheck = buildImportPlan(inventory, { selection });
+  // What every selection CLI chokepoint now does before building the plan.
+  assert.doesNotThrow(() => assertSelectorsResolve(inventory, selection));
+  const withCheck = buildImportPlan(inventory, { selection });
+
+  assert.equal(withCheck.digest, withoutCheck.digest);
+  assert.equal(withCheck.canonicalJson, withoutCheck.canonicalJson);
 });
 
 test("loss summaries aggregate explicit adapter observations deterministically", () => {
@@ -164,6 +305,7 @@ test("import plans and their digest are canonical across input order and path sp
     sourcePath: "b.jsonl",
     lastTsMs: 20,
     messageCount: 2,
+    isArchived: false,
   };
   const second = {
     sessionId: "a",
@@ -172,6 +314,7 @@ test("import plans and their digest are canonical across input order and path sp
     sourcePath: "a.jsonl",
     lastTsMs: 10,
     messageCount: 1,
+    isArchived: false,
   };
 
   const one = buildImportPlan([first, second]);
@@ -185,6 +328,8 @@ test("import plans and their digest are canonical across input order and path sp
     createHash("sha256").update(one.canonicalJson, "utf8").digest("hex"),
   );
   assert.deepEqual(JSON.parse(one.canonicalJson), one.plan);
+  assert.equal(one.plan.sessions[0]?.projectMembership, "unknown");
+  assert.equal(one.plan.sessions[0]?.projectMembershipProvenance, "unresolved");
 });
 
 test("an import plan applies a limit deterministically to newest sessions", () => {
@@ -204,7 +349,46 @@ test("changing a stored plan session changes its confirmation digest", () => {
     selection: { archive: "all" },
   });
   const changed = structuredClone(built.plan);
-  changed.sessions[0].archived = true;
+  changed.sessions[0].archiveState = "archived";
   assert.notEqual(digestImportPlan(changed).digest, built.digest);
 });
 
+
+test("pruning the inventory before load leaves the plan and its digest unchanged", () => {
+  const inventory = [
+    session("newest", { lastTsMs: 300, projectName: "alpha" }),
+    session("middle", { lastTsMs: 200, projectName: "alpha" }),
+    session("oldest", { lastTsMs: 100, projectName: "beta", isArchived: true }),
+  ];
+  for (const selection of [
+    { archive: "all" as const },
+    { archive: "all" as const, limit: 2 },
+    { archive: "all" as const, sessionIds: ["middle"] },
+    { archive: "active" as const, projects: ["alpha"] },
+    { archive: "all" as const, fromMs: 150, toMs: 250 },
+  ]) {
+    // What a source reader that decides selection from metadata hands the plan
+    // builder, against what it used to hand it: the whole inventory.
+    const pruned = buildImportPlan(preselectSessions(inventory, { selection }), { selection });
+    const whole = buildImportPlan(inventory, { selection });
+    assert.equal(pruned.canonicalJson, whole.canonicalJson);
+    assert.equal(pruned.digest, whole.digest);
+  }
+});
+
+test("selection that fails closed on an unknown still fails when it is decided early", () => {
+  const inventory = [session("known"), session("unknown", { isArchived: undefined })];
+  assert.throws(() => preselectSessions(inventory, { selection: { archive: "active" } }),
+    /archive state is unknown for unknown/);
+  const undated = [session("known"), session("undated", { lastTsMs: null, firstTsMs: null })];
+  assert.throws(() => preselectSessions(undated, { selection: { fromMs: 150, toMs: 250 } }),
+    /source activity timestamp is unknown for undated/);
+  assert.throws(() => buildImportPlan(undated, { selection: { fromMs: 150, toMs: 250 } }),
+    /source activity timestamp is unknown for undated/);
+  // A selector that excludes the unknown session never judges it, before or after.
+  assert.deepEqual(
+    preselectSessions(inventory, { selection: { archive: "active", sessionIds: ["known"] } })
+      .map((entry) => entry.sessionId),
+    ["known"],
+  );
+});

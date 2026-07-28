@@ -17,7 +17,9 @@ export interface ClaudeDesktopSourceSession {
   sessionId: string;
   cwd: string;
   title: string;
-  isArchived: boolean;
+  isArchived?: boolean;
+  archiveState?: "active" | "archived" | "unknown";
+  archiveProvenance?: "claude-wrapper-isArchived" | "claude-wrapper-missing-isArchived";
   createdAtMs: number | null;
   lastActivityAtMs: number | null;
   transcriptPath: string | null;
@@ -125,6 +127,7 @@ export function inventoryClaudeDesktop(
       transcriptPath = indexed.find((candidate) =>
         (process.platform === "win32" ? path.resolve(candidate).toLowerCase() : path.resolve(candidate)) === candidates[0]) ?? expected;
     }
+    const archiveKnown = typeof record.isArchived === "boolean";
     sessions.push({
       wrapperPath,
       wrapperSessionId: record.sessionId,
@@ -132,7 +135,9 @@ export function inventoryClaudeDesktop(
       sessionId: record.sessionId,
       cwd: record.cwd,
       title: typeof record.title === "string" ? record.title : "",
-      isArchived: record.isArchived === true,
+      ...(archiveKnown ? { isArchived: record.isArchived } : {}),
+      archiveState: archiveKnown ? (record.isArchived ? "archived" : "active") : "unknown",
+      archiveProvenance: archiveKnown ? "claude-wrapper-isArchived" : "claude-wrapper-missing-isArchived",
       createdAtMs: Number.isFinite(record.createdAt) ? Number(record.createdAt) : null,
       lastActivityAtMs: Number.isFinite(record.lastActivityAt) ? Number(record.lastActivityAt) : null,
       transcriptPath,

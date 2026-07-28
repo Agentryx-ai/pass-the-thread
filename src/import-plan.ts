@@ -2,8 +2,11 @@ import { createHash } from "node:crypto";
 
 import { summarizeLosses, type LossObservation, type LossReport } from "./loss-report.ts";
 import { canonicalProjectIdentity } from "./project-identity.ts";
+import { planGoalMigration, type GoalMigrationDecision } from "./goal.ts";
 import {
   selectSessions,
+  archiveState,
+  projectMembership,
   type SelectionOptions,
   type SelectionSession,
 } from "./selection.ts";
@@ -14,26 +17,34 @@ export interface ImportPlanSessionSummary extends SelectionSession {
   title?: string;
   messageCount?: number;
   losses?: readonly LossObservation[];
+  goalDecision?: GoalMigrationDecision;
 }
 
 export interface ImportPlanSession {
   sessionId: string;
   projectPath: string | null;
   projectKey: string | null;
-  projectExists: boolean;
+  sourceProjectRootExists: boolean;
   projectName: string | null;
-  hasProject: boolean;
-  archived: boolean;
-  targetExists: boolean;
+  projectMembership: "project" | "projectless" | "unknown";
+  projectMembershipProvenance: string;
+  archiveState: "active" | "archived" | "unknown";
+  archiveProvenance: string;
+  targetProjectExists: boolean | null;
+  targetConversationExists: boolean | null;
+  targetConversationState: "absent" | "exact-existing" | "collision" | "relocated" | "unknown";
+  /** Present only when a transcript turned up outside the derived project directory. */
+  relocatedTranscriptPaths?: string[];
   activityAtMs: number | null;
   sourcePath: string | null;
   sourceSha256: string | null;
   title: string | null;
   messageCount: number | null;
+  goalDecision: GoalMigrationDecision;
 }
 
 export interface ImportPlan {
-  version: 1;
+  version: 3;
   selection: {
     archive: "active" | "all" | "archived";
     projectScope: "all" | "projects" | "projectless" | "existing-targets";
@@ -58,6 +69,22 @@ export interface BuiltImportPlan {
   digest: string;
 }
 
+export const REGENERATE_PLAN_MESSAGE = "regenerate plan with current threadpass";
+
+export function assertCurrentImportPlan(value: unknown): asserts value is ImportPlan {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`unsupported nested import plan; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+  const plan = value as Record<string, unknown>;
+  if (plan.version !== 3) {
+    throw new Error(`unsupported nested import plan version ${String(plan.version)}; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+  if (plan.selection == null || typeof plan.selection !== "object" || Array.isArray(plan.selection) ||
+    !Array.isArray(plan.sessions) || plan.losses == null || typeof plan.losses !== "object" || Array.isArray(plan.losses)) {
+    throw new Error(`malformed nested import plan; ${REGENERATE_PLAN_MESSAGE}`);
+  }
+}
+
 /**
  * Build a deterministic, side-effect-free import plan from parsed summaries.
  * Session input order and object insertion order do not affect the output.
@@ -66,28 +93,50 @@ export function buildImportPlan(
   sessions: readonly ImportPlanSessionSummary[],
   options: BuildImportPlanOptions = {},
 ): BuiltImportPlan {
-  ensureUniqueSessionIds(sessions);
   const selection = options.selection ?? {};
-  // Source readers commonly return newest-first, but a plan digest must not
-  // depend on that caller detail. Stabilize before applying an explicit limit.
-  const ordered = [...sessions].sort(compareSourceSessions);
-  const selected = selectSessions(ordered, selection);
+  const selected = preselectSessions(sessions, options);
   const rows = selected.map(toPlanSession).sort((left, right) => compareText(
     left.sessionId,
     right.sessionId,
   ));
 
   const plan: ImportPlan = {
-    version: 1,
+    version: 3,
     selection: normalizeSelection(selection),
     sessions: rows,
-    losses: summarizeLosses(selected),
+    losses: summarizeLosses(selected.map((session) => ({
+      ...session,
+      losses: [...(session.losses ?? []), ...goalDecisionLosses(session.goalDecision ?? planGoalMigration(null))],
+    }))),
   };
   const { canonicalJson, digest } = digestImportPlan(plan);
   return { plan, canonicalJson, digest };
 }
 
+/**
+ * The selection `buildImportPlan` would apply, decided before anything is loaded.
+ *
+ * Selection reads nothing but the `SelectionSession` fields, so a source reader
+ * can settle it from inventory metadata and then load bodies for the survivors
+ * alone. Building the plan from those survivors is byte-identical to building it
+ * from the whole inventory: this same ordering and filter run again over an
+ * already-selected list keeps every one of them, and the plan is derived from
+ * the selected sessions only. The unique-id guard still sees the whole
+ * inventory, which is why it lives here rather than after the filter.
+ */
+export function preselectSessions<T extends ImportPlanSessionSummary>(
+  sessions: readonly T[],
+  options: BuildImportPlanOptions = {},
+): T[] {
+  ensureUniqueSessionIds(sessions);
+  // Source readers commonly return newest-first, but a plan digest must not
+  // depend on that caller detail. Stabilize before applying an explicit limit.
+  const ordered = [...sessions].sort(compareSourceSessions);
+  return selectSessions(ordered, options.selection ?? {});
+}
+
 export function digestImportPlan(plan: ImportPlan): Pick<BuiltImportPlan, "canonicalJson" | "digest"> {
+  assertCurrentImportPlan(plan);
   const canonicalJson = canonicalStringify(plan);
   const digest = createHash("sha256").update(canonicalJson, "utf8").digest("hex");
   return { canonicalJson, digest };
@@ -123,17 +172,56 @@ function toPlanSession(session: ImportPlanSessionSummary): ImportPlanSession {
     sessionId: session.sessionId,
     projectPath: identity?.path ?? null,
     projectKey: identity?.key ?? null,
-    projectExists: identity?.exists ?? false,
+    sourceProjectRootExists: identity?.exists ?? false,
     projectName: session.projectName ?? null,
-    hasProject: session.hasProject === true,
-    archived: session.isArchived === true,
-    targetExists: session.targetExists === true,
+    projectMembership: projectMembership(session),
+    projectMembershipProvenance: session.projectMembershipProvenance ??
+      (session.projectMembership != null || session.hasProject != null ? "source-observation" : "unresolved"),
+    archiveState: archiveState(session),
+    archiveProvenance: session.archiveProvenance ??
+      (session.archiveState != null || session.isArchived != null ? "source-observation" : "unresolved"),
+    targetProjectExists: session.targetProjectExists ?? null,
+    targetConversationExists: session.targetConversationExists ?? null,
+    targetConversationState: session.targetConversationState ??
+      (session.targetConversationExists === true ? "collision" :
+        session.targetConversationExists === false ? "absent" : "unknown"),
+    // The key itself is absent unless a transcript turned up out of place, so an
+    // unaffected plan reads and digests exactly as it did before.
+    ...(session.relocatedTranscriptPaths != null && session.relocatedTranscriptPaths.length > 0
+      ? { relocatedTranscriptPaths: [...session.relocatedTranscriptPaths] }
+      : {}),
     activityAtMs: session.lastTsMs ?? session.firstTsMs ?? null,
     sourcePath: session.sourcePath ?? null,
     sourceSha256: session.sourceSha256 ?? null,
     title: session.title ?? null,
     messageCount: session.messageCount ?? null,
+    goalDecision: session.goalDecision ?? planGoalMigration(null),
   };
+}
+
+function goalDecisionLosses(decision: GoalMigrationDecision): LossObservation[] {
+  if (decision.status === "pending_target_implementation") {
+    return [{
+      kind: "goal_activation_target_unimplemented",
+      count: 1,
+      detail: "An eligible authoritative source Goal is bound to the plan but cannot be activated by this version.",
+    }];
+  }
+  if (decision.status === "skipped_by_policy" && decision.sourceGoalSha256 != null) {
+    return [{
+      kind: "goal_migration_skipped_by_policy",
+      count: 1,
+      detail: "The authoritative source Goal remains historical because Goal migration was skipped.",
+    }];
+  }
+  if (decision.status === "historical_only") {
+    return [{
+      kind: "goal_ineligible_historical_only",
+      count: 1,
+      detail: "The terminal or otherwise ineligible authoritative source Goal remains historical.",
+    }];
+  }
+  return [];
 }
 
 function normalizeSelection(selection: SelectionOptions): ImportPlan["selection"] {

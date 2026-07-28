@@ -14,6 +14,7 @@
 // compaction notice and harness notifications as `user` lines too, all stamped
 // after the import — see `isAuthored`.
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 
 export interface Continuation {
   /** Non-meta user turns written after the import. */
@@ -25,6 +26,222 @@ export interface Continuation {
 }
 
 /**
+ * What an existing transcript is, judged by what is written in it.
+ *
+ *  - `unchanged`   nothing at all was added after the import
+ *  - `trivial`     only lines nobody authored were added — tool results, the
+ *                  compaction notice, harness notifications
+ *  - `modified`    somebody typed a turn, or Claude answered one
+ *  - `undecidable` the file cannot be placed relative to the import
+ *
+ * `modified` and `undecidable` are never overwrite-eligible. The stored
+ * `targetSha256` decides nothing here: Claude rewrites a transcript byte-for-byte
+ * whenever the conversation is opened, so a hash mismatch says only "Claude
+ * touched the file", which is true of practically every imported session and is
+ * not evidence that anything of the user's is in it.
+ */
+export type TargetContentClass = "unchanged" | "modified" | "trivial" | "undecidable";
+
+/**
+ * Line types Claude writes without a timestamp, and only for a session somebody
+ * has worked in. Measured over the 42 imported transcripts: 1196 `last-prompt`,
+ * 921 `custom-title` and 56 `relocated` lines, every one of them in a session
+ * that had been continued and none in the 22 that had not. `mode` is deliberately
+ * absent: Claude writes it merely on opening a session, so it proves nothing.
+ */
+const MARKER_TYPES = new Set(["last-prompt", "custom-title", "relocated"]);
+
+export interface TargetContentVerdict {
+  classification: TargetContentClass;
+  /** Post-import turns somebody typed, when there are any. */
+  continuation: Continuation | null;
+  /** Post-import `assistant` lines. Claude only writes these in reply to a turn. */
+  assistantLines: number;
+  /** Post-import `user` lines nobody authored. */
+  incidentalLines: number;
+  /** Why nothing could be decided; null unless `undecidable`. */
+  undecidable: string | null;
+  /**
+   * Unstamped lines only Claude writes, and only once a session has been worked
+   * in: `last-prompt`, `custom-title`, `relocated`. The importer emits none of
+   * them, so one is evidence of its own.
+   */
+  markerLines: number;
+  /**
+   * Whether the bytes still match what the importer recorded. Reported as
+   * corroboration and never consulted by the classification.
+   */
+  sha256Matches: boolean | null;
+}
+
+export interface ClassifyTargetOptions {
+  /** The `targetSha256` the importer stored, for corroboration only. */
+  expectedSha256?: string | null;
+}
+
+/**
+ * Classify an existing transcript by its content.
+ *
+ * Replayed turns keep their original Codex timestamps, so the import's own lines
+ * are never mistaken for later ones; only what carries a stamp after
+ * `importedAtMs` counts. Without an import time there is no "after", so the file
+ * is `undecidable` rather than assumed safe.
+ */
+export function classifyTargetContent(
+  targetPath: string,
+  importedAtMs: number | undefined | null,
+  options: ClassifyTargetOptions = {},
+): TargetContentVerdict {
+  const expected = options.expectedSha256 ?? null;
+  let raw: string | null;
+  try {
+    raw = fs.readFileSync(targetPath, "utf8");
+  } catch {
+    raw = null;
+  }
+  const sha256Matches = raw == null || expected == null
+    ? null
+    : createHash("sha256").update(raw, "utf8").digest("hex") === expected;
+
+  let markerLines = 0;
+  const undecided = (reason: string): TargetContentVerdict => ({
+    classification: "undecidable",
+    continuation: null,
+    assistantLines: 0,
+    incidentalLines: 0,
+    undecidable: reason,
+    markerLines,
+    sha256Matches,
+  });
+
+  if (raw == null) return undecided(`the transcript could not be read: ${targetPath}`);
+  if (importedAtMs == null) return undecided("no import time is recorded for this session");
+
+  let turns = 0;
+  let firstText = "";
+  let firstAtMs: number | null = null;
+  let assistantLines = 0;
+  let incidentalLines = 0;
+  // A line that cannot be placed does not stop the scan: whatever else the file
+  // holds is still worth finding, and a message of the user's outweighs it.
+  let unplaceable: string | null = null;
+  // Lines of a type this function does not otherwise recognise, but that carry a
+  // trustworthy post-import timestamp. Enumerating "the types that can hold user
+  // text" is what let a real loss through: `queue-operation` records the user's
+  // typed message, timestamped, the instant they submit it — before any `user`
+  // line exists for it — and was being skipped by a `type !== "user"` check the
+  // same shape as the one below. `attachment` (queued-command prompts),
+  // `ai-title`, `permission-mode` and others carry the same risk. Rather than
+  // name each one, anything stamped after the import counts, whatever it is
+  // called: we cannot show it holds nothing of the user's, so it is not
+  // something to write over. `mode` needs no exception — every `mode` line on
+  // disk is unstamped, so it can never cross the timestamp check below.
+  let unrecognizedStamped = 0;
+  const lines = raw.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (line.trim() === "") continue;
+    let rec: AnyLine;
+    try {
+      rec = JSON.parse(line) as typeof rec;
+    } catch {
+      // A transcript that cannot be parsed cannot be shown to be free of the
+      // user's messages, so it is not something to overwrite unattended.
+      unplaceable ??= `line ${index + 1} of ${targetPath} is not JSON`;
+      continue;
+    }
+    // Some of Claude's own lines carry no timestamp and so cannot be placed
+    // against the import, but they are written only once a session has been
+    // worked in: the prompt last typed into it, a title the user gave it, the
+    // note that Claude moved it. The importer writes none of them, so finding
+    // one says the session was touched even though nothing datable was added.
+    if (typeof rec.type === "string" && MARKER_TYPES.has(rec.type)) {
+      markerLines += 1;
+      continue;
+    }
+    if (rec.type !== "user" && rec.type !== "assistant") {
+      // Not a conversation line — Claude's bookkeeping, or an out-of-band record
+      // like `queue-operation`. Most of it (like `mode`) is unstamped and says
+      // nothing; whatever does carry a timestamp after the import is treated as
+      // evidence of its own, per the note above. A line with NO `timestamp`
+      // property at all is the ordinary unstamped-bookkeeping case (`mode`,
+      // `ai-title`, `permission-mode`, `bridge-session`, ...) and stays inert.
+      // A line that DOES carry a `timestamp` but whose value cannot be placed —
+      // not a string, or a string in a format we do not trust to parse — is
+      // exactly as untrustworthy as one we cannot read the type of: we cannot
+      // show it holds nothing of the user's, so it is not something to write
+      // over.
+      if (rec.timestamp !== undefined) {
+        const stamp = typeof rec.timestamp === "string" ? parseStrictTimestamp(rec.timestamp) : null;
+        if (stamp != null) {
+          if (stamp > importedAtMs + 1000) unrecognizedStamped += 1;
+        } else {
+          unplaceable ??=
+            `a ${String(rec.type)} line at ${index + 1} of ${targetPath} carries a timestamp that could not be placed`;
+        }
+      }
+      continue;
+    }
+    // A `user`/`assistant` line whose timestamp is a string we cannot strictly
+    // parse (no explicit offset, an unfamiliar format, ...) is still known to be
+    // a turn somebody typed or a reply Claude wrote — unlike an unrecognized
+    // type, its authorship is not in question, only its clock. We cannot show
+    // it was written before the import, so it is treated the same as a stamp we
+    // can place after it, just without a reliable `firstAtMs`. Only a line with
+    // no usable timestamp at all (missing, or not a string) is truly unplaceable.
+    const hasTimestamp = typeof rec.timestamp === "string";
+    const at = hasTimestamp ? parseStrictTimestamp(rec.timestamp as string) : null;
+    if (!hasTimestamp) {
+      unplaceable ??= `a ${rec.type} line at ${index + 1} of ${targetPath} has no usable timestamp`;
+      continue;
+    }
+    // A second's slack: our own lines are stamped from Codex and are far older,
+    // so this only guards against clock jitter around the write itself. Only a
+    // stamp we could actually place is eligible to be skipped as pre-import.
+    if (at != null && at <= importedAtMs + 1000) continue;
+
+    if (rec.type === "assistant") {
+      assistantLines += 1;
+      continue;
+    }
+    // Tool results, the compaction notice and harness notifications come back as
+    // user lines too, and are not something anyone typed.
+    const text = rec.isMeta === true || !isAuthored(rec) ? "" : userText(rec.message?.content);
+    if (text === "") {
+      incidentalLines += 1;
+      continue;
+    }
+    turns += 1;
+    if (firstText === "") {
+      firstText = text.replace(/\s+/g, " ").slice(0, 80);
+      firstAtMs = at;
+    }
+  }
+
+  const continuation = turns > 0 ? { turns, firstText, firstAtMs } : null;
+  if (
+    turns === 0 && assistantLines === 0 && markerLines === 0 && unrecognizedStamped === 0
+    && unplaceable != null
+  ) {
+    return { ...undecided(unplaceable), incidentalLines };
+  }
+  // A marker cannot say what was done, only that something was, so it settles
+  // the question the same way a turn does: this is not a transcript to write over.
+  // A stamped line of an unrecognised type settles it the same way: it might be
+  // bookkeeping, but it might be the only record of something the user typed.
+  const classification: TargetContentClass =
+    turns > 0 || assistantLines > 0 || markerLines > 0 || unrecognizedStamped > 0
+      ? "modified"
+      : incidentalLines > 0 ? "trivial" : "unchanged";
+  return { classification, continuation, assistantLines, incidentalLines, undecidable: null, markerLines, sha256Matches };
+}
+
+/** Only a transcript shown to hold nothing of the user's may be written over. */
+export function overwriteEligible(verdict: TargetContentVerdict): boolean {
+  return verdict.classification === "unchanged" || verdict.classification === "trivial";
+}
+
+/**
  * Messages the user sent after `importedAtMs`, or null when there are none —
  * including when the file is unreadable, since nothing can be claimed then.
  */
@@ -32,42 +249,7 @@ export function findContinuation(
   targetPath: string,
   importedAtMs: number | undefined,
 ): Continuation | null {
-  if (importedAtMs == null) return null;
-  let raw: string;
-  try {
-    raw = fs.readFileSync(targetPath, "utf8");
-  } catch {
-    return null;
-  }
-
-  let turns = 0;
-  let firstText = "";
-  let firstAtMs: number | null = null;
-  for (const line of raw.split(/\r?\n/)) {
-    if (line.trim() === "") continue;
-    let rec: AnyLine;
-    try {
-      rec = JSON.parse(line) as typeof rec;
-    } catch {
-      continue;
-    }
-    if (rec.type !== "user" || rec.isMeta === true) continue;
-    if (!isAuthored(rec)) continue;
-    if (typeof rec.timestamp !== "string") continue;
-    const at = Date.parse(rec.timestamp);
-    // A second's slack: our own lines are stamped from Codex and are far older,
-    // so this only guards against clock jitter around the write itself.
-    if (Number.isNaN(at) || at <= importedAtMs + 1000) continue;
-    const text = userText(rec.message?.content);
-    // Tool results come back as user lines too, and are not something anyone typed.
-    if (text === "") continue;
-    turns += 1;
-    if (firstText === "") {
-      firstText = text.replace(/\s+/g, " ").slice(0, 80);
-      firstAtMs = at;
-    }
-  }
-  return turns > 0 ? { turns, firstText, firstAtMs } : null;
+  return classifyTargetContent(targetPath, importedAtMs).continuation;
 }
 
 interface AnyLine {
@@ -105,6 +287,21 @@ function isAuthored(rec: AnyLine): boolean {
   const content = rec.message?.content;
   if (typeof content === "string" && content.startsWith("<local-command-stdout>")) return false;
   return true;
+}
+
+/**
+ * Parse a timestamp only when it carries an explicit UTC offset (a trailing
+ * `Z` or a `±HH:MM` suffix). `Date.parse` accepts a bare local date-time too,
+ * interpreting it in the machine's own timezone — on a UTC+9 machine that
+ * shifts a stamp up to 9 hours earlier, which could move a real post-import
+ * continuation back before `importedAtMs` and let it be skipped rather than
+ * flagged. Every stamp this tool and Claude write carries `Z`; anything else is
+ * untrustworthy, so it is treated as no timestamp at all rather than guessed at.
+ */
+function parseStrictTimestamp(value: string): number | null {
+  if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? null : at;
 }
 
 /** Text the user typed, from either shape Claude writes for a user message. */

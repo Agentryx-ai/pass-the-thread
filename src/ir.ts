@@ -1,6 +1,7 @@
 import type { RawEnvelope } from "./envelope.ts";
+import type { CanonicalGoalSnapshot } from "./goal.ts";
 
-export const BRIDGE_IR_VERSION = 1 as const;
+export const BRIDGE_IR_VERSION = 2 as const;
 
 /**
  * Imported control records describe past state. They are never instructions to
@@ -40,6 +41,11 @@ export interface TextEvent extends BridgeEventBase {
 
 export interface ToolUseEvent extends BridgeEventBase {
   kind: "tool_use";
+  /** Source message role when the provider records one. */
+  role?: "user" | "assistant" | "system" | "unknown";
+  /** Provider-native message identity used only to prove source adjacency. */
+  sourceRecordUuid?: string | null;
+  sourceParentUuid?: string | null;
   toolUseId: string | null;
   name: string | null;
   input: unknown;
@@ -47,6 +53,11 @@ export interface ToolUseEvent extends BridgeEventBase {
 
 export interface ToolResultEvent extends BridgeEventBase {
   kind: "tool_result";
+  /** Source message role when the provider records one. */
+  role?: "user" | "assistant" | "system" | "unknown";
+  /** Provider-native message identity used only to prove source adjacency. */
+  sourceRecordUuid?: string | null;
+  sourceParentUuid?: string | null;
   toolUseId: string | null;
   content: unknown;
   isError: boolean | null;
@@ -80,6 +91,39 @@ export interface AccessSnapshotEvent extends BridgeEventBase {
   snapshot: unknown;
 }
 
+export interface ReasoningEvent extends BridgeEventBase {
+  kind: "reasoning";
+  summary: unknown;
+  content: unknown;
+}
+
+export interface MediaEvent extends BridgeEventBase {
+  kind: "media";
+  mediaType: "image" | "audio" | "file" | "unknown";
+  source: unknown;
+  metadata: unknown;
+  role: "user" | "assistant" | "system" | "unknown";
+  authoredByHuman: boolean;
+}
+
+/** A known provider protocol record which has no portable behavioral meaning. */
+export interface ProtocolEvent extends BridgeEventBase {
+  kind: "protocol";
+  recordType: string;
+  protocolType: string | null;
+  payload: unknown;
+}
+
+export interface TurnContextEvent extends BridgeEventBase {
+  kind: "turn_context";
+  context: unknown;
+}
+
+export interface WorldStateEvent extends BridgeEventBase {
+  kind: "world_state";
+  state: unknown;
+}
+
 export interface UnknownEvent extends BridgeEventBase {
   kind: "unknown";
   reason: "invalid_json" | "unknown_record" | "unknown_content_block" | "unsupported_shape";
@@ -94,6 +138,11 @@ export type BridgeEvent =
   | CompactBoundaryEvent
   | GoalSnapshotEvent
   | AccessSnapshotEvent
+  | ReasoningEvent
+  | MediaEvent
+  | ProtocolEvent
+  | TurnContextEvent
+  | WorldStateEvent
   | UnknownEvent;
 
 export interface BridgeConversation {
@@ -101,11 +150,17 @@ export interface BridgeConversation {
   id: string;
   /** Open provider/format identifier; provider-specific parsing lives in adapters. */
   source: string;
+  /** Provider identity when `source` names a provider-specific file format. */
+  sourceProvider?: string;
   sourcePath: string;
   sourceContentSha256: string;
   sourceSessionId: string | null;
+  /** Provider-native thread identity used to bind live control state. */
+  sourceThreadId?: string | null;
   cwd: string | null;
   title: string | null;
+  /** Authoritative current source Goal, separate from historical Goal events. */
+  goalState?: CanonicalGoalSnapshot;
   recordEnvelopeIds: string[];
   events: BridgeEvent[];
 }

@@ -77,8 +77,11 @@ overrides.
 Claude replays a whole transcript when you resume, so a long Codex session can
 blow past the context window before you send anything. Codex records the
 shortened context it kept on each compaction, and imports start from the most
-recent one. On a real set of 20 conversations this took 39 MB of history down
-to 6.5 MB, and the largest conversation from roughly 2.1M tokens to 250K.
+recent one. On one observed set of 20 conversations this took 39 MB of
+serialized history down to 6.5 MB. Provider-reported token counters, when
+present, remain source provenance; the offline refusal check uses explicitly
+named serialized character or UTF-8 byte units and never treats those counters
+as target usage.
 
 Nothing is summarised, and nothing needs to be. Codex does not summarise at
 import either. It seeds token counts so its own auto-compaction runs on the
