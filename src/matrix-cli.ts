@@ -28,7 +28,7 @@ import {
 } from "./import-plan.ts";
 import { assertSelectorsResolve, selectSessions, type SelectionOptions, type SelectionSession } from "./selection.ts";
 import { loadDesktopSelection, loadDesktopSelectionResult, projectForCwd } from "./codex-desktop-state.ts";
-import { canonicalProjectIdentity } from "./project-identity.ts";
+import { canonicalProjectIdentity, keySeparator } from "./project-identity.ts";
 import { findStateDb, loadDesktopThreads, reconcileCodexArchive, type DbThreadRow } from "./codex-db.ts";
 import {
   applyCodexTarget,
@@ -540,7 +540,7 @@ function targetProject(codexHome: string, cwd: string): {
     for (const raw of project.rootPaths) {
       let root: string;
       try { root = canonicalProjectIdentity(raw).key; } catch { continue; }
-      if (needle !== root && !needle.startsWith(root + path.sep.toLowerCase())) continue;
+      if (needle !== root && !needle.startsWith(root + keySeparator(root))) continue;
       if (best == null || root.length > best.length) best = { length: root.length, name: project.name };
     }
   }
@@ -565,10 +565,9 @@ export function transcriptIdentityError(
   for (const cwd of transcript.cwds) {
     try {
       const transcriptKey = canonicalProjectIdentity(cwd).key;
-      const separator = path.sep.toLowerCase();
       const compatible = transcriptKey === wrapperKey ||
-        transcriptKey.startsWith(wrapperKey + separator) ||
-        wrapperKey.startsWith(transcriptKey + separator);
+        transcriptKey.startsWith(wrapperKey + keySeparator(wrapperKey)) ||
+        wrapperKey.startsWith(transcriptKey + keySeparator(transcriptKey));
       if (!compatible) return "wrapper cwd does not match transcript cwd";
     } catch {
       return "transcript cwd cannot be canonicalized";

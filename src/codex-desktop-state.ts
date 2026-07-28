@@ -15,7 +15,7 @@
 // assignment map is simply absent.
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalProjectIdentity } from "./project-identity.ts";
+import { canonicalProjectIdentity, keySeparator } from "./project-identity.ts";
 
 export interface DesktopProject {
   projectId: string;
@@ -186,7 +186,7 @@ export function projectForCwd(
     for (const raw of project.rootPaths) {
       let root: string;
       try { root = canonicalProjectIdentity(raw).key; } catch { continue; }
-      if (needle !== root && !needle.startsWith(root + path.sep.toLowerCase())) continue;
+      if (needle !== root && !needle.startsWith(root + keySeparator(root))) continue;
       if (best == null || root.length > best.len) best = { project, len: root.length };
     }
   }

@@ -51,6 +51,16 @@ export function canonicalProjectIdentity(input: string): ProjectIdentity {
   return { path: canonical, key: canonical.toLowerCase(), exists };
 }
 
+/**
+ * The separator belonging to a canonicalProjectIdentity key. `key` may be
+ * Windows-style even on a POSIX host (canonicalProjectIdentity canonicalizes
+ * Windows-looking input with path.win32 on any platform), so path.sep — the
+ * host's separator — is the wrong thing to append when testing prefixes.
+ */
+export function keySeparator(key: string): "\\" | "/" {
+  return /^[a-z]:|^\\\\/.test(key) ? "\\" : "/";
+}
+
 export function sameProject(
   left: string | ProjectIdentity,
   right: string | ProjectIdentity,

@@ -34,6 +34,7 @@ import {
   titleShowsCodexName,
 } from "../src/claude-desktop-target.ts";
 import { loadDesktopSelection, projectForCwd } from "../src/codex-desktop-state.ts";
+import { keySeparator } from "../src/project-identity.ts";
 import { loadThreadNames, nameFromThreadRow } from "../src/codex-thread-names.ts";
 import { renderCitation, splitCitations } from "../src/citation.ts";
 import { validateTranscript } from "../src/validate.ts";
@@ -418,8 +419,9 @@ test("the signed-in account decides which session-record directory is used", () 
   assert.equal(findActiveWorkspaceDir(root), stale, "the guess alone would land on the wrong account");
 });
 
-test("current Codex Desktop state groups by project root, not by an assignment map", () => {
+test("current Codex Desktop state groups by project root, not by an assignment map", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(
     path.join(home, ".codex-global-state.json"),
     JSON.stringify({
@@ -447,8 +449,9 @@ test("current Codex Desktop state groups by project root, not by an assignment m
   assert.equal(projectForCwd(sel, ""), null);
 });
 
-test("an older Desktop state with an assignment map still drives selection directly", () => {
+test("an older Desktop state with an assignment map still drives selection directly", (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   fs.writeFileSync(
     path.join(home, ".codex-global-state.json"),
     JSON.stringify({
@@ -464,6 +467,44 @@ test("an older Desktop state with an assignment map still drives selection direc
   assert.equal(sel.threadProject.get("t-2"), null);
   // Windows roots still match despite drive-letter case and separators
   assert.equal(projectForCwd(sel, "C:\\work\\repo")?.name, "eagle");
+});
+
+// Regression for the separator bug fixed alongside the typed IR work: matching
+// a canonicalProjectIdentity key must use the key's own separator, not
+// path.sep (the host's), since a Windows-style key can occur on any host and
+// a POSIX-style key can occur on any host. Asserted without reference to
+// process.platform so the same assertions hold whichever host runs them; see
+// keySeparator's own direct test below for how that holds by construction.
+test("projectForCwd matches a root against a deeper cwd in both Windows and POSIX styles, but not a prefix-sharing sibling", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-state-sep-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  fs.writeFileSync(
+    path.join(home, ".codex-global-state.json"),
+    JSON.stringify({
+      "local-projects": {
+        p1: { id: "p1", name: "eagle", rootPaths: ["c:\\work"] },
+        p2: { id: "p2", name: "gecko", rootPaths: ["/srv/work"] },
+      },
+      "thread-project-assignments": {},
+      "projectless-thread-ids": [],
+    }),
+  );
+  const sel = loadDesktopSelection(home);
+  assert.ok(sel);
+
+  assert.equal(projectForCwd(sel, "C:\\work\\repo")?.name, "eagle");
+  assert.equal(projectForCwd(sel, "c:\\workshop\\repo"), null, "workshop merely shares a prefix with work");
+
+  assert.equal(projectForCwd(sel, "/srv/work/repo")?.name, "gecko");
+  assert.equal(projectForCwd(sel, "/srv/workshop/repo"), null, "workshop merely shares a prefix with work");
+});
+
+test("keySeparator derives the separator from the key's own style, not the host's path.sep", () => {
+  assert.equal(keySeparator("c:\\work"), "\\");
+  assert.equal(keySeparator("c:\\work\\repo"), "\\");
+  assert.equal(keySeparator("\\\\server\\share\\work"), "\\");
+  assert.equal(keySeparator("/srv/work"), "/");
+  assert.equal(keySeparator("/srv/work/repo"), "/");
 });
 
 test("Codex's generated conversation name is read, newest entry winning", () => {
