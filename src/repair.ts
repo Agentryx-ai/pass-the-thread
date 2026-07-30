@@ -134,6 +134,12 @@ export function repairTranscript(input: ClaudeTranscriptRecord[]): ClaudeTranscr
     i = j - 1;
   }
 
+  // A transcript must open with a user message. Dropping a leading assistant
+  // turn orphans the tool_result that answered it, so this has to happen before
+  // the safety net below rather than after it — otherwise the orphan it creates
+  // is never looked at again and the transcript fails on resume.
+  while (out.length > 0 && out[0].type === "assistant") out.shift();
+
   // Safety net: a tool_result whose tool_use never appeared (compacted history,
   // an unmapped call variant) is rejected by the API. Keep the content, drop the
   // pairing by demoting it to text.
@@ -153,9 +159,6 @@ export function repairTranscript(input: ClaudeTranscriptRecord[]): ClaudeTranscr
         : b,
     );
   }
-
-  // A transcript must open with a user message.
-  while (out.length > 0 && out[0].type === "assistant") out.shift();
 
   // Re-link the chain after merges and drops.
   let parent: string | null = null;
