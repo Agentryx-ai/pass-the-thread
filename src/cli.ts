@@ -52,7 +52,7 @@ import {
   applyClaudeGoalTarget,
   claudeGoalHistoryIdentity,
 } from "./claude-goal-target.ts";
-import { applyBudget } from "./repair.ts";
+import { applyActiveBudget } from "./repair.ts";
 
 /**
  * The verdict to open the overwrite decision with, before any fork is checked.
@@ -517,7 +517,7 @@ export function main(argv: string[]): number {
       const composedLines = applyClaudeGoalTarget(s, baseLines, sourceGoal, goalMode);
       const goalSuffixLength = composedLines.length - baseLines.length;
       const lines = renderMode === "semantic" && goalSuffixLength > 0
-        ? applyBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength }).lines
+        ? applyActiveBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength })
         : composedLines;
       if (lines.length === 0) {
         skipped += 1;

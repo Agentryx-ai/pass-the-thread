@@ -263,3 +263,46 @@ export function applyBudget(
   }
   throw new Error(`required transcript controls exceed the ${maxChars}-character budget`);
 }
+
+/**
+ * Budget only what a resumed conversation actually replays.
+ *
+ * Claude loads a transcript from its last `compact_boundary`, so history before
+ * that boundary never enters the prompt — Codex already compacted it away. It
+ * costs nothing to resume and is the record of the conversation the user reads.
+ * Trimming it to fit a prompt budget removes the conversation while keeping the
+ * cost, so the budget applies to the active tail and the earlier history is
+ * left whole. With no boundary the whole transcript is active, and this is the
+ * plain budget.
+ */
+export function applyActiveBudget(
+  lines: ClaudeTranscriptLine[],
+  maxChars?: number,
+  options?: TranscriptBudgetOptions,
+): ClaudeTranscriptLine[];
+export function applyActiveBudget(
+  lines: ClaudeTranscriptRecord[],
+  maxChars?: number,
+  options?: TranscriptBudgetOptions,
+): ClaudeTranscriptRecord[];
+export function applyActiveBudget(
+  lines: ClaudeTranscriptRecord[],
+  maxChars?: number,
+  options: TranscriptBudgetOptions = {},
+): ClaudeTranscriptRecord[] {
+  const lastBoundary = lines.findLastIndex(
+    (line) => line.type === "system" && line.subtype === "compact_boundary",
+  );
+  if (lastBoundary < 0) return applyBudget(lines, maxChars, options).lines;
+
+  const history = lines.slice(0, lastBoundary + 1);
+  const active = applyBudget(lines.slice(lastBoundary + 1), maxChars, options).lines;
+  const out = [...history, ...active];
+  // The two halves were linked independently; rejoin them into one chain.
+  let parent: string | null = null;
+  for (const line of out) {
+    line.parentUuid = parent;
+    parent = line.uuid;
+  }
+  return out;
+}

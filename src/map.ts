@@ -6,7 +6,7 @@ import type {
 } from "./types.ts";
 import { splitUserMessage } from "./preamble.ts";
 import { splitCitations } from "./citation.ts";
-import { applyBudget, repairTranscript } from "./repair.ts";
+import { applyActiveBudget, repairTranscript } from "./repair.ts";
 
 export interface MapOptions {
   /** Value written to each line's `version` field. */
@@ -384,7 +384,7 @@ export function mapSessionToClaudeLines(
 
   // Make the result replayable before anything reads lines[0].
   lines = repairTranscript(lines);
-  lines = applyBudget(lines, opts.maxChars).lines;
+  lines = applyActiveBudget(lines, opts.maxChars);
 
   // Set a display title on the first line. Claude reads "customTitle" from the
   // file head with the highest priority, so this controls the sidebar label.
