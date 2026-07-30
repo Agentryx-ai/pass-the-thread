@@ -255,6 +255,8 @@ See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 | `--max-chars <n>` | 1000000 | cap on a whole transcript |
 | `--include-empty` | off | keep threads you never wrote in |
 | `--force` | | re-import, and refresh records this tool wrote |
+| `--keep-continuation` | off | re-render a transcript that was carried on in Claude after the import, keeping every line written since on the end |
+| `--workspace-dir <p>` | detected | exact Claude Desktop `<accountId>/<deviceId>` record directory to register into |
 | `--no-register` | off | transcript only, so it will not be listed |
 | `--model <id>` | `claude-opus-5` | model recorded for resumed sessions |
 | `--version-tag <s>` | | `version` field written into transcript lines |

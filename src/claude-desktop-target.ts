@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import type { ClaudeTranscriptRecord } from "./types.ts";
 import { mapEffort, mapPermissionMode } from "./policy.ts";
 
+
 export interface WrapperRecord {
   sessionId: string;
   cliSessionId: string;
@@ -65,14 +66,71 @@ export function resolveDesktopSessionsRoot(override?: string): string {
 }
 
 /**
- * The account Claude Code is signed in to, as <accountId>/<deviceId> — which is
- * exactly the directory layout under `claude-code-sessions`. Reading it beats
- * guessing from file counts when more than one account has records on disk.
+ * The account Claude Desktop itself is signed in to.
+ *
+ * Its own `config.json` records this as `lastKnownAccountUuid`, and the app
+ * reads records from that account's directory. The CLI's `~/.claude.json` is a
+ * different sign-in and the two can name different accounts on one machine —
+ * when they did, registering under the CLI's account put every imported
+ * conversation somewhere Desktop never looks, with no error to show for it.
+ */
+export function desktopSignedInAccountUuid(): string | null {
+  try {
+    const config = JSON.parse(
+      fs.readFileSync(path.join(resolveDesktopDataDir(), "config.json"), "utf8"),
+    ) as { lastKnownAccountUuid?: unknown };
+    const uuid = config.lastKnownAccountUuid;
+    return typeof uuid === "string" && uuid.trim() !== "" ? uuid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record-holding <deviceId> directories under one account, newest record first. */
+export function workspaceDirsForAccount(sessionsRoot: string, accountUuid: string): string[] {
+  const accountDir = path.join(sessionsRoot, accountUuid);
+  let devices: string[];
+  try {
+    devices = fs.readdirSync(accountDir);
+  } catch {
+    return [];
+  }
+  const found: { dir: string; mtime: number }[] = [];
+  for (const device of devices) {
+    const dir = path.join(accountDir, device);
+    if (!safeIsDir(dir)) continue;
+    let mtime = 0;
+    let records = 0;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith("local_") || !f.endsWith(".json")) continue;
+      records += 1;
+      try {
+        mtime = Math.max(mtime, fs.statSync(path.join(dir, f)).mtimeMs);
+      } catch {
+        /* ignore unreadable record */
+      }
+    }
+    if (records > 0) found.push({ dir, mtime });
+  }
+  return found.sort((a, b) => b.mtime - a.mtime).map((f) => f.dir);
+}
+
+/**
+ * The workspace directory to register into, as <accountId>/<deviceId>.
+ *
+ * Claude Desktop's own signed-in account decides this, because Desktop is what
+ * has to list the result. The CLI's `~/.claude.json` is only consulted when
+ * Desktop states no account — a CLI-only machine — and never overrides it.
  */
 export function signedInWorkspaceDir(
   sessionsRoot: string,
   claudeHome: string,
 ): string | null {
+  const desktopAccount = desktopSignedInAccountUuid();
+  if (desktopAccount != null) {
+    const dirs = workspaceDirsForAccount(sessionsRoot, desktopAccount);
+    if (dirs.length > 0) return dirs[0];
+  }
   const candidates = [
     path.join(claudeHome, ".claude.json"),
     path.join(os.homedir(), ".claude.json"),

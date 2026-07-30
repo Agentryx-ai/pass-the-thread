@@ -25,6 +25,7 @@ import {
 import {
   buildWrapperRecord,
   countWorkspaceDirs,
+  desktopSignedInAccountUuid,
   existingCliSessionIds,
   findActiveWorkspaceDir,
   findRecordFor,
@@ -131,7 +132,22 @@ OPTIONAL REFINEMENTS (off by default)
   --to <date>        upper bound on last activity
   --id <sessionId>   a single thread by id
 
+TITLES
+  --title-prefix <s>          prefix conversation titles, e.g. "[Codex] "
+  --replace-title-prefix <s>  a leading prefix that --title-prefix replaces
+                              instead of stacking on (repeatable); a title
+                              already carrying --title-prefix is left alone
+
+OVERWRITING
+  --force              re-import, and refresh the records this tool wrote
+  --keep-continuation  when a transcript was carried on in Claude after the
+                       import, re-render the history and put the lines written
+                       since back on the end, instead of refusing to touch it
+
 PATHS
+  --workspace-dir <p>  exact Claude Desktop <accountId>/<deviceId> record
+                       directory to register into; detected from Claude
+                       Desktop's own signed-in account when omitted
   --codex-home <p>   default $CODEX_HOME or ~/.codex
   --claude-home <p>  default $CLAUDE_CONFIG_DIR or ~/.claude
   --bridge-root <p>  canonical source sidecars; default ~/.codex-to-claude/bridge-v1
@@ -219,6 +235,9 @@ export function main(argv: string[]): number {
       "title-prefix": { type: "string" },
       "no-register": { type: "boolean", default: false },
       "sessions-root": { type: "string" },
+      "workspace-dir": { type: "string" },
+      "keep-continuation": { type: "boolean", default: false },
+      "replace-title-prefix": { type: "string", multiple: true },
       model: { type: "string" },
       "projects-only": { type: "boolean", default: false },
       "projectless-only": { type: "boolean", default: false },
@@ -345,24 +364,47 @@ export function main(argv: string[]): number {
     const sessionsRoot = resolveDesktopSessionsRoot(
       values["sessions-root"] as string | undefined,
     );
-    // Records live under <accountId>/<deviceId>. Ask Claude Code which account
-    // is signed in rather than guessing, so a stale second account's directory
-    // cannot swallow the import.
-    const workspaceDir = register
+    // Records live under <accountId>/<deviceId>. Claude Desktop's own signed-in
+    // account decides which one, because Desktop is what has to list the
+    // result; an explicit --workspace-dir wins over any detection.
+    const workspaceOverride = values["workspace-dir"] as string | undefined;
+    if (workspaceOverride != null && workspaceOverride.trim() !== "" && !register) {
+      throw new Error("--workspace-dir cannot be combined with --no-register");
+    }
+    const detectedWorkspaceDir = register
       ? (signedInWorkspaceDir(sessionsRoot, claudeHome) ??
         findActiveWorkspaceDir(sessionsRoot))
       : null;
-    if (
-      register &&
-      workspaceDir != null &&
-      signedInWorkspaceDir(sessionsRoot, claudeHome) == null &&
-      countWorkspaceDirs(sessionsRoot) > 1
-    ) {
-      process.stderr.write(
-        `WARNING: several Claude accounts have session records and the signed-in one\n` +
-          `could not be determined; guessing ${workspaceDir}.\n` +
-          `Pass --sessions-root <dir> if the import lands under the wrong account.\n\n`,
-      );
+    let workspaceDir = detectedWorkspaceDir;
+    if (register && workspaceOverride != null && workspaceOverride.trim() !== "") {
+      const resolved = path.resolve(workspaceOverride);
+      if (!fs.existsSync(resolved)) {
+        throw new Error(`--workspace-dir does not exist: ${resolved}`);
+      }
+      workspaceDir = resolved;
+    }
+    if (register && workspaceDir != null) {
+      // Say where this landed. Getting it wrong is silent otherwise: the
+      // transcripts are written and simply never appear in the sidebar.
+      process.stderr.write(`Registering into: ${workspaceDir}\n`);
+      const desktopAccount = desktopSignedInAccountUuid();
+      if (
+        workspaceOverride == null &&
+        desktopAccount != null &&
+        !workspaceDir.split(path.sep).includes(desktopAccount)
+      ) {
+        process.stderr.write(
+          `WARNING: Claude Desktop reports account ${desktopAccount}, which has no\n` +
+            `session records yet; registering under ${workspaceDir} instead.\n` +
+            `Pass --workspace-dir <dir> to choose explicitly.\n`,
+        );
+      } else if (workspaceOverride == null && desktopAccount == null && countWorkspaceDirs(sessionsRoot) > 1) {
+        process.stderr.write(
+          `WARNING: several Claude accounts have session records and Claude Desktop\n` +
+            `states no signed-in account; guessing ${workspaceDir}.\n` +
+            `Pass --workspace-dir <dir> if the import lands under the wrong account.\n`,
+        );
+      }
     }
     const alreadyRegistered =
       workspaceDir != null ? existingCliSessionIds(workspaceDir) : new Set<string>();
