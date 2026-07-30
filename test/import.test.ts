@@ -13,6 +13,7 @@ import {
 } from "../src/codex-source.ts";
 import { applyFilter } from "../src/filter.ts";
 import { applyTitlePrefix, mapSessionToClaudeLines } from "../src/map.ts";
+import { buildWrapperRecord } from "../src/claude-desktop-target.ts";
 import { isInjectedContext, splitUserMessage } from "../src/preamble.ts";
 import {
   alreadyImported,
@@ -828,4 +829,34 @@ test("a title keeps one crossing's mark: the previous one is replaced, its own i
   assert.equal(applyTitlePrefix("[Claude] 리톡", "[Codex] ", undefined), "[Codex] [Claude] 리톡");
   // and an empty prefix never renames anything
   assert.equal(applyTitlePrefix("[Claude] 리톡", "", R), "[Claude] 리톡");
+});
+
+// Regression: Claude Desktop groups its sidebar by the record's cwd string, so
+// two spellings of one directory are two projects. Codex writes the drive
+// letter either way — the same folder as `C:\...` in its index and `c:\...` in
+// a rollout — and the record used to take the source spelling verbatim, which
+// split a project in two in the sidebar.
+test("a record's cwd is normalized, so one directory cannot become two projects", () => {
+  const line = {
+    parentUuid: null, isSidechain: false, userType: "external" as const,
+    cwd: "c:\work", sessionId: "s", version: "v", type: "user" as const,
+    message: { role: "user" as const, content: [{ type: "text" as const, text: "hi" }] },
+    uuid: randomUUID(), timestamp: "2026-07-24T10:00:00.000Z",
+  };
+  const upper = buildWrapperRecord({
+    cliSessionId: "a", cwd: "C:\_projects\P\New", lines: [line], title: "t",
+  });
+  const lower = buildWrapperRecord({
+    cliSessionId: "b", cwd: "c:\_projects\P\New", lines: [line], title: "t",
+  });
+  assert.equal(upper.cwd, lower.cwd);
+  assert.equal(upper.cwd, "C:\_projects\P\New");
+  // originCwd groups too on some builds, so it must not disagree with cwd
+  assert.equal(upper.originCwd, upper.cwd);
+  assert.equal(lower.originCwd, lower.cwd);
+  // a POSIX path has no drive letter to normalize and is left exactly as given
+  const posix = buildWrapperRecord({
+    cliSessionId: "c", cwd: "/home/u/work", lines: [line], title: "t",
+  });
+  assert.equal(posix.cwd, "/home/u/work");
 });

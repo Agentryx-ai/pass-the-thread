@@ -393,17 +393,39 @@ export interface BuildRecordInput {
   reasoningEffort?: string | null;
 }
 
+/**
+ * The cwd spelling to record a conversation under.
+ *
+ * Claude Desktop groups the sidebar by this string, so two spellings of one
+ * directory are two projects that look identical. Codex is not consistent about
+ * it — the same folder is `C:\...` in its index and `c:\...` in a rollout — and
+ * taking the source's spelling verbatim split a project in two.
+ *
+ * Claude's own sessions record an upper-case drive letter, which is what
+ * Windows hands a process as its working directory, so that is the spelling to
+ * match: normalising the other way would have kept imported conversations out
+ * of the group holding the ones started in Claude. `normalizeCwd` lower-cases
+ * instead and is deliberately left alone — it names transcript directories,
+ * where the existing layout is already established and the filesystem is
+ * case-insensitive anyway. The byte-exact source spelling is preserved in the
+ * bridge sidecar, not in a field the sidebar groups on.
+ */
+export function recordCwd(cwd: string): string {
+  return /^[A-Za-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
+}
+
 export function buildWrapperRecord(input: BuildRecordInput): WrapperRecord {
   const first = input.lines[0];
   const last = input.lines[input.lines.length - 1];
   const createdAt = first ? Date.parse(first.timestamp) : Date.now();
   const lastActivityAt = last ? Date.parse(last.timestamp) : createdAt;
   const completedTurns = input.lines.filter((l) => l.type === "user").length;
+  const cwd = recordCwd(input.cwd);
   return {
     sessionId: `local_${randomUUID()}`,
     cliSessionId: input.cliSessionId,
-    cwd: input.cwd,
-    originCwd: input.cwd,
+    cwd,
+    originCwd: cwd,
     lastFocusedAt: lastActivityAt,
     createdAt: Number.isNaN(createdAt) ? Date.now() : createdAt,
     lastActivityAt: Number.isNaN(lastActivityAt) ? Date.now() : lastActivityAt,
