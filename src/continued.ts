@@ -252,6 +252,47 @@ export function findContinuation(
   return classifyTargetContent(targetPath, importedAtMs).continuation;
 }
 
+/**
+ * The lines a transcript grew by after it was imported, exactly as written.
+ *
+ * Everything from the first line stamped after the import onward: the turns
+ * somebody typed, the replies to them, and Claude's own bookkeeping between
+ * them. It is returned raw rather than parsed and re-rendered — Claude wrote
+ * these records and knows how to read them back, and re-deriving records this
+ * importer does not model (`queue-operation`, `custom-title`, attachments)
+ * would be inventing content rather than preserving it.
+ *
+ * Null when the file cannot be read, when nothing postdates the import, or when
+ * a line cannot be placed against it — a tail that cannot be delimited is not
+ * one to carry over.
+ */
+export function postImportTail(
+  targetPath: string,
+  importedAtMs: number | undefined,
+): string[] | null {
+  if (importedAtMs == null) return null;
+  let raw: string;
+  try {
+    raw = fs.readFileSync(targetPath, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = raw.split(/\r?\n/).filter((line) => line.trim() !== "");
+  for (const [index, line] of lines.entries()) {
+    let rec: AnyLine;
+    try {
+      rec = JSON.parse(line) as AnyLine;
+    } catch {
+      return null; // an unreadable line cannot be placed; refuse to guess
+    }
+    if (typeof rec.timestamp !== "string") continue;
+    const at = parseStrictTimestamp(rec.timestamp);
+    if (at == null) return null;
+    if (at > importedAtMs + 1000) return lines.slice(index);
+  }
+  return null;
+}
+
 interface AnyLine {
   type?: unknown;
   isMeta?: unknown;

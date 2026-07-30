@@ -39,7 +39,12 @@ import {
   writeWrapperRecord,
 } from "./claude-desktop-target.ts";
 import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
-import { classifyTargetContent, overwriteEligible, type TargetContentVerdict } from "./continued.ts";
+import {
+  classifyTargetContent,
+  overwriteEligible,
+  postImportTail,
+  type TargetContentVerdict,
+} from "./continued.ts";
 import type { TargetState, TranscriptLocation } from "./claude-target.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
@@ -353,6 +358,16 @@ export function main(argv: string[]): number {
     const history = loadImportHistory(claudeHome);
     const dryRun = values["dry-run"] === true;
     const force = values.force === true;
+    const keepContinuation = values["keep-continuation"] === true;
+    const replaceTitlePrefixes = Array.isArray(values["replace-title-prefix"])
+      ? (values["replace-title-prefix"] as string[])
+      : [];
+    if (replaceTitlePrefixes.some((p) => p === "")) {
+      throw new Error("--replace-title-prefix must not be empty");
+    }
+    if (replaceTitlePrefixes.length > 0 && typeof values["title-prefix"] !== "string") {
+      throw new Error("--replace-title-prefix requires --title-prefix");
+    }
     let imported = 0;
     let skipped = 0;
     let registered = 0;
@@ -589,7 +604,24 @@ export function main(argv: string[]): number {
       }
 
       const continued = verdict.continuation;
-      if (verdict.classification === "modified") {
+      let continuationTail: { path: string; lines: string[] } | null = null;
+      // The transcript grew after the import and the caller asked to keep what
+      // it grew by. Re-render the source, then put those lines back on the end
+      // exactly as Claude wrote them, so the history underneath is corrected
+      // without costing the conversation that was carried on in it.
+      if (verdict.classification === "modified" && keepContinuation) {
+        const tail = postImportTail(verdictIn, prior?.importedAtMs);
+        if (tail == null) {
+          conflicts += 1;
+          skipped += 1;
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — its continuation could not be delimited; ` +
+              `--keep-continuation cannot be honoured safely)\n`,
+          );
+          continue;
+        }
+        continuationTail = { path: verdictIn, lines: tail };
+      } else if (verdict.classification === "modified") {
         conflicts += 1;
         skipped += 1;
         if (continued != null) {
@@ -628,12 +660,22 @@ export function main(argv: string[]): number {
           `WARN  ${s.sessionId}  overwriting a transcript nothing could be decided about ` +
             `(${verdict.undecidable})\n`,
         );
-      } else if (location.state !== "absent" && !overwriteEligible(verdict)) {
-        // Unreachable today; kept so a new class cannot silently become writable.
+      } else if (
+        location.state !== "absent" &&
+        !overwriteEligible(verdict) &&
+        continuationTail == null
+      ) {
+        // Reached only by a class with nothing preserved to carry over; kept so
+        // a new class cannot silently become writable.
         conflicts += 1;
         skipped += 1;
         process.stdout.write(`skip  ${s.sessionId}  (${verdict.classification} — not overwrite-eligible)\n`);
         continue;
+      } else if (continuationTail != null) {
+        process.stdout.write(
+          `note  ${s.sessionId}  MODIFIED; keeping ${continuationTail.lines.length} line(s) ` +
+            `written after the import and re-rendering the history below them\n`,
+        );
       } else if (location.state !== "absent" && state !== "ours") {
         // Overwrite-eligible: the bytes differ from what was recorded, but the
         // file holds nothing anybody wrote. Say so rather than demanding --force.
@@ -644,16 +686,31 @@ export function main(argv: string[]): number {
         );
       }
 
+      // Put a preserved continuation back on the end. Its records are reattached
+      // as Claude wrote them; only the first link is repointed, at the seam
+      // where the freshly rendered history now ends.
+      let linesToWrite = lines;
+      if (continuationTail != null) {
+        const tail = continuationTail.lines.map((line) => JSON.parse(line) as ClaudeTranscriptRecord);
+        const lastUuid = [...lines].reverse().find((line) => typeof line.uuid === "string")?.uuid ?? null;
+        const seam = tail.find((rec) => typeof rec.uuid === "string");
+        if (seam) seam.parentUuid = lastUuid;
+        linesToWrite = [...lines, ...tail];
+      }
+
       if (dryRun) {
         const goalAction = sourceGoal == null ? "none"
           : goalMode === "migrate" && sourceGoal.migrationEligible ? "activate"
             : "historical-only";
-        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath} (Goal: ${goalAction})\n`);
+        process.stdout.write(
+          `would write  ${linesToWrite.length} lines -> ${targetPath} (Goal: ${goalAction})` +
+            `${continuationTail ? ` (+${continuationTail.lines.length} continuation line(s) kept)` : ""}\n`,
+        );
         imported += 1;
         continue;
       }
       writeBridgeConversation(bridgeRoot, bundle);
-      const res = writeTranscript(claudeHome, s, lines);
+      const res = writeTranscript(claudeHome, s, linesToWrite);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
       // repointed one is recognisable later instead of looking like a stranger.
