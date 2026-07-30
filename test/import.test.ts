@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   parseRollout,
@@ -734,4 +735,80 @@ test("inventory parsing derives every field without keeping the transcript body"
   // Title, counts, timestamps and the source hash are derived identically; only
   // the bodies they were derived from are let go.
   assert.deepEqual({ ...released, items: null }, { ...retained, items: null });
+});
+
+// Regression: `thread-project-assignments` is Codex Desktop's UI state, not its
+// thread list. A thread created by an external importer never enters that map,
+// yet Desktop lists it because the sidebar reads the `threads` table — so it
+// has to be selectable, and by --id in particular. The union is confined to the
+// clients the map is a map of, so an index full of `codex exec` and subagent
+// rows does not become the population instead.
+test("assigned mode selects an index thread the assignment map never learned about", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-assigned-union-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "sessions", "2026", "07", "24");
+  fs.mkdirSync(dir, { recursive: true });
+
+  const MAPPED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const IMPORTED = "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb";
+  const EXEC = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const rolloutFor = (id: string): string => path.join(dir, `rollout-2026-07-24T10-00-00-${id}.jsonl`);
+  for (const id of [MAPPED, IMPORTED, EXEC]) {
+    fs.writeFileSync(
+      rolloutFor(id),
+      [
+        { timestamp: "2026-07-24T10:00:00.000Z", type: "session_meta", payload: { id, cwd: "/work/repo" } },
+        {
+          timestamp: "2026-07-24T10:00:01.000Z",
+          type: "response_item",
+          payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+        },
+      ].map((l) => JSON.stringify(l)).join("\n") + "\n",
+    );
+  }
+
+  fs.writeFileSync(
+    path.join(home, ".codex-global-state.json"),
+    JSON.stringify({
+      "local-projects": { p1: { id: "p1", name: "eagle", rootPaths: ["/work"] } },
+      "thread-project-assignments": { [MAPPED]: { projectId: "p1" } },
+    }),
+  );
+
+  const db = new DatabaseSync(path.join(home, "state_5.sqlite"));
+  try {
+    db.exec(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER, updated_at INTEGER,
+      source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT,
+      approval_mode TEXT, tokens_used INTEGER, has_user_event INTEGER, archived INTEGER,
+      archived_at INTEGER, cli_version TEXT, first_user_message TEXT, memory_mode TEXT,
+      reasoning_effort TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, preview TEXT,
+      recency_at INTEGER, recency_at_ms INTEGER, history_mode TEXT, name TEXT
+    )`);
+    db.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)");
+    const insert = db.prepare(
+      `INSERT INTO threads (id, rollout_path, source, cwd, title, has_user_event, archived)
+       VALUES (?, ?, ?, ?, ?, 1, 0)`,
+    );
+    insert.run(MAPPED, rolloutFor(MAPPED), "vscode", "/work/repo", "mapped thread");
+    insert.run(IMPORTED, rolloutFor(IMPORTED), "vscode", "/work/repo", "[Claude] imported thread");
+    insert.run(EXEC, rolloutFor(EXEC), "exec", "/work/repo", "automation run");
+  } finally {
+    db.close();
+  }
+
+  const { via, sessions } = loadDesktopSessions(home, {});
+  assert.equal(via, "desktop");
+  const ids = sessions.map((s) => s.sessionId).sort();
+  // the importer's thread is selectable; the exec run is not the population
+  assert.deepEqual(ids, [MAPPED, IMPORTED].sort());
+  // and it is grouped the way Desktop groups a thread it has no assignment for
+  const imported = sessions.find((s) => s.sessionId === IMPORTED);
+  assert.equal(imported?.projectName, "eagle");
+  assert.equal(imported?.hasProject, true);
+  // --id reaches it now that it is in the population at all
+  assert.deepEqual(
+    applyFilter(sessions, { sinceDays: 0, id: IMPORTED }, NOW).map((s) => s.sessionId),
+    [IMPORTED],
+  );
 });
