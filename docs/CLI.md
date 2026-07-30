@@ -247,7 +247,8 @@ See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dry-run` | | print the plan, write nothing |
-| `--title-prefix <s>` | | prefix titles, e.g. `"[Codex] "` |
+| `--title-prefix <s>` | | prefix titles, e.g. `"[Codex] "`; a title already carrying it is left alone |
+| `--replace-title-prefix <s>` | | a leading prefix that `--title-prefix` replaces instead of stacking on; repeatable, longest match wins |
 | `--include-reasoning` | off | keep Codex reasoning as `thinking` blocks |
 | `--full-history` | off | every turn instead of Codex's compacted context |
 | `--render-mode <mode>` | `semantic` | `semantic` converts supported structures; `verbatim` renders the complete source rollout as inert historical text |

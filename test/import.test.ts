@@ -12,7 +12,7 @@ import {
   loadDesktopSessions,
 } from "../src/codex-source.ts";
 import { applyFilter } from "../src/filter.ts";
-import { mapSessionToClaudeLines } from "../src/map.ts";
+import { applyTitlePrefix, mapSessionToClaudeLines } from "../src/map.ts";
 import { isInjectedContext, splitUserMessage } from "../src/preamble.ts";
 import {
   alreadyImported,
@@ -811,4 +811,21 @@ test("assigned mode selects an index thread the assignment map never learned abo
     applyFilter(sessions, { sinceDays: 0, id: IMPORTED }, NOW).map((s) => s.sessionId),
     [IMPORTED],
   );
+});
+
+test("a title keeps one crossing's mark: the previous one is replaced, its own is not restacked", () => {
+  const R = ["[Claude] ", "[Codex] "];
+  // the mark of the crossing before this one is replaced, not stacked on
+  assert.equal(applyTitlePrefix("[Claude] 리톡 복원", "[Codex] ", R), "[Codex] 리톡 복원");
+  // a title already carrying this crossing's mark is returned unchanged, so a
+  // re-import does not rename the conversation every time
+  assert.equal(applyTitlePrefix("[Codex] Baton", "[Codex] ", R), "[Codex] Baton");
+  // an unmarked title just takes the prefix
+  assert.equal(applyTitlePrefix("평범한 제목", "[Codex] ", R), "[Codex] 평범한 제목");
+  // the longest match wins, so overlapping marks cannot be half-removed
+  assert.equal(applyTitlePrefix("[A][B] x", "[C] ", ["[A]", "[A][B] "]), "[C] x");
+  // without a replace list the old behaviour stands: prefixes stack
+  assert.equal(applyTitlePrefix("[Claude] 리톡", "[Codex] ", undefined), "[Codex] [Claude] 리톡");
+  // and an empty prefix never renames anything
+  assert.equal(applyTitlePrefix("[Claude] 리톡", "", R), "[Claude] 리톡");
 });

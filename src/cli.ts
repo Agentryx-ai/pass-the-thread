@@ -183,7 +183,7 @@ function parseDateMs(v: string | undefined): number | undefined {
   return Number.isNaN(n) ? undefined : n;
 }
 
-function toFilter(v: Record<string, string | boolean | undefined>): SessionFilter {
+function toFilter(v: Record<string, string | string[] | boolean | undefined>): SessionFilter {
   return {
     // Default 0 = no age/count cut: the Codex Desktop criteria drive selection,
     // these are opt-in refinements only.
@@ -262,7 +262,7 @@ export function main(argv: string[]): number {
   const codexHome = resolveCodexHome(values["codex-home"] as string | undefined);
   const claudeHome = resolveClaudeHome(values["claude-home"] as string | undefined);
   const nowMs = Date.now();
-  const filter = toFilter(values as Record<string, string | boolean | undefined>);
+  const filter = toFilter(values as Record<string, string | string[] | boolean | undefined>);
   const renderMode = parseRenderMode(values["render-mode"] as string | undefined);
   const goalMode = legacyGoalMigrationMode(
     values["goal-mode"] as string | undefined,
@@ -460,12 +460,14 @@ export function main(argv: string[]): number {
                     typeof values["title-prefix"] === "string"
                       ? (values["title-prefix"] as string)
                       : undefined,
+                  replaceTitlePrefixes,
                 })
               : mapSessionToClaudeLines(s, {
                   titlePrefix:
                     typeof values["title-prefix"] === "string"
                       ? (values["title-prefix"] as string)
                       : undefined,
+                  replaceTitlePrefixes,
                 });
           const catchUp = applyClaudeGoalTarget(s, catchUpBase, sourceGoal, goalMode);
           if (catchUp.length > 0) {
@@ -512,6 +514,7 @@ export function main(argv: string[]): number {
                 typeof values["title-prefix"] === "string"
                   ? (values["title-prefix"] as string)
                   : undefined,
+              replaceTitlePrefixes,
             })
           : mapSessionToClaudeLines(s, {
               version:
@@ -523,6 +526,7 @@ export function main(argv: string[]): number {
                 typeof values["title-prefix"] === "string"
                   ? (values["title-prefix"] as string)
                   : undefined,
+              replaceTitlePrefixes,
               maxToolChars:
                 values["max-tool-output"] != null
                   ? Number(values["max-tool-output"])
