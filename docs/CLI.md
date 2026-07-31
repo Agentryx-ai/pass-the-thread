@@ -177,6 +177,10 @@ Selection options:
 | `--render-mode <mode>` | `semantic` (default) or `verbatim`; included in the plan digest |
 | `--goal-mode <mode>` | `migrate` (default) or `skip`; independent of render mode and included in the digest |
 | `--no-migrate-goal` | alias for `--goal-mode skip`; conflicting flags are rejected |
+| `--title-prefix <s>` | Claude → Codex only: prefix target titles; already-prefixed titles stay unchanged |
+| `--replace-title-prefix <s>` | Claude → Codex only: replace this leading prefix with `--title-prefix`; repeatable and plan-bound |
+| `--compact-active-bytes <n>` | Claude → Codex only: retain full history before a synthetic compact boundary while limiting resumable active context to `n` UTF-8 bytes; plan-bound and capped by the audited target limit |
+| `--allow-wrapper-cwd-relocation` | Claude → Codex only: when CLI session identity matches, use the wrapper's current project despite an older differing transcript cwd; the relocation is reported as a loss observation |
 | `--allow-overwrite` | forward apply only: authorize overwrite after exact unchanged-target proof |
 | `--dry-run` | rebuild and run read-only static preflights with zero mutation; reports blockers and live gates it cannot prove |
 
@@ -243,7 +247,8 @@ See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--dry-run` | | print the plan, write nothing |
-| `--title-prefix <s>` | | prefix titles, e.g. `"[Codex] "` |
+| `--title-prefix <s>` | | prefix titles, e.g. `"[Codex] "`; a title already carrying it is left alone |
+| `--replace-title-prefix <s>` | | a leading prefix that `--title-prefix` replaces instead of stacking on; repeatable, longest match wins |
 | `--include-reasoning` | off | keep Codex reasoning as `thinking` blocks |
 | `--full-history` | off | every turn instead of Codex's compacted context |
 | `--render-mode <mode>` | `semantic` | `semantic` converts supported structures; `verbatim` renders the complete source rollout as inert historical text |
@@ -251,6 +256,8 @@ See the [runtime evidence](research/codex-desktop/26.721.41059/GOAL_RPC.md).
 | `--max-chars <n>` | 1000000 | cap on a whole transcript |
 | `--include-empty` | off | keep threads you never wrote in |
 | `--force` | | re-import, and refresh records this tool wrote |
+| `--keep-continuation` | off | re-render a transcript that was carried on in Claude after the import, keeping every line written since on the end |
+| `--workspace-dir <p>` | detected | exact Claude Desktop `<accountId>/<deviceId>` record directory to register into |
 | `--no-register` | off | transcript only, so it will not be listed |
 | `--model <id>` | `claude-opus-5` | model recorded for resumed sessions |
 | `--version-tag <s>` | | `version` field written into transcript lines |

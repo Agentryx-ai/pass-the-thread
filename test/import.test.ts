@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   parseRollout,
@@ -11,7 +12,8 @@ import {
   loadDesktopSessions,
 } from "../src/codex-source.ts";
 import { applyFilter } from "../src/filter.ts";
-import { mapSessionToClaudeLines } from "../src/map.ts";
+import { applyTitlePrefix, mapSessionToClaudeLines } from "../src/map.ts";
+import { buildWrapperRecord } from "../src/claude-desktop-target.ts";
 import { isInjectedContext, splitUserMessage } from "../src/preamble.ts";
 import {
   alreadyImported,
@@ -734,4 +736,127 @@ test("inventory parsing derives every field without keeping the transcript body"
   // Title, counts, timestamps and the source hash are derived identically; only
   // the bodies they were derived from are let go.
   assert.deepEqual({ ...released, items: null }, { ...retained, items: null });
+});
+
+// Regression: `thread-project-assignments` is Codex Desktop's UI state, not its
+// thread list. A thread created by an external importer never enters that map,
+// yet Desktop lists it because the sidebar reads the `threads` table — so it
+// has to be selectable, and by --id in particular. The union is confined to the
+// clients the map is a map of, so an index full of `codex exec` and subagent
+// rows does not become the population instead.
+test("assigned mode selects an index thread the assignment map never learned about", (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "codex-assigned-union-"));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, "sessions", "2026", "07", "24");
+  fs.mkdirSync(dir, { recursive: true });
+
+  const MAPPED = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const IMPORTED = "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb";
+  const EXEC = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const rolloutFor = (id: string): string => path.join(dir, `rollout-2026-07-24T10-00-00-${id}.jsonl`);
+  for (const id of [MAPPED, IMPORTED, EXEC]) {
+    fs.writeFileSync(
+      rolloutFor(id),
+      [
+        { timestamp: "2026-07-24T10:00:00.000Z", type: "session_meta", payload: { id, cwd: "/work/repo" } },
+        {
+          timestamp: "2026-07-24T10:00:01.000Z",
+          type: "response_item",
+          payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+        },
+      ].map((l) => JSON.stringify(l)).join("\n") + "\n",
+    );
+  }
+
+  fs.writeFileSync(
+    path.join(home, ".codex-global-state.json"),
+    JSON.stringify({
+      "local-projects": { p1: { id: "p1", name: "eagle", rootPaths: ["/work"] } },
+      "thread-project-assignments": { [MAPPED]: { projectId: "p1" } },
+    }),
+  );
+
+  const db = new DatabaseSync(path.join(home, "state_5.sqlite"));
+  try {
+    db.exec(`CREATE TABLE threads (
+      id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER, updated_at INTEGER,
+      source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT,
+      approval_mode TEXT, tokens_used INTEGER, has_user_event INTEGER, archived INTEGER,
+      archived_at INTEGER, cli_version TEXT, first_user_message TEXT, memory_mode TEXT,
+      reasoning_effort TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, preview TEXT,
+      recency_at INTEGER, recency_at_ms INTEGER, history_mode TEXT, name TEXT
+    )`);
+    db.exec("CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT)");
+    const insert = db.prepare(
+      `INSERT INTO threads (id, rollout_path, source, cwd, title, has_user_event, archived)
+       VALUES (?, ?, ?, ?, ?, 1, 0)`,
+    );
+    insert.run(MAPPED, rolloutFor(MAPPED), "vscode", "/work/repo", "mapped thread");
+    insert.run(IMPORTED, rolloutFor(IMPORTED), "vscode", "/work/repo", "[Claude] imported thread");
+    insert.run(EXEC, rolloutFor(EXEC), "exec", "/work/repo", "automation run");
+  } finally {
+    db.close();
+  }
+
+  const { via, sessions } = loadDesktopSessions(home, {});
+  assert.equal(via, "desktop");
+  const ids = sessions.map((s) => s.sessionId).sort();
+  // the importer's thread is selectable; the exec run is not the population
+  assert.deepEqual(ids, [MAPPED, IMPORTED].sort());
+  // and it is grouped the way Desktop groups a thread it has no assignment for
+  const imported = sessions.find((s) => s.sessionId === IMPORTED);
+  assert.equal(imported?.projectName, "eagle");
+  assert.equal(imported?.hasProject, true);
+  // --id reaches it now that it is in the population at all
+  assert.deepEqual(
+    applyFilter(sessions, { sinceDays: 0, id: IMPORTED }, NOW).map((s) => s.sessionId),
+    [IMPORTED],
+  );
+});
+
+test("a title keeps one crossing's mark: the previous one is replaced, its own is not restacked", () => {
+  const R = ["[Claude] ", "[Codex] "];
+  // the mark of the crossing before this one is replaced, not stacked on
+  assert.equal(applyTitlePrefix("[Claude] 리톡 복원", "[Codex] ", R), "[Codex] 리톡 복원");
+  // a title already carrying this crossing's mark is returned unchanged, so a
+  // re-import does not rename the conversation every time
+  assert.equal(applyTitlePrefix("[Codex] Baton", "[Codex] ", R), "[Codex] Baton");
+  // an unmarked title just takes the prefix
+  assert.equal(applyTitlePrefix("평범한 제목", "[Codex] ", R), "[Codex] 평범한 제목");
+  // the longest match wins, so overlapping marks cannot be half-removed
+  assert.equal(applyTitlePrefix("[A][B] x", "[C] ", ["[A]", "[A][B] "]), "[C] x");
+  // without a replace list the old behaviour stands: prefixes stack
+  assert.equal(applyTitlePrefix("[Claude] 리톡", "[Codex] ", undefined), "[Codex] [Claude] 리톡");
+  // and an empty prefix never renames anything
+  assert.equal(applyTitlePrefix("[Claude] 리톡", "", R), "[Claude] 리톡");
+});
+
+// Regression: Claude Desktop groups its sidebar by the record's cwd string, so
+// two spellings of one directory are two projects. Codex writes the drive
+// letter either way — the same folder as `C:\...` in its index and `c:\...` in
+// a rollout — and the record used to take the source spelling verbatim, which
+// split a project in two in the sidebar.
+test("a record's cwd is normalized, so one directory cannot become two projects", () => {
+  const line = {
+    parentUuid: null, isSidechain: false, userType: "external" as const,
+    cwd: "c:\work", sessionId: "s", version: "v", type: "user" as const,
+    message: { role: "user" as const, content: [{ type: "text" as const, text: "hi" }] },
+    uuid: randomUUID(), timestamp: "2026-07-24T10:00:00.000Z",
+  };
+  const upper = buildWrapperRecord({
+    cliSessionId: "a", cwd: "C:\_projects\P\New", lines: [line], title: "t",
+  });
+  const lower = buildWrapperRecord({
+    cliSessionId: "b", cwd: "c:\_projects\P\New", lines: [line], title: "t",
+  });
+  assert.equal(upper.cwd, lower.cwd);
+  assert.equal(upper.cwd, "C:\_projects\P\New");
+  // originCwd groups too on some builds, so it must not disagree with cwd
+  assert.equal(upper.originCwd, upper.cwd);
+  assert.equal(lower.originCwd, lower.cwd);
+  // a POSIX path has no drive letter to normalize and is left exactly as given
+  const posix = buildWrapperRecord({
+    cliSessionId: "c", cwd: "/home/u/work", lines: [line], title: "t",
+  });
+  assert.equal(posix.cwd, "/home/u/work");
 });

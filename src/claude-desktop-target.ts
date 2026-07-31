@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import type { ClaudeTranscriptRecord } from "./types.ts";
 import { mapEffort, mapPermissionMode } from "./policy.ts";
 
+
 export interface WrapperRecord {
   sessionId: string;
   cliSessionId: string;
@@ -65,14 +66,71 @@ export function resolveDesktopSessionsRoot(override?: string): string {
 }
 
 /**
- * The account Claude Code is signed in to, as <accountId>/<deviceId> — which is
- * exactly the directory layout under `claude-code-sessions`. Reading it beats
- * guessing from file counts when more than one account has records on disk.
+ * The account Claude Desktop itself is signed in to.
+ *
+ * Its own `config.json` records this as `lastKnownAccountUuid`, and the app
+ * reads records from that account's directory. The CLI's `~/.claude.json` is a
+ * different sign-in and the two can name different accounts on one machine —
+ * when they did, registering under the CLI's account put every imported
+ * conversation somewhere Desktop never looks, with no error to show for it.
+ */
+export function desktopSignedInAccountUuid(): string | null {
+  try {
+    const config = JSON.parse(
+      fs.readFileSync(path.join(resolveDesktopDataDir(), "config.json"), "utf8"),
+    ) as { lastKnownAccountUuid?: unknown };
+    const uuid = config.lastKnownAccountUuid;
+    return typeof uuid === "string" && uuid.trim() !== "" ? uuid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Record-holding <deviceId> directories under one account, newest record first. */
+export function workspaceDirsForAccount(sessionsRoot: string, accountUuid: string): string[] {
+  const accountDir = path.join(sessionsRoot, accountUuid);
+  let devices: string[];
+  try {
+    devices = fs.readdirSync(accountDir);
+  } catch {
+    return [];
+  }
+  const found: { dir: string; mtime: number }[] = [];
+  for (const device of devices) {
+    const dir = path.join(accountDir, device);
+    if (!safeIsDir(dir)) continue;
+    let mtime = 0;
+    let records = 0;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.startsWith("local_") || !f.endsWith(".json")) continue;
+      records += 1;
+      try {
+        mtime = Math.max(mtime, fs.statSync(path.join(dir, f)).mtimeMs);
+      } catch {
+        /* ignore unreadable record */
+      }
+    }
+    if (records > 0) found.push({ dir, mtime });
+  }
+  return found.sort((a, b) => b.mtime - a.mtime).map((f) => f.dir);
+}
+
+/**
+ * The workspace directory to register into, as <accountId>/<deviceId>.
+ *
+ * Claude Desktop's own signed-in account decides this, because Desktop is what
+ * has to list the result. The CLI's `~/.claude.json` is only consulted when
+ * Desktop states no account — a CLI-only machine — and never overrides it.
  */
 export function signedInWorkspaceDir(
   sessionsRoot: string,
   claudeHome: string,
 ): string | null {
+  const desktopAccount = desktopSignedInAccountUuid();
+  if (desktopAccount != null) {
+    const dirs = workspaceDirsForAccount(sessionsRoot, desktopAccount);
+    if (dirs.length > 0) return dirs[0];
+  }
   const candidates = [
     path.join(claudeHome, ".claude.json"),
     path.join(os.homedir(), ".claude.json"),
@@ -335,17 +393,39 @@ export interface BuildRecordInput {
   reasoningEffort?: string | null;
 }
 
+/**
+ * The cwd spelling to record a conversation under.
+ *
+ * Claude Desktop groups the sidebar by this string, so two spellings of one
+ * directory are two projects that look identical. Codex is not consistent about
+ * it — the same folder is `C:\...` in its index and `c:\...` in a rollout — and
+ * taking the source's spelling verbatim split a project in two.
+ *
+ * Claude's own sessions record an upper-case drive letter, which is what
+ * Windows hands a process as its working directory, so that is the spelling to
+ * match: normalising the other way would have kept imported conversations out
+ * of the group holding the ones started in Claude. `normalizeCwd` lower-cases
+ * instead and is deliberately left alone — it names transcript directories,
+ * where the existing layout is already established and the filesystem is
+ * case-insensitive anyway. The byte-exact source spelling is preserved in the
+ * bridge sidecar, not in a field the sidebar groups on.
+ */
+export function recordCwd(cwd: string): string {
+  return /^[A-Za-z]:/.test(cwd) ? cwd[0].toUpperCase() + cwd.slice(1) : cwd;
+}
+
 export function buildWrapperRecord(input: BuildRecordInput): WrapperRecord {
   const first = input.lines[0];
   const last = input.lines[input.lines.length - 1];
   const createdAt = first ? Date.parse(first.timestamp) : Date.now();
   const lastActivityAt = last ? Date.parse(last.timestamp) : createdAt;
   const completedTurns = input.lines.filter((l) => l.type === "user").length;
+  const cwd = recordCwd(input.cwd);
   return {
     sessionId: `local_${randomUUID()}`,
     cliSessionId: input.cliSessionId,
-    cwd: input.cwd,
-    originCwd: input.cwd,
+    cwd,
+    originCwd: cwd,
     lastFocusedAt: lastActivityAt,
     createdAt: Number.isNaN(createdAt) ? Date.now() : createdAt,
     lastActivityAt: Number.isNaN(lastActivityAt) ? Date.now() : lastActivityAt,

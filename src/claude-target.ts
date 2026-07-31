@@ -16,6 +16,7 @@ import {
   type RenderMode,
 } from "./render-mode.ts";
 import type { GoalMigrationMode } from "./goal.ts";
+import { applyTitlePrefix } from "./map.ts";
 
 const HISTORY_FILE = "codex-import-history.json";
 
@@ -245,6 +246,8 @@ export interface VerbatimMapOptions {
   version?: string;
   /** Prefix prepended to Claude's display title. */
   titlePrefix?: string;
+  /** Leading prefixes that `titlePrefix` replaces rather than stacks on top of. */
+  replaceTitlePrefixes?: string[];
 }
 
 /**
@@ -265,7 +268,11 @@ export function mapVerbatimRolloutToClaudeLines(
 
   const timestampMs = session.firstTsMs ?? session.lastTsMs ?? 0;
   const timestamp = new Date(Number.isFinite(timestampMs) ? timestampMs : 0).toISOString();
-  const title = `${opts.titlePrefix ?? ""}${session.codexName || session.title || session.sessionId}`;
+  const title = applyTitlePrefix(
+    session.codexName || session.title || session.sessionId,
+    opts.titlePrefix ?? "",
+    opts.replaceTitlePrefixes,
+  );
   const line: ClaudeTranscriptLine = {
     parentUuid: null,
     isSidechain: false,

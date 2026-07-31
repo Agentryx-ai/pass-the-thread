@@ -25,6 +25,7 @@ import {
 import {
   buildWrapperRecord,
   countWorkspaceDirs,
+  desktopSignedInAccountUuid,
   existingCliSessionIds,
   findActiveWorkspaceDir,
   findRecordFor,
@@ -38,7 +39,12 @@ import {
   writeWrapperRecord,
 } from "./claude-desktop-target.ts";
 import { npmSwallowedFlags, npmSwallowedMessage } from "./npm-flags.ts";
-import { classifyTargetContent, overwriteEligible, type TargetContentVerdict } from "./continued.ts";
+import {
+  classifyTargetContent,
+  overwriteEligible,
+  postImportTail,
+  type TargetContentVerdict,
+} from "./continued.ts";
 import type { TargetState, TranscriptLocation } from "./claude-target.ts";
 import { validateTranscript } from "./validate.ts";
 import { fixTranscriptFile } from "./fix.ts";
@@ -51,7 +57,7 @@ import {
   applyClaudeGoalTarget,
   claudeGoalHistoryIdentity,
 } from "./claude-goal-target.ts";
-import { applyBudget } from "./repair.ts";
+import { applyActiveBudget } from "./repair.ts";
 
 /**
  * The verdict to open the overwrite decision with, before any fork is checked.
@@ -131,7 +137,22 @@ OPTIONAL REFINEMENTS (off by default)
   --to <date>        upper bound on last activity
   --id <sessionId>   a single thread by id
 
+TITLES
+  --title-prefix <s>          prefix conversation titles, e.g. "[Codex] "
+  --replace-title-prefix <s>  a leading prefix that --title-prefix replaces
+                              instead of stacking on (repeatable); a title
+                              already carrying --title-prefix is left alone
+
+OVERWRITING
+  --force              re-import, and refresh the records this tool wrote
+  --keep-continuation  when a transcript was carried on in Claude after the
+                       import, re-render the history and put the lines written
+                       since back on the end, instead of refusing to touch it
+
 PATHS
+  --workspace-dir <p>  exact Claude Desktop <accountId>/<deviceId> record
+                       directory to register into; detected from Claude
+                       Desktop's own signed-in account when omitted
   --codex-home <p>   default $CODEX_HOME or ~/.codex
   --claude-home <p>  default $CLAUDE_CONFIG_DIR or ~/.claude
   --bridge-root <p>  canonical source sidecars; default ~/.codex-to-claude/bridge-v1
@@ -162,7 +183,7 @@ function parseDateMs(v: string | undefined): number | undefined {
   return Number.isNaN(n) ? undefined : n;
 }
 
-function toFilter(v: Record<string, string | boolean | undefined>): SessionFilter {
+function toFilter(v: Record<string, string | string[] | boolean | undefined>): SessionFilter {
   return {
     // Default 0 = no age/count cut: the Codex Desktop criteria drive selection,
     // these are opt-in refinements only.
@@ -219,6 +240,9 @@ export function main(argv: string[]): number {
       "title-prefix": { type: "string" },
       "no-register": { type: "boolean", default: false },
       "sessions-root": { type: "string" },
+      "workspace-dir": { type: "string" },
+      "keep-continuation": { type: "boolean", default: false },
+      "replace-title-prefix": { type: "string", multiple: true },
       model: { type: "string" },
       "projects-only": { type: "boolean", default: false },
       "projectless-only": { type: "boolean", default: false },
@@ -238,7 +262,7 @@ export function main(argv: string[]): number {
   const codexHome = resolveCodexHome(values["codex-home"] as string | undefined);
   const claudeHome = resolveClaudeHome(values["claude-home"] as string | undefined);
   const nowMs = Date.now();
-  const filter = toFilter(values as Record<string, string | boolean | undefined>);
+  const filter = toFilter(values as Record<string, string | string[] | boolean | undefined>);
   const renderMode = parseRenderMode(values["render-mode"] as string | undefined);
   const goalMode = legacyGoalMigrationMode(
     values["goal-mode"] as string | undefined,
@@ -334,6 +358,16 @@ export function main(argv: string[]): number {
     const history = loadImportHistory(claudeHome);
     const dryRun = values["dry-run"] === true;
     const force = values.force === true;
+    const keepContinuation = values["keep-continuation"] === true;
+    const replaceTitlePrefixes = Array.isArray(values["replace-title-prefix"])
+      ? (values["replace-title-prefix"] as string[])
+      : [];
+    if (replaceTitlePrefixes.some((p) => p === "")) {
+      throw new Error("--replace-title-prefix must not be empty");
+    }
+    if (replaceTitlePrefixes.length > 0 && typeof values["title-prefix"] !== "string") {
+      throw new Error("--replace-title-prefix requires --title-prefix");
+    }
     let imported = 0;
     let skipped = 0;
     let registered = 0;
@@ -345,24 +379,47 @@ export function main(argv: string[]): number {
     const sessionsRoot = resolveDesktopSessionsRoot(
       values["sessions-root"] as string | undefined,
     );
-    // Records live under <accountId>/<deviceId>. Ask Claude Code which account
-    // is signed in rather than guessing, so a stale second account's directory
-    // cannot swallow the import.
-    const workspaceDir = register
+    // Records live under <accountId>/<deviceId>. Claude Desktop's own signed-in
+    // account decides which one, because Desktop is what has to list the
+    // result; an explicit --workspace-dir wins over any detection.
+    const workspaceOverride = values["workspace-dir"] as string | undefined;
+    if (workspaceOverride != null && workspaceOverride.trim() !== "" && !register) {
+      throw new Error("--workspace-dir cannot be combined with --no-register");
+    }
+    const detectedWorkspaceDir = register
       ? (signedInWorkspaceDir(sessionsRoot, claudeHome) ??
         findActiveWorkspaceDir(sessionsRoot))
       : null;
-    if (
-      register &&
-      workspaceDir != null &&
-      signedInWorkspaceDir(sessionsRoot, claudeHome) == null &&
-      countWorkspaceDirs(sessionsRoot) > 1
-    ) {
-      process.stderr.write(
-        `WARNING: several Claude accounts have session records and the signed-in one\n` +
-          `could not be determined; guessing ${workspaceDir}.\n` +
-          `Pass --sessions-root <dir> if the import lands under the wrong account.\n\n`,
-      );
+    let workspaceDir = detectedWorkspaceDir;
+    if (register && workspaceOverride != null && workspaceOverride.trim() !== "") {
+      const resolved = path.resolve(workspaceOverride);
+      if (!fs.existsSync(resolved)) {
+        throw new Error(`--workspace-dir does not exist: ${resolved}`);
+      }
+      workspaceDir = resolved;
+    }
+    if (register && workspaceDir != null) {
+      // Say where this landed. Getting it wrong is silent otherwise: the
+      // transcripts are written and simply never appear in the sidebar.
+      process.stderr.write(`Registering into: ${workspaceDir}\n`);
+      const desktopAccount = desktopSignedInAccountUuid();
+      if (
+        workspaceOverride == null &&
+        desktopAccount != null &&
+        !workspaceDir.split(path.sep).includes(desktopAccount)
+      ) {
+        process.stderr.write(
+          `WARNING: Claude Desktop reports account ${desktopAccount}, which has no\n` +
+            `session records yet; registering under ${workspaceDir} instead.\n` +
+            `Pass --workspace-dir <dir> to choose explicitly.\n`,
+        );
+      } else if (workspaceOverride == null && desktopAccount == null && countWorkspaceDirs(sessionsRoot) > 1) {
+        process.stderr.write(
+          `WARNING: several Claude accounts have session records and Claude Desktop\n` +
+            `states no signed-in account; guessing ${workspaceDir}.\n` +
+            `Pass --workspace-dir <dir> if the import lands under the wrong account.\n`,
+        );
+      }
     }
     const alreadyRegistered =
       workspaceDir != null ? existingCliSessionIds(workspaceDir) : new Set<string>();
@@ -403,12 +460,14 @@ export function main(argv: string[]): number {
                     typeof values["title-prefix"] === "string"
                       ? (values["title-prefix"] as string)
                       : undefined,
+                  replaceTitlePrefixes,
                 })
               : mapSessionToClaudeLines(s, {
                   titlePrefix:
                     typeof values["title-prefix"] === "string"
                       ? (values["title-prefix"] as string)
                       : undefined,
+                  replaceTitlePrefixes,
                 });
           const catchUp = applyClaudeGoalTarget(s, catchUpBase, sourceGoal, goalMode);
           if (catchUp.length > 0) {
@@ -455,6 +514,7 @@ export function main(argv: string[]): number {
                 typeof values["title-prefix"] === "string"
                   ? (values["title-prefix"] as string)
                   : undefined,
+              replaceTitlePrefixes,
             })
           : mapSessionToClaudeLines(s, {
               version:
@@ -466,6 +526,7 @@ export function main(argv: string[]): number {
                 typeof values["title-prefix"] === "string"
                   ? (values["title-prefix"] as string)
                   : undefined,
+              replaceTitlePrefixes,
               maxToolChars:
                 values["max-tool-output"] != null
                   ? Number(values["max-tool-output"])
@@ -475,7 +536,7 @@ export function main(argv: string[]): number {
       const composedLines = applyClaudeGoalTarget(s, baseLines, sourceGoal, goalMode);
       const goalSuffixLength = composedLines.length - baseLines.length;
       const lines = renderMode === "semantic" && goalSuffixLength > 0
-        ? applyBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength }).lines
+        ? applyActiveBudget(composedLines, maxChars, { preserveSuffix: goalSuffixLength })
         : composedLines;
       if (lines.length === 0) {
         skipped += 1;
@@ -547,7 +608,24 @@ export function main(argv: string[]): number {
       }
 
       const continued = verdict.continuation;
-      if (verdict.classification === "modified") {
+      let continuationTail: { path: string; lines: string[] } | null = null;
+      // The transcript grew after the import and the caller asked to keep what
+      // it grew by. Re-render the source, then put those lines back on the end
+      // exactly as Claude wrote them, so the history underneath is corrected
+      // without costing the conversation that was carried on in it.
+      if (verdict.classification === "modified" && keepContinuation) {
+        const tail = postImportTail(verdictIn, prior?.importedAtMs);
+        if (tail == null) {
+          conflicts += 1;
+          skipped += 1;
+          process.stdout.write(
+            `skip  ${s.sessionId}  (MODIFIED — its continuation could not be delimited; ` +
+              `--keep-continuation cannot be honoured safely)\n`,
+          );
+          continue;
+        }
+        continuationTail = { path: verdictIn, lines: tail };
+      } else if (verdict.classification === "modified") {
         conflicts += 1;
         skipped += 1;
         if (continued != null) {
@@ -586,12 +664,22 @@ export function main(argv: string[]): number {
           `WARN  ${s.sessionId}  overwriting a transcript nothing could be decided about ` +
             `(${verdict.undecidable})\n`,
         );
-      } else if (location.state !== "absent" && !overwriteEligible(verdict)) {
-        // Unreachable today; kept so a new class cannot silently become writable.
+      } else if (
+        location.state !== "absent" &&
+        !overwriteEligible(verdict) &&
+        continuationTail == null
+      ) {
+        // Reached only by a class with nothing preserved to carry over; kept so
+        // a new class cannot silently become writable.
         conflicts += 1;
         skipped += 1;
         process.stdout.write(`skip  ${s.sessionId}  (${verdict.classification} — not overwrite-eligible)\n`);
         continue;
+      } else if (continuationTail != null) {
+        process.stdout.write(
+          `note  ${s.sessionId}  MODIFIED; keeping ${continuationTail.lines.length} line(s) ` +
+            `written after the import and re-rendering the history below them\n`,
+        );
       } else if (location.state !== "absent" && state !== "ours") {
         // Overwrite-eligible: the bytes differ from what was recorded, but the
         // file holds nothing anybody wrote. Say so rather than demanding --force.
@@ -602,16 +690,31 @@ export function main(argv: string[]): number {
         );
       }
 
+      // Put a preserved continuation back on the end. Its records are reattached
+      // as Claude wrote them; only the first link is repointed, at the seam
+      // where the freshly rendered history now ends.
+      let linesToWrite = lines;
+      if (continuationTail != null) {
+        const tail = continuationTail.lines.map((line) => JSON.parse(line) as ClaudeTranscriptRecord);
+        const lastUuid = [...lines].reverse().find((line) => typeof line.uuid === "string")?.uuid ?? null;
+        const seam = tail.find((rec) => typeof rec.uuid === "string");
+        if (seam) seam.parentUuid = lastUuid;
+        linesToWrite = [...lines, ...tail];
+      }
+
       if (dryRun) {
         const goalAction = sourceGoal == null ? "none"
           : goalMode === "migrate" && sourceGoal.migrationEligible ? "activate"
             : "historical-only";
-        process.stdout.write(`would write  ${lines.length} lines -> ${targetPath} (Goal: ${goalAction})\n`);
+        process.stdout.write(
+          `would write  ${linesToWrite.length} lines -> ${targetPath} (Goal: ${goalAction})` +
+            `${continuationTail ? ` (+${continuationTail.lines.length} continuation line(s) kept)` : ""}\n`,
+        );
         imported += 1;
         continue;
       }
       writeBridgeConversation(bridgeRoot, bundle);
-      const res = writeTranscript(claudeHome, s, lines);
+      const res = writeTranscript(claudeHome, s, linesToWrite);
       history.records = history.records.filter((r) => r.importedSessionId !== s.sessionId);
       // The records written for this conversation stay known across runs, so a
       // repointed one is recognisable later instead of looking like a stranger.

@@ -134,6 +134,12 @@ export function repairTranscript(input: ClaudeTranscriptRecord[]): ClaudeTranscr
     i = j - 1;
   }
 
+  // A transcript must open with a user message. Dropping a leading assistant
+  // turn orphans the tool_result that answered it, so this has to happen before
+  // the safety net below rather than after it — otherwise the orphan it creates
+  // is never looked at again and the transcript fails on resume.
+  while (out.length > 0 && out[0].type === "assistant") out.shift();
+
   // Safety net: a tool_result whose tool_use never appeared (compacted history,
   // an unmapped call variant) is rejected by the API. Keep the content, drop the
   // pairing by demoting it to text.
@@ -153,9 +159,6 @@ export function repairTranscript(input: ClaudeTranscriptRecord[]): ClaudeTranscr
         : b,
     );
   }
-
-  // A transcript must open with a user message.
-  while (out.length > 0 && out[0].type === "assistant") out.shift();
 
   // Re-link the chain after merges and drops.
   let parent: string | null = null;
@@ -262,4 +265,47 @@ export function applyBudget(
     }
   }
   throw new Error(`required transcript controls exceed the ${maxChars}-character budget`);
+}
+
+/**
+ * Budget only what a resumed conversation actually replays.
+ *
+ * Claude loads a transcript from its last `compact_boundary`, so history before
+ * that boundary never enters the prompt — Codex already compacted it away. It
+ * costs nothing to resume and is the record of the conversation the user reads.
+ * Trimming it to fit a prompt budget removes the conversation while keeping the
+ * cost, so the budget applies to the active tail and the earlier history is
+ * left whole. With no boundary the whole transcript is active, and this is the
+ * plain budget.
+ */
+export function applyActiveBudget(
+  lines: ClaudeTranscriptLine[],
+  maxChars?: number,
+  options?: TranscriptBudgetOptions,
+): ClaudeTranscriptLine[];
+export function applyActiveBudget(
+  lines: ClaudeTranscriptRecord[],
+  maxChars?: number,
+  options?: TranscriptBudgetOptions,
+): ClaudeTranscriptRecord[];
+export function applyActiveBudget(
+  lines: ClaudeTranscriptRecord[],
+  maxChars?: number,
+  options: TranscriptBudgetOptions = {},
+): ClaudeTranscriptRecord[] {
+  const lastBoundary = lines.findLastIndex(
+    (line) => line.type === "system" && line.subtype === "compact_boundary",
+  );
+  if (lastBoundary < 0) return applyBudget(lines, maxChars, options).lines;
+
+  const history = lines.slice(0, lastBoundary + 1);
+  const active = applyBudget(lines.slice(lastBoundary + 1), maxChars, options).lines;
+  const out = [...history, ...active];
+  // The two halves were linked independently; rejoin them into one chain.
+  let parent: string | null = null;
+  for (const line of out) {
+    line.parentUuid = parent;
+    parent = line.uuid;
+  }
+  return out;
 }

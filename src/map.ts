@@ -6,7 +6,7 @@ import type {
 } from "./types.ts";
 import { splitUserMessage } from "./preamble.ts";
 import { splitCitations } from "./citation.ts";
-import { applyBudget, repairTranscript } from "./repair.ts";
+import { applyActiveBudget, repairTranscript } from "./repair.ts";
 
 export interface MapOptions {
   /** Value written to each line's `version` field. */
@@ -16,6 +16,16 @@ export interface MapOptions {
   /** Prefix prepended to the conversation title (via customTitle on the first line). */
   titlePrefix?: string;
   /**
+   * Leading prefixes that `titlePrefix` replaces rather than stacks on top of.
+   *
+   * A conversation that has already crossed between providers carries the
+   * previous crossing's mark — `[Claude] ...` on a thread Codex received from
+   * Claude. Prefixing that again reads as `[Codex] [Claude] ...`, which says
+   * where it has been rather than where it is. The longest matching prefix
+   * wins, so overlapping marks cannot be half-removed.
+   */
+  replaceTitlePrefixes?: string[];
+  /**
    * Cap on a single tool result, in characters. Tool output dominates a Codex
    * transcript (~50% of bytes here) while prose is a rounding error, and Claude
    * replays the whole transcript on resume — an uncapped import can exceed the
@@ -24,6 +34,31 @@ export interface MapOptions {
   maxToolChars?: number;
   /** Ceiling on the whole transcript, in characters. 0 disables trimming. */
   maxChars?: number;
+}
+
+/**
+ * The display title a crossing gives a conversation.
+ *
+ * A conversation that has already crossed between providers carries the
+ * previous crossing's mark — `[Claude] ...` on a thread Codex received from
+ * Claude. Prefixing that again reads as `[Codex] [Claude] ...`, which says
+ * where it has been rather than where it is, so a named prefix is replaced
+ * instead of stacked. The longest match wins, so overlapping marks cannot be
+ * half-removed, and a title already carrying this crossing's own mark comes
+ * back unchanged — re-importing must not rename a conversation each time.
+ */
+export function applyTitlePrefix(
+  title: string,
+  prefix: string,
+  replaced: readonly string[] | undefined,
+): string {
+  if (prefix === "") return title;
+  if (title.startsWith(prefix)) return title;
+  const candidates = [...new Set(replaced ?? [])].filter((candidate) => candidate !== "");
+  const match = candidates
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => title.startsWith(candidate));
+  return prefix + (match == null ? title : title.slice(match.length));
 }
 
 const DEFAULT_VERSION = "0.0.0-codex-import";
@@ -384,7 +419,7 @@ export function mapSessionToClaudeLines(
 
   // Make the result replayable before anything reads lines[0].
   lines = repairTranscript(lines);
-  lines = applyBudget(lines, opts.maxChars).lines;
+  lines = applyActiveBudget(lines, opts.maxChars);
 
   // Set a display title on the first line. Claude reads "customTitle" from the
   // file head with the highest priority, so this controls the sidebar label.
@@ -408,7 +443,7 @@ export function mapSessionToClaudeLines(
           : session.title && session.title !== ""
             ? session.title
             : "(untitled)";
-    lines[0].customTitle = (prefix + base).slice(0, 200);
+    lines[0].customTitle = applyTitlePrefix(base, prefix, opts.replaceTitlePrefixes).slice(0, 200);
   }
 
   return lines;

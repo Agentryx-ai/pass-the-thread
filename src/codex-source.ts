@@ -318,7 +318,36 @@ export function loadDesktopSessions(
 
   if (selection && selection.mode === "assigned") {
     const ids = [...new Set([...selection.threadProject.keys(), ...selection.unknownThreadIds])];
-    const rows = loadThreadsByIds(codexHome, ids, opts);
+    const assigned = loadThreadsByIds(codexHome, ids, opts);
+    // `thread-project-assignments` is Codex Desktop's UI state, not its list of
+    // threads: the sidebar is backed by the `threads` table. A row the map never
+    // learned about — every thread an external importer created — is a
+    // conversation Desktop shows and this tool has to be able to select, so the
+    // index is unioned in rather than the map being trusted as the whole
+    // membership.
+    //
+    // The union is confined to the clients the map is a map of. A machine's
+    // index also holds `codex exec` automation runs, CLI sessions and subagent
+    // work — hundreds of them here — which Desktop does not list beside its own
+    // conversations, and pulling those in would trade one wrong population for a
+    // much larger one. Taking the client set from the mapped rows themselves
+    // keeps that judgement in Codex's data rather than in a hardcoded name, and
+    // costs nothing when the map turns out to name no usable client.
+    const rows = assigned == null
+      ? null
+      : (() => {
+          const indexed = loadDesktopThreads(codexHome, opts);
+          if (indexed == null) return assigned;
+          const known = new Set(assigned.map((r) => r.id));
+          const desktopClients = new Set(
+            assigned.map((r) => r.source).filter((source) => typeof source === "string" && source !== ""),
+          );
+          if (desktopClients.size === 0) return assigned;
+          return [
+            ...assigned,
+            ...indexed.filter((r) => !known.has(r.id) && desktopClients.has(r.source)),
+          ];
+        })();
     if (rows) {
       const sessions: CodexSession[] = [];
       for (const r of rows) {
@@ -333,8 +362,16 @@ export function loadDesktopSessions(
         if (s.title === "" && r.title) s.title = r.title.replace(/\s+/g, " ").slice(0, 100);
         s.codexName = nameFor(r);
         if (r.source) s.source = r.source;
-        if (!selection.unknownThreadIds.has(r.id)) {
+        if (selection.threadProject.has(r.id)) {
           const proj = selection.threadProject.get(r.id) ?? null;
+          s.projectName = proj?.name ?? "(no project)";
+          s.hasProject = proj != null;
+        } else if (!selection.unknownThreadIds.has(r.id)) {
+          // Present in the index but not in the map. Desktop groups it the way
+          // it groups any thread it has no assignment for: by where it works.
+          const proj = selection.projectlessThreadIds.has(r.id)
+            ? null
+            : projectForCwd(selection, r.cwd || s.cwdOriginal || s.cwd);
           s.projectName = proj?.name ?? "(no project)";
           s.hasProject = proj != null;
         }
