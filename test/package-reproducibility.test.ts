@@ -25,10 +25,14 @@ const exactTextEntries = [
   "package/dist/codex-target-db.js",
   "package/dist/codex-target.js",
   "package/dist/map.js",
+  "package/dist/matrix-cli.js",
   "package/dist/threadpass.js",
   "package/docs/CLI.md",
   "package/docs/CONVERSION.md",
   "package/docs/FORMATS.md",
+  "package/docs/known-issues/imported-threads-invisible-in-assigned-mode.md",
+  "package/docs/known-issues/record-cwd-spelling-splits-a-project-in-two.md",
+  "package/docs/known-issues/round-tripped-imports-collapse-into-one-assistant-turn.md",
   "package/docs/research/codex-desktop/26.721.41059/BATCH_OBSERVATIONS.md",
   "package/docs/research/codex-desktop/26.721.41059/BUILT_IN_IMPORTER.md",
   "package/docs/research/codex-desktop/26.721.41059/COMPACTION_CASE.md",
@@ -141,9 +145,9 @@ test("npm pack is byte-identical across fresh Windows checkout line-ending modes
   const lfEntries = tarEntries(lfTarball);
   const crlfEntries = tarEntries(crlfTarball);
   const countHint = "packaged entry count changed: give the new file a `text eol=lf` line in .gitattributes before updating this count. A new src file counts too, because it emits a new dist entry and CR survives inside multi-line template literals.";
-  assert.equal(authoritativeEntries.size, 61, countHint);
-  assert.equal(lfEntries.size, 61, countHint);
-  assert.equal(crlfEntries.size, 61, countHint);
+  assert.equal(authoritativeEntries.size, 64, countHint);
+  assert.equal(lfEntries.size, 64, countHint);
+  assert.equal(crlfEntries.size, 64, countHint);
   const differingEntries = (left: Map<string, Buffer>, right: Map<string, Buffer>) => [
     ...new Set([...left.keys(), ...right.keys()]),
   ]
