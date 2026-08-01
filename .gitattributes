@@ -5,6 +5,9 @@
 /docs/CLI.md text eol=lf
 /docs/CONVERSION.md text eol=lf
 /docs/FORMATS.md text eol=lf
+/docs/known-issues/imported-threads-invisible-in-assigned-mode.md text eol=lf
+/docs/known-issues/record-cwd-spelling-splits-a-project-in-two.md text eol=lf
+/docs/known-issues/round-tripped-imports-collapse-into-one-assistant-turn.md text eol=lf
 /docs/research/codex-desktop/26.721.41059/BATCH_OBSERVATIONS.md text eol=lf
 /docs/research/codex-desktop/26.721.41059/BUILT_IN_IMPORTER.md text eol=lf
 /docs/research/codex-desktop/26.721.41059/COMPACTION_CASE.md text eol=lf
@@ -21,6 +24,7 @@
 /src/codex-target.ts text eol=lf
 /src/goal.ts text eol=lf
 /src/map.ts text eol=lf
+/src/matrix-cli.ts text eol=lf
 /src/session-handoff-cli.ts text eol=lf
 /src/session-handoff.ts text eol=lf
 /src/threadpass.ts text eol=lf
