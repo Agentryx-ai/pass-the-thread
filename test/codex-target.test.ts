@@ -98,6 +98,54 @@ test("semantic tool calls and results remain native Codex response items", () =>
   assert.equal(payloads[2].call_id, "call-1");
 });
 
+test("rollout carries renderable messages on the event stream Codex Desktop draws from", () => {
+  const lines = buildCodexRollout41059({
+    threadId: "t", cwd: "C:\\repo", title: "render", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [],
+    items: [
+      { kind: "message", role: "user", text: "ask" },
+      { kind: "message", role: "assistant", text: "answer" },
+      { kind: "message", role: "developer", text: "instructions" },
+      { kind: "tool_call", callId: "call-1", name: "shell", input: { cmd: "pwd" } },
+      { kind: "tool_result", callId: "call-1", output: "C:\\repo" },
+    ],
+  });
+
+  const meta = lines.find((line) => line.type === "session_meta");
+  assert.equal(meta?.payload.thread_source, "user");
+
+  const events = lines.filter((line) => line.type === "event_msg").map((line) => line.payload);
+  assert.deepEqual(events.map((payload) => payload.type), ["user_message", "agent_message"]);
+  assert.equal(events[0].message, "ask");
+  assert.deepEqual(events[0].images, []);
+  assert.match(String(events[0].client_id), /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.equal(events[1].message, "answer");
+  assert.equal(events[1].phase, "commentary");
+  assert.equal(events[1].memory_citation, null);
+
+  // Native order on 26.721.41059: user response_item then its event; agent event
+  // then its response_item. Developer text and tool items stay model-facing only.
+  const shape = lines.map((line) => `${line.type}/${line.payload.type ?? ""}`);
+  assert.deepEqual(shape, [
+    "session_meta/",
+    "response_item/message",
+    "event_msg/user_message",
+    "event_msg/agent_message",
+    "response_item/message",
+    "response_item/message",
+    "response_item/function_call",
+    "response_item/function_call_output",
+  ]);
+});
+
+test("rollout event stream is deterministic across builds", () => {
+  const build = (): string => JSON.stringify(buildCodexRollout41059({
+    threadId: "t", cwd: "C:\\repo", title: "render", createdAt: "2026-07-26T00:00:00.000Z",
+    messages: [{ role: "user", text: "ask" }],
+  }));
+  assert.equal(build(), build());
+});
+
 test("target serialization refuses malformed native tool history", () => {
   assert.throws(() => buildCodexRollout41059({
     ...sampleConversation(),

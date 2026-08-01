@@ -128,6 +128,30 @@ function safeContextText(context: HistoricalContextCard): string {
   ].join("\n");
 }
 
+/**
+ * Codex Desktop renders a conversation from the `event_msg` stream; `response_item`
+ * records are the model-facing history it resumes from. A rollout carrying only
+ * `response_item` lines is resumable but draws an empty transcript, so every
+ * renderable message is emitted on both streams.
+ */
+function deterministicUuid(seed: string): string {
+  const bytes = Buffer.from(createHash("sha256").update(seed).digest().subarray(0, 16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+/** The text a `message` response item carries, or null when it is not one. */
+function renderableMessage(payload: Record<string, unknown>): { role: string; text: string } | null {
+  if (payload.type !== "message" || typeof payload.role !== "string") return null;
+  const content = payload.content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const first = content[0];
+  if (!isPlainObject(first) || typeof first.text !== "string") return null;
+  return { role: payload.role, text: first.text };
+}
+
 function responseItem(message: LogicalMessage): Record<string, unknown> {
   return {
     type: "message",
@@ -178,6 +202,7 @@ export function buildCodexRollout41059(input: LogicalCodexConversation): CodexRo
       originator: "agentryx-session-import",
       cli_version: "0.146.0-alpha.3.1",
       source: "vscode",
+      thread_source: "user",
       model_provider: "openai",
       history_mode: "legacy",
       native_session_id: input.threadId,
@@ -213,13 +238,50 @@ export function buildCodexRollout41059(input: LogicalCodexConversation): CodexRo
       },
     };
   };
+  // Native order, measured on 26.721.41059: a user turn writes its response_item
+  // first and the `user_message` event after it; an assistant turn writes the
+  // `agent_message` event first and the response_item after.
+  const pushRendered = (
+    timestamp: string, payload: Record<string, unknown>, seed: string,
+  ): void => {
+    const message = renderableMessage(payload);
+    const item: CodexRolloutLine = { timestamp, type: "response_item", payload };
+    if (message?.role === "user") {
+      lines.push(item, {
+        timestamp,
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          client_id: deterministicUuid(`${input.threadId}:user_message:${seed}`),
+          message: message.text,
+          images: [], local_images: [], audio: [], local_audio: [], text_elements: [],
+        },
+      });
+      return;
+    }
+    if (message?.role === "assistant") {
+      lines.push({
+        timestamp,
+        type: "event_msg",
+        payload: {
+          type: "agent_message", message: message.text,
+          phase: "commentary", memory_citation: null,
+        },
+      }, item);
+      return;
+    }
+    // Developer messages and native tool call/output items have no measured
+    // event_msg form on this build; they stay model-facing only.
+    lines.push(item);
+  };
+
   if (input.compaction && activeIndex === 0) lines.push(compactedLine(input.createdAt));
   for (let i = 0; i < logicalItems.length; i += 1) {
     const item = logicalItems[i];
     const timestamp = item.timestamp && Number.isFinite(Date.parse(item.timestamp))
       ? new Date(item.timestamp).toISOString()
       : input.createdAt;
-    lines.push({ timestamp, type: "response_item", payload: items[i] });
+    pushRendered(timestamp, items[i]!, `item:${i}`);
     if (input.compaction && activeIndex != null && i + 1 === activeIndex) {
       // The replacement history is the context that exists *at the boundary*.
       // Messages after the boundary are appended below in normal file order.
@@ -227,12 +289,14 @@ export function buildCodexRollout41059(input: LogicalCodexConversation): CodexRo
       lines.push(compactedLine(timestamp));
     }
   }
-  for (const task of input.historicalTasks ?? []) {
-    lines.push({
-      timestamp: task.timestamp ?? input.createdAt,
-      type: "response_item",
-      payload: responseItem({ role: "assistant", text: safeTaskText(task) }),
-    });
+  const tasks = input.historicalTasks ?? [];
+  for (let i = 0; i < tasks.length; i += 1) {
+    const task = tasks[i]!;
+    pushRendered(
+      task.timestamp ?? input.createdAt,
+      responseItem({ role: "assistant", text: safeTaskText(task) }),
+      `historical_task:${i}`,
+    );
   }
   return lines;
 }

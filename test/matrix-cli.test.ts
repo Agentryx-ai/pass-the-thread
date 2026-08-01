@@ -1049,8 +1049,16 @@ test("semantic reverse rendering keeps the latest compact summary and appends po
     summary: { sessionId: "local_wrapper", cwd: root, hasProject: true, isArchived: false, targetProjectExists: false },
   }, "semantic");
   assert.equal(logical.compaction?.summary, "latest summary");
-  const rollout = JSON.stringify(buildCodexRollout41059({ ...logical, threadId: "target" }));
-  assert.equal((rollout.match(/active once/g) ?? []).length, 1);
+  const lines = buildCodexRollout41059({ ...logical, threadId: "target" });
+  // Renderable messages are carried on both streams, so count each separately:
+  // the point of this test is that the post-boundary item is appended once, not
+  // that it appears once in the file.
+  const occurrences = (type: string, needle: RegExp): number =>
+    lines.filter((line) => line.type === type).filter((line) => needle.test(JSON.stringify(line))).length;
+  assert.equal(occurrences("response_item", /active once/), 1);
+  assert.equal(occurrences("event_msg", /active once/), 1);
+  assert.equal(occurrences("compacted", /latest summary/), 1);
+  const rollout = JSON.stringify(lines);
   assert.equal((rollout.match(/latest summary/g) ?? []).length, 1);
   assert.doesNotMatch(rollout, /old summary/);
 });
